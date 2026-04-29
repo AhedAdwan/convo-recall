@@ -36,7 +36,18 @@ def main() -> None:
     p_serve.add_argument("--model", default="BAAI/bge-large-en-v1.5",
                          help="Sentence-transformers model name")
 
-    sub.add_parser("ingest", help="Scan and ingest new/updated conversations")
+    p_ingest = sub.add_parser("ingest", help="Scan and ingest new/updated conversations")
+    p_ingest.add_argument("--agent", "-a", default=None,
+                          help="Only ingest one agent (claude / gemini / codex). "
+                               "Default: read enabled agents from config.json (or claude only).")
+
+    p_watch = sub.add_parser("watch",
+                             help="Polling watcher loop for sandbox / Linux (no launchd). "
+                                  "Re-runs ingest every N seconds.")
+    p_watch.add_argument("--interval", "-i", type=int, default=10, metavar="SEC",
+                         help="Poll interval in seconds (default 10)")
+    p_watch.add_argument("--verbose", action="store_true",
+                         help="Verbose output for each tick.")
     sub.add_parser("embed-backfill", help="Generate embeddings for all un-embedded messages")
     sub.add_parser("backfill-clean", help="Re-clean all stored messages and rebuild FTS")
     sub.add_parser("chunk-backfill", help="Re-embed long messages with chunked mean-pooling")
@@ -56,6 +67,8 @@ def main() -> None:
                           help="Search across all projects (overrides cwd auto-detect)")
     p_search.add_argument("--context", "-c", type=int, default=1, metavar="N",
                           help="Show N messages before/after each result (default 1, 0 to disable)")
+    p_search.add_argument("--agent", "-a", default=None,
+                          help="Filter to messages from a single agent (claude / gemini / codex)")
 
     args = parser.parse_args()
 
@@ -88,7 +101,12 @@ def main() -> None:
     con = ingest.open_db()
     try:
         if args.cmd == "ingest":
-            ingest.scan_all(con, verbose=True)
+            if args.agent:
+                ingest.scan_one_agent(con, args.agent, verbose=True)
+            else:
+                ingest.scan_all(con, verbose=True)
+        elif args.cmd == "watch":
+            ingest.watch_loop(con, interval=args.interval, verbose=args.verbose)
         elif args.cmd == "embed-backfill":
             ingest.embed_backfill(con)
         elif args.cmd == "backfill-clean":
@@ -106,7 +124,8 @@ def main() -> None:
             ingest.search(con, args.query, args.n,
                           recent=args.recent,
                           project=project,
-                          context=args.context)
+                          context=args.context,
+                          agent=args.agent)
         else:
             parser.print_help()
             sys.exit(1)

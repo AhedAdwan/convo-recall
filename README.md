@@ -2,14 +2,15 @@
 
 > **AI agents are stateless by design. convo-recall makes them stateful by infrastructure.**
 
-Every Claude Code session starts blind. Decisions made last week, approaches that failed, the exact fix for that recurring bug — all of it vanishes when the context window closes. As sessions grow longer, the cost of keeping that context alive skews toward noise over signal. And when multiple agents work on the same project, each one starts from zero with no knowledge of what the others have done.
+Every coding-agent session starts blind. Decisions made last week, approaches that failed, the exact fix for that recurring bug — all of it vanishes when the context window closes. As sessions grow longer, the cost of keeping that context alive skews toward noise over signal. And when multiple agents work on the same project, each one starts from zero with no knowledge of what the others have done.
 
-convo-recall fixes this. It indexes every Claude Code conversation into a local SQLite database and makes it searchable — by keyword, by semantic meaning, or both. Your agents get a memory that survives the context window.
+convo-recall fixes this. It indexes every conversation from your coding agents — **Claude Code, Gemini CLI, and Codex** — into one local SQLite database and makes it searchable by keyword, by semantic meaning, or both. Your agents get a shared memory that survives the context window AND crosses tool boundaries.
 
 ```bash
 recall search "how did we fix the auth middleware"
 recall search "approaches we tried for the chunking problem" --recent
 recall search "deployment config" --all-projects
+recall search "the prompt that worked" --agent gemini      # filter to one agent
 ```
 
 ---
@@ -52,7 +53,7 @@ recall search "deployment config" --all-projects
 
 ## How it works
 
-Claude Code writes session transcripts as `.jsonl` files under `~/.claude/projects/`. convo-recall watches that directory via a launchd job, parses the JSONL, cleans the content, and indexes it with:
+Each coding agent writes session transcripts as `.jsonl` files in its own location. convo-recall watches each directory via a per-agent launchd job, parses the JSONL, cleans the content, and indexes it with:
 
 - **FTS5** — SQLite full-text search with porter stemming. Instant. No model required.
 - **Vector KNN** (optional) — semantic search via BAAI/bge-large-en-v1.5 (1024-dim), running locally on MPS/CPU. Results fused with FTS via Reciprocal Rank Fusion.
@@ -60,6 +61,20 @@ Claude Code writes session transcripts as `.jsonl` files under `~/.claude/projec
 New conversations are searchable within ~10 seconds of being written. The embedding sidecar stays warm in the background so hybrid search stays fast.
 
 Without embeddings, search is FTS-only. With the `[embeddings]` extra and `recall serve`, search becomes hybrid — keyword and semantic together.
+
+### Supported agents
+
+| Agent  | Source dir                 | Pattern                                    |
+|--------|----------------------------|--------------------------------------------|
+| claude | `~/.claude/projects/`      | `*/*.jsonl`, `*/subagents/*.jsonl`         |
+| gemini | `~/.gemini/tmp/`           | `*/chats/session-*.jsonl`                  |
+| codex  | `~/.codex/sessions/`       | `{YYYY}/{MM}/{DD}/rollout-*.jsonl`         |
+
+`recall install` auto-detects which agents are present on your machine and installs one launchd job per agent. The set of enabled agents is persisted in `~/.local/share/convo-recall/config.json` and can be edited directly.
+
+For Codex sessions, the project slug is derived from the session's `cwd` so cross-agent search-by-project works the same way it does for Claude.
+
+Tool calls and reasoning blocks are NOT indexed — only human-readable user/assistant text. Codex `~/.codex/history.jsonl` is intentionally skipped (rollout files are the source of truth).
 
 ---
 
@@ -101,10 +116,13 @@ recall search "sqlite vector search"
 recall search "chunking strategy" --recent        # bias toward recent conversations
 recall search "embedding model" --all-projects    # search across all projects
 recall search "bug fix" -n 20                     # more results
+recall search "the failing test" --agent codex    # filter to one agent
 
 # Maintenance
-recall ingest                   # manual ingest trigger
-recall stats                    # DB statistics
+recall ingest                   # manual ingest trigger (all enabled agents)
+recall ingest --agent gemini    # ingest only one agent
+recall watch                    # polling watcher for Linux/sandbox (no launchd)
+recall stats                    # DB statistics (with per-agent counts)
 recall serve                    # start embedding sidecar manually (if not using launchd)
 
 # One-time backfills (run after upgrading)
@@ -134,6 +152,9 @@ Override with `--project <slug>` or search everything with `--all-projects`.
 |---|---|---|
 | `CONVO_RECALL_DB` | `~/.local/share/convo-recall/conversations.db` | SQLite database path |
 | `CONVO_RECALL_PROJECTS` | `~/.claude/projects` | Claude Code projects directory |
+| `CONVO_RECALL_GEMINI_TMP` | `~/.gemini/tmp` | Gemini CLI session root |
+| `CONVO_RECALL_CODEX_SESSIONS` | `~/.codex/sessions` | Codex rollout root |
+| `CONVO_RECALL_CONFIG` | `~/.local/share/convo-recall/config.json` | Enabled-agents config file |
 | `CONVO_RECALL_SOCK` | `~/.local/share/convo-recall/embed.sock` | Embedding sidecar socket path |
 
 ---
