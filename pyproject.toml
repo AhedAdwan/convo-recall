@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "convo-recall"
+version = "0.1.0"
+description = "Searchable memory for Claude Code sessions — FTS5 + vector hybrid search"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+authors = [
+    {name = "Ahed Isir"},
+]
+keywords = ["claude", "claude-code", "search", "memory", "rag", "sqlite", "fts5"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: Other/Proprietary License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Utilities",
+    "Topic :: Text Processing :: Indexing",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "apsw>=3.46",
+    "sqlite-vec>=0.1.6,<0.2",
+]
+
+[project.optional-dependencies]
+embeddings = [
+    "sentence-transformers>=3.0",
+    "torch>=2.2,<3",
+    "aiohttp>=3.9",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov",
+]
+
+[project.scripts]
+recall = "convo_recall.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/ahed-isir/convo-recall"
+Repository = "https://github.com/ahed-isir/convo-recall"
+Issues = "https://github.com/ahed-isir/convo-recall/issues"
+Changelog = "https://github.com/ahed-isir/convo-recall/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/convo_recall"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["tests/fixtures/**"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

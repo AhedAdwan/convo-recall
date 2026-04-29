@@ -1,0 +1,141 @@
+name: 🐛 Bug Report
+description: Report a bug or unexpected behavior in convo-recall
+title: "[BUG] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this bug! Please fill out the sections below.
+
+        Before submitting, please check:
+        - You're using the latest version (`recall --version`)
+        - This issue hasn't already been reported in [existing issues](https://github.com/ahed-isir/convo-recall/issues?q=is%3Aissue+state%3Aopen+label%3Abug)
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight Checklist
+      options:
+        - label: I have searched existing issues and this hasn't been reported yet
+          required: true
+        - label: This is a single bug report (please file separate reports for different bugs)
+          required: true
+        - label: I am using the latest version of convo-recall
+          required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What's Wrong?
+      description: Describe what's happening that shouldn't be
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What Should Happen?
+      description: Describe the expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: error_output
+    attributes:
+      label: Error Messages / Logs
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      placeholder: |
+        1. Run `recall ingest`
+        2. Run `recall search "..."`
+        3. See error
+    validations:
+      required: true
+
+  - type: dropdown
+    id: command
+    attributes:
+      label: Which command is affected?
+      options:
+        - recall install
+        - recall uninstall
+        - recall ingest
+        - recall search
+        - recall serve
+        - recall stats
+        - recall embed-backfill
+        - recall chunk-backfill
+        - recall backfill-clean
+        - recall tool-error-backfill
+        - Multiple / not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install_method
+    attributes:
+      label: How did you install convo-recall?
+      options:
+        - pipx install convo-recall
+        - pipx install convo-recall[embeddings]
+        - pip install convo-recall
+        - pip install -e . (development install)
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: search_mode
+    attributes:
+      label: Search mode
+      options:
+        - FTS-only (no embeddings installed)
+        - Hybrid (embeddings installed, sidecar running)
+        - Hybrid (embeddings installed, sidecar NOT running)
+        - Not applicable
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: convo-recall version
+      description: Run `recall --version`
+      placeholder: "e.g., 0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: python_version
+    attributes:
+      label: Python version
+      placeholder: "e.g., 3.12.3"
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Information
+    validations:
+      required: false

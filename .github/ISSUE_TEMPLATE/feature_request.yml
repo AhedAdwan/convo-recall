@@ -1,0 +1,80 @@
+name: ✨ Feature Request
+description: Suggest a new feature or enhancement for convo-recall
+title: "[FEATURE] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature! Please help us understand your use case.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight Checklist
+      options:
+        - label: I have searched [existing requests](https://github.com/ahed-isir/convo-recall/issues?q=is%3Aissue+label%3Aenhancement) and this hasn't been requested yet
+          required: true
+        - label: This is a single feature request (not multiple features)
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: What problem are you trying to solve? Focus on the problem, not the solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: How would you like this to work?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+    validations:
+      required: false
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - Critical — blocking my use of convo-recall
+        - High — significant impact on my workflow
+        - Medium — would be very helpful
+        - Low — nice to have
+    validations:
+      required: true
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      options:
+        - Search quality / relevance
+        - Ingestion / indexing
+        - CLI commands and flags
+        - Embedding / vector search
+        - Cross-platform support (Linux, Windows)
+        - Performance
+        - Configuration and environment variables
+        - Integration with other tools
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+    validations:
+      required: false

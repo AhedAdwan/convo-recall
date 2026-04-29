@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Discussions
+    url: https://github.com/ahed-isir/convo-recall/discussions
+    about: Ask questions, share ideas, and get help from the community
+  - name: 📖 README
+    url: https://github.com/ahed-isir/convo-recall#readme
+    about: Installation, usage, and environment variable reference
