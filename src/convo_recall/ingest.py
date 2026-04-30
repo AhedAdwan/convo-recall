@@ -1222,6 +1222,46 @@ def _fetch_context(con: apsw.Connection, session_id: str,
     return list(reversed(before)), after
 
 
+def _safe_fts_query(query: str) -> str:
+    """Convert a free-form user query into a safe FTS5 MATCH expression.
+
+    FTS5 treats `-`, `.`, `:`, `(`, `*`, `AND`, `OR`, `NOT`, `NEAR` as
+    operators / column refs. Passing a raw user string into
+    `messages_fts MATCH ?` crashes on common inputs (`app-gemini` →
+    "no such column: gemini"; `.*` → "syntax error near '.'").
+
+    Strategy: split on whitespace, wrap each token in double quotes
+    (FTS5's phrase syntax — special chars inside are literal), join
+    with spaces. Multiple quoted tokens are implicit-AND'ed by FTS5,
+    matching the prior behavior for normal multi-word queries.
+
+    Edge cases:
+      - empty input → returns a quoted empty string, which FTS5 reads
+        as a no-match (caller prints "No results.").
+      - embedded double quotes are doubled (FTS5's quote-escape
+        convention).
+      - tokens that consist entirely of FTS5-special chars (e.g. `.*`)
+        end up as empty phrases, which FTS5 also no-matches cleanly.
+    """
+    if not query.strip():
+        return '""'
+    parts = []
+    for token in query.split():
+        # Strip leading/trailing FTS5 specials so a token like `.*` doesn't
+        # produce an empty phrase that FTS5 treats as a syntax error in
+        # some contexts. Internal punctuation is preserved (the tokenizer
+        # handles word-boundary splitting inside the phrase).
+        cleaned = token.strip('.*:()')
+        if not cleaned:
+            continue
+        # Double-up any embedded double quotes per FTS5's escape convention.
+        escaped = cleaned.replace('"', '""')
+        parts.append(f'"{escaped}"')
+    if not parts:
+        return '""'
+    return " ".join(parts)
+
+
 def search(con: apsw.Connection, query: str, limit: int = 10,
            recent: bool = False, project: str | None = None,
            context: int = 1, agent: str | None = None,
@@ -1234,6 +1274,16 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
     if use_vec:
         qvec = embed(query, mode="query")
         use_vec = qvec is not None
+
+    # FTS5 interprets `-`, `.`, `:`, `(`, `*`, etc. as query operators or
+    # column refs, so passing a raw user query into `messages_fts MATCH ?`
+    # crashes on common inputs (e.g. `app-gemini` → "no such column: gemini",
+    # `.*` → "syntax error near '.'"). Wrap each whitespace-separated token
+    # in double quotes — FTS5's phrase syntax — so special chars inside are
+    # literal. Implicit-AND semantics across multiple quoted tokens preserve
+    # the prior behavior for normal queries. Embedding path uses the raw
+    # query (the model handles any string).
+    fts_query = _safe_fts_query(query)
 
     # Pre-compute the rowid set for the (project, agent) filter so we can
     # narrow both FTS and vec result sets down before scoring.
@@ -1332,7 +1382,7 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
                     JOIN messages m ON messages_fts.rowid = m.rowid
                     WHERE messages_fts MATCH ? AND m.rowid IN ({placeholders})
                     LIMIT ?""",
-                (query, *filter_rowids, prefilter_k),
+                (fts_query, *filter_rowids, prefilter_k),
             ).fetchall()
             fts_map = {r["rowid"]: r["fts_rank"] for r in fts_rows}
         else:
@@ -1342,7 +1392,7 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
                    JOIN messages m ON messages_fts.rowid = m.rowid
                    WHERE messages_fts MATCH ?
                    LIMIT ?""",
-                (query, prefilter_k),
+                (fts_query, prefilter_k),
             ).fetchall()
             fts_map = {r["rowid"]: r["fts_rank"] for r in fts_rows
                        if project_rowids is None or r["rowid"] in project_rowids}
@@ -1402,7 +1452,7 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
                     WHERE messages_fts MATCH ? AND m.rowid IN ({placeholders})
                     ORDER BY rank
                     LIMIT ?""",
-                (query, *filter_rowids, limit),
+                (fts_query, *filter_rowids, limit),
             ).fetchall()
         else:
             rows = con.execute(
@@ -1414,7 +1464,7 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
                    WHERE messages_fts MATCH ?
                    ORDER BY rank
                    LIMIT ?""",
-                (query, limit),
+                (fts_query, limit),
             ).fetchall()
 
     if not rows:

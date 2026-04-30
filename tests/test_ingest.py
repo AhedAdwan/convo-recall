@@ -1457,3 +1457,89 @@ def test_doctor_recommends_install_command_when_extra_missing(db, tmp_path, monk
     assert "Embed extra      : NOT installed" in out
     assert "pipx install" in out
     assert "convo-recall[embeddings]" in out
+
+
+# ── F-9: FTS5 query sanitization ─────────────────────────────────────────────
+
+
+def test_safe_fts_query_wraps_tokens_in_quotes():
+    assert ingest._safe_fts_query("hello world") == '"hello" "world"'
+
+
+def test_safe_fts_query_handles_empty():
+    assert ingest._safe_fts_query("") == '""'
+    assert ingest._safe_fts_query("   ") == '""'
+
+
+def test_safe_fts_query_escapes_embedded_quotes():
+    out = ingest._safe_fts_query('he said "hi"')
+    # `he` and `said` are quoted; `"hi"` becomes `""hi""` (escaped doubles).
+    assert '"he"' in out
+    assert '"said"' in out
+    assert '""hi""' in out
+
+
+def test_safe_fts_query_strips_special_only_tokens():
+    """Token `.*` would crash FTS5 — should reduce to a no-match (empty)."""
+    assert ingest._safe_fts_query(".*") == '""'
+    assert ingest._safe_fts_query("...") == '""'
+
+
+def test_search_with_hyphenated_query_does_not_crash(db, tmp_path, monkeypatch, capsys):
+    """The Gemini-agent crash: `recall search "app-gemini"` →
+    `apsw.SQLError: no such column: gemini`. Sanitization fixes it."""
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    sess = tmp_path / "p" / "s.jsonl"
+    _write_session(sess, [
+        {"uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+         "message": {"role": "user", "content": "app-gemini integration notes"}},
+    ])
+    ingest.ingest_file(db, sess, do_embed=False)
+
+    capsys.readouterr()
+    # No raise = pass. Returns matching rows because "app-gemini" appears
+    # in the indexed content.
+    ingest.search(db, "app-gemini", limit=5, context=0)
+    out = capsys.readouterr().out
+    # Either we got a hit, or "No results." — but never the crash.
+    assert "no such column" not in out
+    assert "syntax error" not in out
+
+
+def test_search_with_dot_asterisk_query_does_not_crash(db, tmp_path, monkeypatch, capsys):
+    """The other Gemini-agent crash: `recall search ".*"` →
+    `apsw.SQLError: fts5: syntax error near "."`."""
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    sess = tmp_path / "p" / "s.jsonl"
+    _write_session(sess, [
+        {"uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+         "message": {"role": "user", "content": "anything"}},
+    ])
+    ingest.ingest_file(db, sess, do_embed=False)
+
+    capsys.readouterr()
+    ingest.search(db, ".*", limit=5, context=0)
+    out = capsys.readouterr().out
+    assert "syntax error" not in out
+    # `.*` strips to empty → no-match phrase → "No results."
+    assert "No results" in out
+
+
+def test_search_with_colon_query_does_not_crash(db, tmp_path, monkeypatch, capsys):
+    """Colons and parens are also FTS5-special. Defensive against future
+    user input that wasn't in the Gemini agent's specific cases."""
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    sess = tmp_path / "p" / "s.jsonl"
+    _write_session(sess, [
+        {"uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+         "message": {"role": "user", "content": "url:https://example.com"}},
+    ])
+    ingest.ingest_file(db, sess, do_embed=False)
+
+    capsys.readouterr()
+    for q in ("url:https", "(query)", "foo*bar", "AND OR NOT"):
+        capsys.readouterr()
+        ingest.search(db, q, limit=5, context=0)
+        out = capsys.readouterr().out
+        assert "syntax error" not in out, f"crashed on query: {q!r}"
+        assert "no such column" not in out, f"crashed on query: {q!r}"
