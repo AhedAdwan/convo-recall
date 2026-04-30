@@ -115,6 +115,8 @@ def main() -> None:
                           help="Show N messages before/after each result (default 1, 0 to disable)")
     p_search.add_argument("--agent", "-a", default=None,
                           help="Filter to messages from a single agent (claude / gemini / codex)")
+    p_search.add_argument("--json", action="store_true",
+                          help="Emit machine-readable JSON instead of human-formatted text")
 
     args = parser.parse_args()
 
@@ -205,7 +207,8 @@ def main() -> None:
                           recent=args.recent,
                           project=project,
                           context=args.context,
-                          agent=args.agent)
+                          agent=args.agent,
+                          json_=getattr(args, "json", False))
         else:
             parser.print_help()
             sys.exit(1)

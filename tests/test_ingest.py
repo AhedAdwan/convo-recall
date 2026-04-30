@@ -984,11 +984,15 @@ def test_conversation_memory_hook_emits_valid_json_for_each_cli():
     assert hook.exists(), f"hook script missing at {hook}"
     assert os.access(hook, os.X_OK), f"hook script not executable: {hook}"
 
+    # Use a substantive prompt so the F-6 throttle (added 2026-05) doesn't
+    # skip the reminder — this test verifies event-name dispatch, not the
+    # throttle behavior (covered separately by tests/test_hook_throttle.sh).
+    SUBSTANTIVE = "How does the cron scheduler avoid duplicate @reboot lines?"
     cases = [
         # (stdin payload, expected hookEventName)
-        ('{"hook_event_name":"UserPromptSubmit","prompt":"hi","session_id":"s","cwd":"/x"}', "UserPromptSubmit"),
-        ('{"hook_event_name":"BeforeAgent","prompt":"hi"}', "BeforeAgent"),
-        ('{"prompt":"hi"}', "BeforeAgent"),  # Gemini-shaped, no hook_event_name
+        (f'{{"hook_event_name":"UserPromptSubmit","prompt":{json.dumps(SUBSTANTIVE)},"session_id":"s","cwd":"/x"}}', "UserPromptSubmit"),
+        (f'{{"hook_event_name":"BeforeAgent","prompt":{json.dumps(SUBSTANTIVE)}}}', "BeforeAgent"),
+        (f'{{"prompt":{json.dumps(SUBSTANTIVE)}}}', "BeforeAgent"),  # Gemini-shaped
         ('', "UserPromptSubmit"),             # empty stdin defaults
     ]
     for payload, expected_event in cases:
@@ -1002,9 +1006,12 @@ def test_conversation_memory_hook_emits_valid_json_for_each_cli():
             f"stdin {payload!r}: expected hookEventName={expected_event!r}, "
             f"got {hso['hookEventName']!r}"
         )
-        assert "convo-recall" in hso["additionalContext"], \
-            "additionalContext should mention convo-recall"
-        assert hso["additionalContext"], "additionalContext must not be empty"
+        # Empty-stdin case: throttle skips it (no prompt → no reminder),
+        # so additionalContext is "" but hookEventName still set correctly.
+        if payload:
+            assert "convo-recall" in hso["additionalContext"], \
+                "additionalContext should mention convo-recall"
+            assert hso["additionalContext"], "additionalContext must not be empty"
 
 
 def test_doctor_bak_warns_on_stale_files(db, tmp_path, monkeypatch, capsys):
@@ -1185,3 +1192,268 @@ def test_search_no_results_for_unknown_agent(db, tmp_path, monkeypatch, capsys):
     ingest.search(db, "anything", agent="nonexistent", limit=10, context=0)
     out = capsys.readouterr().out
     assert "No messages found" in out
+
+
+# ── P0: project slug normalization (Item 1 of feedback plan) ─────────────────
+
+
+def test_slug_from_cwd_collapses_hyphens_to_underscores(monkeypatch):
+    """Real-world bug: cwd `/Projects/app-claude` ingested under slug
+    `app_claude` (Claude flattens hyphens at ingest), but search auto-detect
+    used `app-claude` and returned 0. Both sides must agree."""
+    fake_parts = ("/", "Users", "x", "Projects", "app-claude")
+    monkeypatch.setattr(ingest.Path, "cwd", classmethod(lambda cls: ingest.Path("/Users/x/Projects/app-claude")))
+    assert ingest.slug_from_cwd() == "app_claude"
+
+
+def test_slug_from_cwd_collapses_multiple_hyphens(monkeypatch):
+    monkeypatch.setattr(ingest.Path, "cwd", classmethod(lambda cls: ingest.Path("/Users/x/Projects/foo-bar/baz-qux")))
+    assert ingest.slug_from_cwd() == "foo_bar_baz_qux"
+
+
+def test_slug_from_cwd_keeps_underscores(monkeypatch):
+    monkeypatch.setattr(ingest.Path, "cwd", classmethod(lambda cls: ingest.Path("/Users/x/Projects/already_underscored")))
+    assert ingest.slug_from_cwd() == "already_underscored"
+
+
+def test_slug_from_cwd_outside_projects_returns_none(monkeypatch):
+    monkeypatch.setattr(ingest.Path, "cwd", classmethod(lambda cls: ingest.Path("/etc/something")))
+    assert ingest.slug_from_cwd() is None
+
+
+def test_search_did_you_mean_hint_when_zero_results(db, tmp_path, monkeypatch, capsys):
+    """Search for a hyphenated slug when the DB has the underscored form
+    surfaces a 'did you mean: <other>' hint."""
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    # Manually construct a session under the underscored slug — we ingest
+    # via a JSONL whose flat-path-derived slug naturally produces an underscore.
+    sess = tmp_path / "-Users-x-Projects-app-claude" / "s.jsonl"
+    _write_session(sess, [
+        {"uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+         "message": {"role": "user", "content": "moodmix sprint"}},
+    ])
+    ingest.ingest_file(db, sess, do_embed=False)
+    rows = db.execute("SELECT DISTINCT project_slug FROM messages").fetchall()
+    underscored = rows[0]["project_slug"]
+    assert underscored == "app_claude", f"expected app_claude, got {underscored}"
+
+    capsys.readouterr()
+    # Search using the hyphenated form — the form a user at /Projects/app-claude
+    # would get from cwd auto-detect (before the slug_from_cwd fix).
+    ingest.search(db, "moodmix", project="app-claude", limit=10, context=0)
+    out = capsys.readouterr().out
+    assert "No messages found" in out
+    assert "Did you mean" in out
+    assert "app_claude" in out
+
+
+def test_search_no_did_you_mean_hint_when_results_found(db, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    sess = tmp_path / "-Users-x-Projects-app-claude" / "s.jsonl"
+    _write_session(sess, [
+        {"uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+         "message": {"role": "user", "content": "moodmix"}},
+    ])
+    ingest.ingest_file(db, sess, do_embed=False)
+    capsys.readouterr()
+    ingest.search(db, "moodmix", project="app_claude", limit=10, context=0)
+    out = capsys.readouterr().out
+    assert "Did you mean" not in out
+
+
+# ── F-2: recall search --json output mode ────────────────────────────────────
+
+
+def test_search_json_output_is_valid_json(db, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    sess = tmp_path / "proj_x" / "s.jsonl"
+    _write_session(sess, [
+        {"uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+         "message": {"role": "user", "content": "moodmix sprint plan"}},
+    ])
+    ingest.ingest_file(db, sess, do_embed=False)
+    capsys.readouterr()
+    ingest.search(db, "moodmix", project="proj_x", limit=10, context=0, json_=True)
+    out = capsys.readouterr().out.strip()
+    payload = json.loads(out)  # raises if not valid JSON
+    assert isinstance(payload, dict)
+
+
+def test_search_json_output_no_human_banners(db, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    sess = tmp_path / "proj_x" / "s.jsonl"
+    _write_session(sess, [
+        {"uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+         "message": {"role": "user", "content": "moodmix"}},
+    ])
+    ingest.ingest_file(db, sess, do_embed=False)
+    capsys.readouterr()
+    ingest.search(db, "moodmix", project="proj_x", limit=5, context=0, json_=True)
+    out = capsys.readouterr().out.strip()
+    assert out.startswith("{"), f"--json output should be a single JSON doc; got: {out[:80]}"
+    assert "[fts search]" not in out
+    assert "[hybrid search]" not in out
+
+
+def test_search_json_empty_results(db, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    sess = tmp_path / "proj_x" / "s.jsonl"
+    _write_session(sess, [
+        {"uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+         "message": {"role": "user", "content": "moodmix"}},
+    ])
+    ingest.ingest_file(db, sess, do_embed=False)
+    capsys.readouterr()
+    ingest.search(db, "zorblax", project="proj_x", limit=10, context=0, json_=True)
+    out = capsys.readouterr().out.strip()
+    payload = json.loads(out)
+    assert payload["results"] == []
+    assert "No results." not in out  # no human banner
+
+
+def test_search_json_includes_required_fields(db, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    sess = tmp_path / "proj_x" / "s.jsonl"
+    _write_session(sess, [
+        {"uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+         "message": {"role": "user", "content": "moodmix"}},
+    ])
+    ingest.ingest_file(db, sess, do_embed=False)
+    capsys.readouterr()
+    ingest.search(db, "moodmix", project="proj_x", limit=5, context=0, json_=True)
+    out = capsys.readouterr().out.strip()
+    payload = json.loads(out)
+    assert payload["results"], "expected at least one result"
+    r = payload["results"][0]
+    for field in ("session_id", "project_slug", "agent", "role", "timestamp", "snippet"):
+        assert field in r, f"missing required field {field!r} in result {r}"
+
+
+def test_search_json_did_you_mean_in_payload(db, tmp_path, monkeypatch, capsys):
+    """Zero-results in JSON mode includes did_you_mean array when applicable."""
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    sess = tmp_path / "-Users-x-Projects-app-claude" / "s.jsonl"
+    _write_session(sess, [
+        {"uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+         "message": {"role": "user", "content": "moodmix"}},
+    ])
+    ingest.ingest_file(db, sess, do_embed=False)
+    capsys.readouterr()
+    ingest.search(db, "moodmix", project="app-claude", limit=10, context=0, json_=True)
+    out = capsys.readouterr().out.strip()
+    payload = json.loads(out)
+    assert payload["results"] == []
+    assert "did_you_mean" in payload
+    assert "app_claude" in payload["did_you_mean"]
+
+
+# ── F-5: search snippet highlights matched query tokens with [brackets] ──────
+
+
+def test_search_snippet_brackets_only_query_matches(db, tmp_path, monkeypatch, capsys):
+    """The agent feedback mistook FTS bracketing for redactor asymmetry.
+    Confirm the brackets come from the query, not from the agent name —
+    a query of `claude` brackets `[claude]`, NOT `gemini` or `codex`."""
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    sess = tmp_path / "proj_x" / "s.jsonl"
+    _write_session(sess, [
+        {"uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+         "message": {"role": "user",
+                     "content": "claude codex gemini are three coding agents"}},
+    ])
+    ingest.ingest_file(db, sess, do_embed=False)
+
+    capsys.readouterr()
+    ingest.search(db, "claude", project="proj_x", limit=5, context=0, json_=True)
+    out = capsys.readouterr().out.strip()
+    payload = json.loads(out)
+    snippet = payload["results"][0]["snippet"]
+
+    # Only the query token gets bracketed.
+    assert "[claude]" in snippet
+    assert "[codex]" not in snippet, (
+        f"codex should NOT be bracketed when querying 'claude'; got: {snippet}"
+    )
+    assert "[gemini]" not in snippet
+
+
+# ── F-4: stats + doctor surface embed-sidecar status ─────────────────────────
+
+
+def test_stats_warns_when_zero_embedded(db, tmp_path, monkeypatch, capsys):
+    """When the DB has messages but Embedded:0, stats prints a warning
+    line + the actionable command. The agent's feedback session showed
+    Embedded: 0 (0%) with 145 messages and no clue why — fix is
+    discoverability, not the install path."""
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    sess = tmp_path / "p" / "s.jsonl"
+    _write_session(sess, [
+        {"uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+         "message": {"role": "user", "content": "abc"}},
+    ])
+    ingest.ingest_file(db, sess, do_embed=False)
+
+    capsys.readouterr()
+    ingest.stats(db)
+    out = capsys.readouterr().out
+    assert "Embedded   : 0" in out
+    assert "Vector search disabled" in out, (
+        f"missing 'Vector search disabled' warning; got:\n{out}"
+    )
+
+
+def test_stats_no_warning_when_no_messages(db, tmp_path, capsys):
+    capsys.readouterr()
+    ingest.stats(db)
+    out = capsys.readouterr().out
+    # Empty DB shouldn't bug the user about embeddings.
+    assert "Vector search disabled" not in out
+
+
+def test_doctor_reports_embed_status_lines(db, tmp_path, monkeypatch, capsys):
+    """`recall doctor` prints three lines reporting embed extra / sidecar /
+    coverage so the user sees the full picture in one place."""
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    sess = tmp_path / "p" / "s.jsonl"
+    _write_session(sess, [
+        {"uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+         "message": {"role": "user", "content": "abc"}},
+    ])
+    ingest.ingest_file(db, sess, do_embed=False)
+
+    capsys.readouterr()
+    ingest.doctor(db)
+    out = capsys.readouterr().out
+    assert "Embed extra" in out
+    assert "Embed sidecar" in out
+    assert "Embedded coverage" in out
+
+
+def test_doctor_recommends_install_command_when_extra_missing(db, tmp_path, monkeypatch, capsys):
+    """When Embedded:0 AND extra not installed, doctor recommends the
+    pipx install command."""
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    sess = tmp_path / "p" / "s.jsonl"
+    _write_session(sess, [
+        {"uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+         "message": {"role": "user", "content": "abc"}},
+    ])
+    ingest.ingest_file(db, sess, do_embed=False)
+
+    # Simulate missing extra by intercepting the import at the doctor() site.
+    import builtins
+    real_import = builtins.__import__
+
+    def _fake_import(name, *a, **kw):
+        if name == "sentence_transformers":
+            raise ImportError("simulated: extra not installed")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+
+    capsys.readouterr()
+    ingest.doctor(db)
+    out = capsys.readouterr().out
+    assert "Embed extra      : NOT installed" in out
+    assert "pipx install" in out
+    assert "convo-recall[embeddings]" in out

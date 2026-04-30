@@ -573,12 +573,23 @@ def _extract_text(content) -> str:
 
 
 def slug_from_cwd() -> str | None:
-    """Derive project slug from cwd, matching ingestion convention."""
+    """Derive project slug from cwd, matching ingestion convention.
+
+    Claude's flattened session storage (`~/.claude/projects/<flat-dir>/`)
+    encodes path separators as hyphens, so distinct hyphens in original
+    names are indistinguishable from path separators at ingest time —
+    `_slug_from_path` splits on `-` and joins with `_`, turning
+    `app-claude` into `app_claude`. This function must apply the same
+    collapse so a search from `/Projects/app-claude` resolves to the
+    same slug rows were ingested under.
+    """
     parts = Path.cwd().parts
     try:
         idx = next(i for i, p in enumerate(parts) if p.lower() == "projects")
         relevant = parts[idx + 1:]
-        return "_".join(relevant) if relevant else None
+        if not relevant:
+            return None
+        return "_".join(relevant).replace("-", "_")
     except StopIteration:
         return None
 
@@ -1213,7 +1224,8 @@ def _fetch_context(con: apsw.Connection, session_id: str,
 
 def search(con: apsw.Connection, query: str, limit: int = 10,
            recent: bool = False, project: str | None = None,
-           context: int = 1, agent: str | None = None) -> None:
+           context: int = 1, agent: str | None = None,
+           json_: bool = False) -> None:
     if len(query) > MAX_QUERY_LEN:
         query = query[:MAX_QUERY_LEN]
 
@@ -1241,11 +1253,39 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
         ).fetchall()
         filter_rowids = {r[0] for r in rows}
         if not filter_rowids:
-            label = ", ".join(filter(None, [
-                f"project='{project}'" if project else None,
-                f"agent='{agent}'" if agent else None,
-            ]))
-            print(f"No messages found for {label}.")
+            # "Did you mean" hint: surface near-miss slugs that differ only
+            # by hyphen/underscore swaps. Most common cause is a hyphenated
+            # repo dir whose ingest-time slug used underscores.
+            suggestions = []
+            if project:
+                near = con.execute(
+                    "SELECT DISTINCT project_slug FROM messages "
+                    "WHERE REPLACE(project_slug, '_', '-') = REPLACE(?, '_', '-') "
+                    "  AND project_slug != ? "
+                    "ORDER BY project_slug",
+                    (project, project),
+                ).fetchall()
+                suggestions = [r[0] for r in near[:3]]
+            if json_:
+                import json as _json
+                payload: dict = {
+                    "query": query,
+                    "project": project,
+                    "agent": agent,
+                    "n": limit,
+                    "results": [],
+                }
+                if suggestions:
+                    payload["did_you_mean"] = suggestions
+                print(_json.dumps(payload))
+            else:
+                label = ", ".join(filter(None, [
+                    f"project='{project}'" if project else None,
+                    f"agent='{agent}'" if agent else None,
+                ]))
+                print(f"No messages found for {label}.")
+                if suggestions:
+                    print(f"Did you mean: {', '.join(suggestions)}?")
             return
     project_rowids = filter_rowids  # keep alias to minimize downstream churn
 
@@ -1378,12 +1418,45 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
             ).fetchall()
 
     if not rows:
-        print("No results.")
+        if json_:
+            import json as _json
+            print(_json.dumps({
+                "query": query,
+                "project": project,
+                "agent": agent,
+                "n": limit,
+                "results": [],
+            }))
+        else:
+            print("No results.")
         return
 
     mode = ("hybrid+recent" if use_vec and recent
             else "hybrid" if use_vec
             else "fts")
+
+    if json_:
+        import json as _json
+        results = []
+        for r in rows:
+            results.append({
+                "session_id": r["session_id"],
+                "project_slug": r["project_slug"],
+                "agent": r["agent"],
+                "role": r["role"],
+                "timestamp": r["timestamp"],
+                "snippet": r["excerpt"],
+            })
+        print(_json.dumps({
+            "query": query,
+            "project": project,
+            "agent": agent,
+            "mode": mode,
+            "n": limit,
+            "results": results,
+        }))
+        return
+
     print(f"[{mode} search]\n")
     # Only show the agent tag when the result set actually mixes agents (or
     # the user explicitly filtered to a non-claude agent). Single-Claude
@@ -1521,6 +1594,32 @@ def doctor(con: apsw.Connection, scan_secrets: bool = False) -> None:
         print("Different docs may reference different paths. If unintentional, "
               "unset the env var.")
 
+    # Embed sidecar + coverage status. Three independent signals (extra
+    # installed, sidecar reachable, coverage) so the user can act on the
+    # right one.
+    msg_count = con.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    vec_count = _vec_count(con) if _vec_ok(con) else 0
+    coverage_pct = (vec_count * 100 // msg_count) if msg_count else 0
+    try:
+        import sentence_transformers  # noqa: F401
+        extra_installed = True
+    except ImportError:
+        extra_installed = False
+    sock_exists = EMBED_SOCK.exists()
+    print(f"\nEmbed extra      : {'installed' if extra_installed else 'NOT installed'}")
+    print(f"Embed sidecar    : {'reachable at ' + str(EMBED_SOCK) if sock_exists else 'down (no socket)'}")
+    print(f"Embedded coverage: {vec_count:,}/{msg_count:,} ({coverage_pct}%)")
+    if msg_count > 0 and vec_count == 0:
+        if not extra_installed:
+            print("  → install with: pipx install 'convo-recall[embeddings]'")
+            print("    then re-run:  recall install --with-embeddings")
+        elif not sock_exists:
+            print("  → start the sidecar: recall serve")
+        else:
+            print("  → backfill embeddings: recall embed-backfill")
+    elif msg_count > 0 and coverage_pct < 95:
+        print(f"  → low coverage; run `recall embed-backfill` to heal")
+
     stale = _scan_stale_bak_files(DB_PATH.parent)
     if stale:
         print(f"\nStale `.bak` files in {DB_PATH.parent} "
@@ -1530,7 +1629,7 @@ def doctor(con: apsw.Connection, scan_secrets: bool = False) -> None:
             print(f"  {path.name}  {age:.0f}d old  {mb:,.1f} MB")
         print("\nReview and remove manually if no longer needed.")
     elif not scan_secrets:
-        print("doctor: no issues found. "
+        print("\nNo other issues found. "
               "Pass `--scan-secrets` to scan for credential-shaped tokens.")
 
 
@@ -1763,3 +1862,23 @@ def stats(con: apsw.Connection) -> None:
     print("By agent   :")
     for agent, count in agent_counts:
         print(f"  {agent:14s}: {count:,}")
+
+    # Hybrid-search readiness warning. Surface the most likely cause + the
+    # exact command to fix it, so users don't silently run in FTS-only mode
+    # without knowing the headline feature is off.
+    if msg_count > 0 and vec_count == 0:
+        print()
+        try:
+            import sentence_transformers  # noqa: F401
+            extra_installed = True
+        except ImportError:
+            extra_installed = False
+        if not extra_installed:
+            print("⚠ Vector search disabled — `[embeddings]` extra not installed.")
+            print("  pipx install 'convo-recall[embeddings]' && recall install --with-embeddings")
+        elif not EMBED_SOCK.exists():
+            print("⚠ Vector search disabled — embed sidecar not running.")
+            print("  recall serve --sock " + str(EMBED_SOCK) + "  (or restart `recall install`)")
+        else:
+            print("⚠ Vector search ready but no rows embedded yet.")
+            print("  recall embed-backfill")

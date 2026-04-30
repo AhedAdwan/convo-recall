@@ -167,13 +167,18 @@ recall doctor --scan-secrets    # count credential-shaped tokens in indexed cont
 
 ## Project scope
 
-Search auto-scopes to your current project when you're inside a Claude Code project directory. The slug is derived from the path after your projects root, with slashes replaced by underscores:
+Search auto-scopes to your current project when you're inside a Claude Code project directory. The slug is derived from the path after your projects root, with both slashes AND hyphens collapsed to underscores:
 
 ```
-~/Projects/apps/my-app  →  apps_my-app
+~/Projects/apps/my-app  →  apps_my_app
+~/Projects/libs/convo-recall  →  libs_convo_recall
 ```
 
-Override with `--project <slug>` or search everything with `--all-projects`.
+Hyphen collapsing is required because Claude's session storage flattens path separators using hyphens, so distinct hyphens in original names become indistinguishable from path separators at ingest time. Both `app-claude` and `app_claude` map to the same slug `app_claude`.
+
+Override with `--project <slug>` or search everything with `--all-projects`. If a search returns zero results for a project, `recall` prints a `Did you mean: <slug>?` hint when a near-miss slug exists in the DB.
+
+**Search snippet highlighting:** matched query tokens in result snippets are wrapped in `[brackets]` (SQLite FTS5's `snippet()` highlighter). For example, searching `"claude codex"` will return snippets with `[claude]` and `[codex]` bracketed. Tokens that aren't in your query are unbracketed — this isn't redaction or asymmetry, it's just where the match landed.
 
 ---
 
