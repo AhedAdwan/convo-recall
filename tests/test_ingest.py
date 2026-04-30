@@ -447,7 +447,7 @@ def test_install_emits_one_plist_per_enabled_agent(tmp_path, monkeypatch):
     (home / ".gemini" / "tmp" / "g1" / "chats" / "session-x.jsonl").write_text("{}\n")
     (home / ".codex" / "sessions" / "2026" / "04" / "30" / "rollout-x.jsonl").write_text("{}\n")
 
-    _install.run(dry_run=False, non_interactive=True)
+    _install.run(dry_run=False, non_interactive=True, scheduler="launchd")
 
     plists = {p.name for p in (tmp_path / "LaunchAgents").iterdir()}
     # Wizard's non-interactive mode accepts all defaults, so we expect:

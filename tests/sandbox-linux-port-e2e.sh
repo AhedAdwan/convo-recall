@@ -552,28 +552,46 @@ else
 import shutil, sys
 import pexpect
 recall = shutil.which("recall")
-w = pexpect.spawn(recall, ["install", "--scheduler", "systemd"],
+# --dry-run so we don't actually call enable-linger / mutate systemd.
+w = pexpect.spawn(recall, ["install", "--scheduler", "systemd", "--dry-run"],
                   encoding="utf-8", timeout=10)
 saw_linger = False
+saw_watchers_question = False
 try:
     while True:
         idx = w.expect([
             r"Keep watchers running when logged out",
+            r"Install systemd --user \(Linux\) watchers",
             r"\[Y/n\]",
             pexpect.EOF,
         ], timeout=15)
         if idx == 0:
+            # Linger fired — that's all we needed to prove. Decline + drain.
             saw_linger = True
-            # Decline the linger question; drain to the end.
             w.expect(r"\[Y/n\]")
             w.sendline("n")
+            # Drain remaining prompts.
+            while True:
+                idx2 = w.expect([r"\[Y/n\]", pexpect.EOF], timeout=15)
+                if idx2 == 0:
+                    w.sendline("n")
+                else:
+                    break
+            break
         elif idx == 1:
-            w.sendline("n")  # decline everything else to exit fast
+            # Watchers question — accept so linger gets a chance to fire.
+            saw_watchers_question = True
+            w.expect(r"\[Y/n\]")
+            w.sendline("y")
+        elif idx == 2:
+            # Some other [Y/n] before watchers question — accept and continue.
+            w.sendline("y")
         else:
             break
 finally:
     w.close()
-print("LINGER_QUESTION_FIRED" if saw_linger else "LINGER_QUESTION_MISSING")
+print("LINGER_QUESTION_FIRED" if saw_linger else "LINGER_QUESTION_MISSING",
+      f"(watchers_q_seen={saw_watchers_question})")
 PY
 )"
     echo "${output}" | grep -q LINGER_QUESTION_FIRED \
