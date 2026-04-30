@@ -1543,3 +1543,86 @@ def test_search_with_colon_query_does_not_crash(db, tmp_path, monkeypatch, capsy
         out = capsys.readouterr().out
         assert "syntax error" not in out, f"crashed on query: {q!r}"
         assert "no such column" not in out, f"crashed on query: {q!r}"
+
+
+# ── F-10: read-only fallback when DB writes are sandboxed ────────────────────
+
+
+def test_open_db_readonly_flag_returns_readonly_connection(tmp_path, monkeypatch):
+    """Explicit readonly=True opens the DB without WAL or chmod, suitable
+    for sandboxed subprocesses (codex CLI restricts writes outside cwd)."""
+    import apsw
+    db_file = tmp_path / "test.db"
+    monkeypatch.setattr(ingest, "DB_PATH", db_file)
+    monkeypatch.setattr(ingest, "_vc", None)
+    # Seed with a write connection first.
+    seed = ingest.open_db()
+    seed.execute("INSERT INTO sessions(session_id, project_slug, title, "
+                 "first_seen, last_updated, agent) VALUES (?,?,?,?,?,?)",
+                 ("s1", "p", None, "2026-01-01", "2026-01-01", "claude"))
+    seed.close()
+
+    # Now reopen read-only.
+    monkeypatch.setattr(ingest, "_vc", None)
+    con = ingest.open_db(readonly=True)
+    rows = con.execute("SELECT session_id FROM sessions").fetchall()
+    assert rows[0]["session_id"] == "s1"
+    # Writes must fail.
+    import pytest as _pytest
+    with _pytest.raises(apsw.ReadOnlyError):
+        con.execute("INSERT INTO sessions(session_id, project_slug, title, "
+                    "first_seen, last_updated, agent) VALUES (?,?,?,?,?,?)",
+                    ("s2", "p", None, "2026-01-01", "2026-01-01", "claude"))
+    con.close()
+
+
+def test_open_db_readonly_raises_when_db_missing(tmp_path, monkeypatch):
+    """Read-only on a non-existent DB is a hard error — there's nothing
+    to read, and silently creating it would mask config bugs."""
+    import apsw
+    monkeypatch.setattr(ingest, "DB_PATH", tmp_path / "does-not-exist.db")
+    monkeypatch.setattr(ingest, "_vc", None)
+    import pytest as _pytest
+    with _pytest.raises(apsw.CantOpenError, match="DB not found"):
+        ingest.open_db(readonly=True)
+
+
+def test_open_db_falls_back_to_readonly_on_wal_cantopen(tmp_path, monkeypatch, capsys):
+    """The Codex CLI bug: parent dir is readable but the sandbox blocks
+    WAL sidecar writes, so `con.execute('PRAGMA journal_mode=WAL')`
+    raises apsw.CantOpenError. Fall back to read-only with a warning."""
+    import os, stat
+
+    # Seed an existing DB so the read-only fallback has something to open.
+    db_dir = tmp_path / "db"
+    db_dir.mkdir()
+    db_file = db_dir / "test.db"
+    monkeypatch.setattr(ingest, "DB_PATH", db_file)
+    monkeypatch.setattr(ingest, "_vc", None)
+    seed = ingest.open_db()
+    seed.execute("INSERT INTO sessions(session_id, project_slug, title, "
+                 "first_seen, last_updated, agent) VALUES (?,?,?,?,?,?)",
+                 ("s1", "p", None, "2026-01-01", "2026-01-01", "claude"))
+    seed.close()
+    monkeypatch.setattr(ingest, "_vc", None)
+
+    # Monkeypatch the WAL helper to raise CantOpenError, mirroring the
+    # codex sandbox where WAL sidecar creation fails. Realistic chmod
+    # doesn't reliably trigger this on all OSes (running as root in
+    # docker bypasses perms; macOS handles WAL sidecars differently).
+    import apsw
+
+    def _fake_wal(con):
+        raise apsw.CantOpenError("simulated sandbox: cannot create WAL sidecar")
+
+    monkeypatch.setattr(ingest, "_enable_wal_mode", _fake_wal)
+
+    capsys.readouterr()  # drain
+    con = ingest.open_db()
+    err = capsys.readouterr().err
+    assert "DB write access denied" in err, (
+        f"expected fallback warning on stderr; got: {err!r}"
+    )
+    rows = con.execute("SELECT session_id FROM sessions").fetchall()
+    assert rows[0]["session_id"] == "s1"
+    con.close()

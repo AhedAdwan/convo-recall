@@ -199,8 +199,41 @@ def _harden_perms(path: Path, mode: int) -> None:
         pass
 
 
-def open_db() -> apsw.Connection:
+def _enable_wal_mode(con: apsw.Connection) -> None:
+    """Wrapper around the WAL pragma. Extracted so tests can monkeypatch
+    it to simulate the codex-style sandbox where WAL sidecar creation
+    fails with apsw.CantOpenError."""
+    con.execute("PRAGMA journal_mode=WAL")
+
+
+def open_db(readonly: bool = False) -> apsw.Connection:
     global _vc
+    # Read-only mode: open the DB without trying to create sidecars or
+    # chmod the parent dir. Used by search/stats/doctor under sandboxed
+    # subprocess contexts (e.g. Codex CLI restricts writes to the
+    # project working dir; WAL mode creates `.db-wal` and `.db-shm`
+    # outside that dir → apsw.CantOpenError on the WAL pragma).
+    if readonly:
+        if not DB_PATH.exists():
+            # Read-only on a missing DB is a hard error — there's
+            # nothing to read. Surface it before apsw does.
+            raise apsw.CantOpenError(
+                f"DB not found at {DB_PATH} (CONVO_RECALL_DB not set; "
+                f"run `recall install` or set the env var)"
+            )
+        con = apsw.Connection(str(DB_PATH), flags=apsw.SQLITE_OPEN_READONLY)
+        con.row_trace = _row_factory
+        try:
+            import sqlite_vec
+            con.enableloadextension(True)
+            sqlite_vec.load(con)
+            con.enableloadextension(False)
+            _VEC_ENABLED[con] = True
+            _vc = con
+        except Exception:
+            pass  # FTS-only is fine for read-only callers
+        return con
+
     # Owner-only on the parent dir AND the DB + WAL/SHM sidecars. The DB
     # contains conversation history including any secrets pasted into chats;
     # default umask 0o022 would publish it to other UIDs on a multi-user box.
@@ -208,7 +241,20 @@ def open_db() -> apsw.Connection:
     _harden_perms(DB_PATH.parent, 0o700)
     con = apsw.Connection(str(DB_PATH))
     con.row_trace = _row_factory
-    con.execute("PRAGMA journal_mode=WAL")
+    try:
+        _enable_wal_mode(con)
+    except apsw.CantOpenError:
+        # Sandboxed subprocess (codex CLI, seatbelt, landlock-restricted
+        # shell) — the parent dir is readable but writes are blocked, so
+        # WAL can't create its sidecars. Auto-fall back to read-only so
+        # search/stats/doctor still work; write-needing operations will
+        # fail clearly when they try.
+        print("[warn] DB write access denied — falling back to read-only "
+              "mode. `recall ingest` and friends won't work in this "
+              "shell; set CONVO_RECALL_DB to a writable path or run "
+              "outside the sandbox.", file=sys.stderr)
+        con.close()
+        return open_db(readonly=True)
     con.execute("PRAGMA synchronous=NORMAL")
     for sidecar in (DB_PATH, DB_PATH.with_suffix(DB_PATH.suffix + "-wal"),
                     DB_PATH.with_suffix(DB_PATH.suffix + "-shm")):
