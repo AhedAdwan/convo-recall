@@ -184,9 +184,23 @@ Override with `--project <slug>` or search everything with `--all-projects`. If 
 
 ## Pre-prompt hooks (Claude / Codex / Gemini)
 
-convo-recall ships a single shell hook that injects a "search history first" hint into the model's context on every user turn. Same script works in all three CLIs — it auto-detects the event from the JSON payload each CLI sends on stdin and echoes back the right `hookEventName` so each accepts the response.
+convo-recall ships a single shell hook that auto-runs `recall search` against your prompt and injects the top hits as context on every substantive user turn. Same script works in all three CLIs — it auto-detects the event from the JSON payload each CLI sends on stdin and echoes back the right `hookEventName` so each accepts the response.
 
 The script is at `src/convo_recall/hooks/conversation-memory.sh`. Without these hooks wired, your AI agents won't know convo-recall exists and will keep guessing/web-searching despite the indexed history sitting right there.
+
+**Behavior:**
+- Substantive prompts (≥12 chars, not pure interjections like "yes" / "ok" / "hmm"): hook runs `recall search "$prompt" -n 3 --json` and prepends top hits to context.
+- Trivial prompts: hook returns empty context, zero token bloat.
+- Opt out entirely: set `CONVO_RECALL_HOOK_AUTO_SEARCH=off` in your env.
+
+### Custom instructions
+
+The hook also reads two optional files and prepends their content to the injected context — useful for per-machine and per-repo guidance:
+
+- **Global**: `~/.config/convo-recall/instructions.md` (or `$XDG_CONFIG_HOME/convo-recall/instructions.md`)
+- **Per-project**: `.recall-instructions.md` in the cwd
+
+Each is capped at 2 KB. Both are optional. If both exist, global content goes first, then per-project, then prior-context, then the static reminder.
 
 ### Quickest path
 

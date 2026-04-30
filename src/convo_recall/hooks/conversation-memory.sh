@@ -41,7 +41,7 @@ import re
 import sys
 
 payload_raw = sys.argv[1] if len(sys.argv) > 1 else ""
-cwd = sys.argv[2] if len(sys.argv) > 2 else ""
+_bash_cwd = sys.argv[2] if len(sys.argv) > 2 else ""
 
 # Determine which event we're answering.
 event = "UserPromptSubmit"
@@ -49,6 +49,11 @@ try:
     data = json.loads(payload_raw) if payload_raw else {}
 except Exception:
     data = {}
+
+# JSON-supplied cwd is more reliable than the bash-side pwd — the hook
+# might be invoked with a different working dir than the agent's actual
+# cwd. Fall back to bash pwd only when the payload doesn't carry it.
+cwd = data.get("cwd") or _bash_cwd
 name = data.get("hook_event_name")
 if name:
     event = name
@@ -170,7 +175,46 @@ if slug:
 else:
     project_line = ""
 
+# ── Custom instructions — global + per-project ad-hoc guidance ───────────────
+#
+# Two optional files. If present, their contents are prepended to the
+# additionalContext (before prior-context + static reminder), so users can
+# add per-machine and per-repo guidance without editing the shipped hook.
+#
+#   1. Global:        $XDG_CONFIG_HOME/convo-recall/instructions.md
+#                     (default ~/.config/convo-recall/instructions.md)
+#   2. Project-local: <cwd>/.recall-instructions.md
+#
+# Order: global → project-local → prior-context → static reminder.
+# Each file is capped at 2 KB to prevent runaway context bloat from a
+# hand-edited file; excess is truncated with a `…` marker.
+
+_INSTRUCTIONS_BYTE_CAP = 2048
+
+
+def _read_instructions(path):
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, PermissionError, OSError):
+        return ""
+    if not text.strip():
+        return ""
+    if len(text.encode("utf-8")) > _INSTRUCTIONS_BYTE_CAP:
+        text = text[: _INSTRUCTIONS_BYTE_CAP] + "\n…[truncated]"
+    return text.rstrip() + "\n\n"
+
+
+import pathlib
+xdg_config = os.environ.get("XDG_CONFIG_HOME") or str(pathlib.Path.home() / ".config")
+global_instr = _read_instructions(pathlib.Path(xdg_config) / "convo-recall" / "instructions.md")
+
+project_instr = ""
+if cwd:
+    project_instr = _read_instructions(pathlib.Path(cwd) / ".recall-instructions.md")
+
 context_text = (
+    f"{global_instr}"
+    f"{project_instr}"
     f"{prior_block}"
     "Before searching the web, guessing, or reinventing something already "
     "solved — this project's full conversation history is searchable via "
