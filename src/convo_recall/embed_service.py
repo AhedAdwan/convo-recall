@@ -22,6 +22,15 @@ from typing import Optional
 
 PROTOCOL_VERSION = 1
 DEFAULT_MODEL = "BAAI/bge-large-en-v1.5"
+# Pin model revision to mitigate supply-chain risk: a future malicious
+# upload to BAAI/bge-large-en-v1.5 cannot silently replace the weights once
+# this revision is locked. SHA below is the v1.5 commit pulled on first use
+# during 2026 Q2 — bump deliberately when upgrading models. Override with
+# CONVO_RECALL_MODEL_REVISION env var for testing.
+DEFAULT_MODEL_REVISION = os.environ.get(
+    "CONVO_RECALL_MODEL_REVISION",
+    "d4aa6901d3a41ba39fb536a557fa166f842b0e09",
+)
 DEFAULT_SOCK = Path(os.environ.get("CONVO_RECALL_SOCK",
                     Path.home() / ".local" / "share" / "convo-recall" / "embed.sock"))
 SEMAPHORE_SIZE = 8
@@ -38,13 +47,17 @@ log = logging.getLogger(__name__)
 class _Model:
     _instance: Optional["_Model"] = None
 
-    def __init__(self, model_name: str = DEFAULT_MODEL):
+    def __init__(self, model_name: str = DEFAULT_MODEL,
+                 revision: str = DEFAULT_MODEL_REVISION):
         import torch
         from sentence_transformers import SentenceTransformer
         self.name = model_name
+        self.revision = revision
         self.device = "mps" if torch.backends.mps.is_available() else "cpu"
-        log.info(f"Loading {model_name} on {self.device}…")
-        self.model = SentenceTransformer(model_name, device=self.device)
+        log.info(f"Loading {model_name}@{revision[:8]} on {self.device}…")
+        self.model = SentenceTransformer(
+            model_name, device=self.device, revision=revision
+        )
         self.dim: int = self.model.get_sentence_embedding_dimension()
         log.info(f"Model ready (dim={self.dim})")
 

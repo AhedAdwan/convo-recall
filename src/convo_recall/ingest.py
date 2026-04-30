@@ -18,8 +18,11 @@ import struct
 import sys
 
 import apsw
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
+
+from . import redact as _redact
 
 DB_PATH = Path(os.environ.get("CONVO_RECALL_DB",
                Path.home() / ".local" / "share" / "convo-recall" / "conversations.db"))
@@ -42,12 +45,23 @@ MAX_QUERY_LEN = 2048
 RRF_K = 60
 DECAY_HALF_LIFE_DAYS = 90
 
-# Single apsw connection for both FTS and vector ops. _vc points at the same
-# connection when sqlite-vec is available (or None when it isn't, which puts
-# the library in FTS-only mode). Using a single connection avoids the
+# Vec-enabled state lives per-connection so multiple open_db() calls in one
+# process (test runners, in-memory bench harnesses) don't clobber each other.
+# A single apsw connection serves both FTS and vector ops to avoid the
 # cross-libsqlite3-version corruption that occurs when stdlib sqlite3 (e.g.
 # 3.45 on Ubuntu 24.04) shares a DB file with apsw's bundled sqlite (3.53).
-_vc = None  # module-level apsw connection, initialised in open_db()
+_VEC_ENABLED: "weakref.WeakKeyDictionary[apsw.Connection, bool]" = weakref.WeakKeyDictionary()
+
+
+def _vec_ok(con: apsw.Connection) -> bool:
+    return _VEC_ENABLED.get(con, False)
+
+
+# Backward-compat shim: tests historically monkeypatched `_vc` to None. We keep
+# the name as a property-like attribute that resolves to the most recently
+# opened vec-enabled connection (or None). New code should use `_vec_ok(con)`
+# and pass the connection through to vec helpers.
+_vc: apsw.Connection | None = None  # last vec-enabled connection (legacy)
 
 
 class _Row:
@@ -113,6 +127,8 @@ def _clean_content(text: str) -> str:
     text = _XML_PAIR_RE.sub('', text)
     text = _XML_SOLO_RE.sub('', text)
     text = _BOX_BRAILLE_RE.sub('', text)
+    if os.environ.get("CONVO_RECALL_REDACT") != "off":
+        text = _redact.redact_secrets(text)
     text = _BLANK_LINES_RE.sub('\n\n', text)
     text = _expand_code_tokens(text)
     return text.strip()
@@ -120,28 +136,47 @@ def _clean_content(text: str) -> str:
 
 # ── Embedding client ──────────────────────────────────────────────────────────
 
+# Sidecar timeout: the model is in-process and embedding is fast (<200ms
+# warm), but a hung sidecar (deadlock, GPU stall) used to freeze ingestion
+# indefinitely. Cap at 30s — generous enough for long inputs that need
+# server-side chunking, short enough to surface a problem same-day.
+_EMBED_TIMEOUT_S = 30.0
+
+
 class _UnixHTTPConn(http.client.HTTPConnection):
-    def __init__(self, sock_path: str):
-        super().__init__("localhost")
+    def __init__(self, sock_path: str, timeout: float = _EMBED_TIMEOUT_S):
+        super().__init__("localhost", timeout=timeout)
         self._sock_path = sock_path
 
     def connect(self):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
         self.sock.connect(self._sock_path)
 
 
 def embed(text: str, mode: str = "document") -> list[float] | None:
-    """POST text to the UDS embed service. Returns None if unreachable.
-    Long texts are chunked and mean-pooled by the sidecar — no client-side truncation."""
+    """POST text to the UDS embed service. Returns None if unreachable
+    or the sidecar returns a non-200 / malformed response.
+
+    Long texts are chunked and mean-pooled by the sidecar — no client-side
+    truncation. Caller falls back to FTS-only when this returns None.
+    """
     body = json.dumps({"text": text, "mode": mode}).encode()
     conn = _UnixHTTPConn(str(EMBED_SOCK))
     try:
         conn.request("POST", "/embed", body=body,
                      headers={"Content-Type": "application/json"})
         resp = conn.getresponse()
-        return json.loads(resp.read())["vector"]
-    except (ConnectionRefusedError, FileNotFoundError, OSError):
-        return None  # service down — expected when sidecar not running
+        if resp.status != 200:
+            # Drain so the connection can close cleanly. Don't spam stderr —
+            # a sidecar that's rate-limiting (429) or briefly unhealthy is a
+            # transient condition, and the caller already degrades to FTS.
+            try: resp.read()
+            except Exception: pass
+            return None
+        return json.loads(resp.read()).get("vector")
+    except (ConnectionRefusedError, FileNotFoundError, OSError, socket.timeout):
+        return None  # service down or hung — expected when sidecar isn't healthy
     except Exception as e:
         print(f"[warn] embed: {type(e).__name__}: {e}", file=sys.stderr)
         return None
@@ -155,35 +190,58 @@ def _vec_bytes(v: list[float]) -> bytes:
 
 # ── DB setup ──────────────────────────────────────────────────────────────────
 
+def _harden_perms(path: Path, mode: int) -> None:
+    """Set mode to {mode} if not already; ignore if file doesn't exist."""
+    try:
+        if path.exists() and (os.stat(path).st_mode & 0o777) != mode:
+            os.chmod(path, mode)
+    except OSError:
+        pass
+
+
 def open_db() -> apsw.Connection:
     global _vc
+    # Owner-only on the parent dir AND the DB + WAL/SHM sidecars. The DB
+    # contains conversation history including any secrets pasted into chats;
+    # default umask 0o022 would publish it to other UIDs on a multi-user box.
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _harden_perms(DB_PATH.parent, 0o700)
     con = apsw.Connection(str(DB_PATH))
     con.row_trace = _row_factory
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
+    for sidecar in (DB_PATH, DB_PATH.with_suffix(DB_PATH.suffix + "-wal"),
+                    DB_PATH.with_suffix(DB_PATH.suffix + "-shm")):
+        _harden_perms(sidecar, 0o600)
     try:
         import sqlite_vec
         con.enableloadextension(True)
         sqlite_vec.load(con)
         con.enableloadextension(False)
+        _VEC_ENABLED[con] = True
         _vc = con
     except Exception as e:
         print(f"[warn] sqlite-vec unavailable (FTS-only mode): {e}", file=sys.stderr)
+        _VEC_ENABLED[con] = False
         _vc = None
     _init_schema(con)
+    _ensure_migrations_table(con)
     _migrate_add_agent_column(con)
     _migrate_fts_porter(con)
-    if _vc is not None:
-        _init_vec_tables(_vc)
+    if _vec_ok(con):
+        _init_vec_tables(con)
     return con
 
 
 def close_db(con: apsw.Connection) -> None:
-    """Close the single apsw connection."""
+    """Close one apsw connection. Per-connection vec state is auto-cleaned
+    by the WeakKeyDictionary when `con` is garbage-collected, but we also
+    clear the legacy `_vc` shim if it pointed here."""
     global _vc
+    if _vc is con:
+        _vc = None
+    _VEC_ENABLED.pop(con, None)
     con.close()
-    _vc = None
 
 
 def _init_schema(con: apsw.Connection) -> None:
@@ -246,12 +304,41 @@ def _has_column(con: apsw.Connection, table: str, column: str) -> bool:
     return column in names
 
 
+def _ensure_migrations_table(con: apsw.Connection) -> None:
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations ("
+        "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+    )
+
+
+def _migration_applied(con: apsw.Connection, version: int) -> bool:
+    row = con.execute(
+        "SELECT 1 FROM schema_migrations WHERE version = ?", (version,)
+    ).fetchone()
+    return row is not None
+
+
+def _record_migration(con: apsw.Connection, version: int) -> None:
+    con.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+        (version, datetime.now(timezone.utc).isoformat()),
+    )
+
+
+# Schema versions. New migrations append here.
+_MIGRATION_AGENT_COLUMN = 2  # v2: add agent column to sessions/messages/ingested_files
+_MIGRATION_FTS_PORTER = 3    # v3: rebuild FTS with porter+unicode61 + agent column
+
+
 def _migrate_add_agent_column(con: apsw.Connection) -> None:
     """Add `agent` column to legacy DBs that pre-date multi-agent support.
 
-    Idempotent: each ALTER guarded by PRAGMA table_info check. Backfills
-    existing rows with 'claude' (the only agent before this migration).
+    Idempotent: gated on schema_migrations version 2; falls back to PRAGMA
+    table_info check for DBs that pre-date the schema_migrations table.
+    Backfills existing rows with 'claude' (the only agent before).
     """
+    if _migration_applied(con, _MIGRATION_AGENT_COLUMN):
+        return
     altered = []
     for table in ("sessions", "messages", "ingested_files"):
         if not _has_column(con, table, "agent"):
@@ -266,12 +353,15 @@ def _migrate_add_agent_column(con: apsw.Connection) -> None:
             "(backfilled to 'claude').",
             file=sys.stderr,
         )
+    _record_migration(con, _MIGRATION_AGENT_COLUMN)
 
 
 def _migrate_fts_porter(con: apsw.Connection) -> None:
     """Migrate FTS table to porter+unicode61 tokenizer if needed AND make sure
     the FTS schema includes the `agent` UNINDEXED column. Both conditions
     trigger the same drop-rebuild flow (they share a code path)."""
+    if _migration_applied(con, _MIGRATION_FTS_PORTER):
+        return
     row = con.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts'"
     ).fetchone()
@@ -279,39 +369,52 @@ def _migrate_fts_porter(con: apsw.Connection) -> None:
     needs_porter = "porter" not in sql
     needs_agent = "agent" not in sql
     if not (needs_porter or needs_agent):
+        _record_migration(con, _MIGRATION_FTS_PORTER)
         return
     why = []
     if needs_porter: why.append("porter unicode61 tokenizer")
     if needs_agent: why.append("agent column")
     print(f"[migrate] Rebuilding FTS index ({', '.join(why)})…", file=sys.stderr)
-    con.execute("""
-        DROP TRIGGER IF EXISTS messages_ai;
-        DROP TRIGGER IF EXISTS messages_ad;
-        DROP TABLE IF EXISTS messages_fts;
+    # Wrap the multi-statement migration in a single transaction so a SIGTERM
+    # or crash mid-way leaves the DB in either the old or new state — never
+    # a half-migrated state with no FTS table where subsequent inserts would
+    # silently go un-indexed.
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("""
+            DROP TRIGGER IF EXISTS messages_ai;
+            DROP TRIGGER IF EXISTS messages_ad;
+            DROP TABLE IF EXISTS messages_fts;
 
-        CREATE VIRTUAL TABLE messages_fts USING fts5(
-            content,
-            session_id   UNINDEXED,
-            project_slug UNINDEXED,
-            role         UNINDEXED,
-            agent        UNINDEXED,
-            content='messages',
-            content_rowid='rowid',
-            tokenize='porter unicode61'
-        );
+            CREATE VIRTUAL TABLE messages_fts USING fts5(
+                content,
+                session_id   UNINDEXED,
+                project_slug UNINDEXED,
+                role         UNINDEXED,
+                agent        UNINDEXED,
+                content='messages',
+                content_rowid='rowid',
+                tokenize='porter unicode61'
+            );
 
-        CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
-            INSERT INTO messages_fts(rowid, content, session_id, project_slug, role, agent)
-            VALUES (new.rowid, new.content, new.session_id, new.project_slug, new.role, new.agent);
-        END;
+            CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content, session_id, project_slug, role, agent)
+                VALUES (new.rowid, new.content, new.session_id, new.project_slug, new.role, new.agent);
+            END;
 
-        CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
-            INSERT INTO messages_fts(messages_fts, rowid, content, session_id, project_slug, role, agent)
-            VALUES ('delete', old.rowid, old.content, old.session_id, old.project_slug, old.role, old.agent);
-        END;
+            CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content, session_id, project_slug, role, agent)
+                VALUES ('delete', old.rowid, old.content, old.session_id, old.project_slug, old.role, old.agent);
+            END;
 
-        INSERT INTO messages_fts(messages_fts) VALUES('rebuild');
-    """)
+            INSERT INTO messages_fts(messages_fts) VALUES('rebuild');
+        """)
+        con.execute("COMMIT")
+    except Exception:
+        try: con.execute("ROLLBACK")
+        except Exception: pass
+        raise
+    _record_migration(con, _MIGRATION_FTS_PORTER)
     print("[migrate] Done.", file=sys.stderr)
 
 
@@ -324,11 +427,11 @@ def _init_vec_tables(vc) -> None:
     """)
 
 
-def _vec_insert(rowid: int, vec: list[float]) -> None:
-    if _vc is None:
+def _vec_insert(con: apsw.Connection, rowid: int, vec: list[float]) -> None:
+    if not _vec_ok(con):
         return
     try:
-        _vc.execute(
+        con.execute(
             "INSERT OR REPLACE INTO message_vecs(rowid, embedding) VALUES (?, ?)",
             (rowid, _vec_bytes(vec)),
         )
@@ -336,11 +439,37 @@ def _vec_insert(rowid: int, vec: list[float]) -> None:
         pass
 
 
-def _vec_search(qvec: list[float], k: int = 100) -> list[int]:
-    if _vc is None:
+def _vec_search(con: apsw.Connection, qvec: list[float], k: int = 100,
+                restrict_rowids: set[int] | None = None) -> list[int]:
+    """Vector KNN search. When `restrict_rowids` is set, results are limited
+    to that subset. For small subsets (<500) we compute cosine in Python
+    against the filtered embeddings — exact recall, sub-millisecond at this
+    size. For larger sets we ask sqlite-vec for a generous top-k and let the
+    caller intersect.
+    """
+    if not _vec_ok(con):
         return []
     try:
-        rows = _vc.execute(
+        if restrict_rowids is not None and len(restrict_rowids) < 500:
+            placeholders = ",".join("?" * len(restrict_rowids))
+            rows = con.execute(
+                f"SELECT rowid, embedding FROM message_vecs "
+                f"WHERE rowid IN ({placeholders})",
+                tuple(restrict_rowids),
+            ).fetchall()
+            qbytes = _vec_bytes(qvec)
+            scored: list[tuple[float, int]] = []
+            qf = struct.unpack(f"{EMBED_DIM}f", qbytes)
+            for r in rows:
+                emb = struct.unpack(f"{EMBED_DIM}f", r[1])
+                # Vectors from BAAI/bge-large-en-v1.5 are L2-normalized at the
+                # sidecar, so dot product == cosine similarity. No norm needed.
+                dot = sum(a * b for a, b in zip(qf, emb))
+                scored.append((dot, r[0]))
+            scored.sort(reverse=True)
+            return [rid for _, rid in scored[:k]]
+
+        rows = con.execute(
             "SELECT rowid FROM message_vecs WHERE embedding MATCH ? AND k = ?",
             (_vec_bytes(qvec), k),
         ).fetchall()
@@ -349,11 +478,11 @@ def _vec_search(qvec: list[float], k: int = 100) -> list[int]:
         return []
 
 
-def _vec_count() -> int:
-    if _vc is None:
+def _vec_count(con: apsw.Connection) -> int:
+    if not _vec_ok(con):
         return 0
     try:
-        return _vc.execute("SELECT COUNT(*) FROM message_vecs").fetchone()[0]
+        return con.execute("SELECT COUNT(*) FROM message_vecs").fetchone()[0]
     except Exception:
         return 0
 
@@ -515,9 +644,14 @@ def detect_agents() -> list[dict]:
 
 
 def load_config() -> dict:
-    """Load `~/.local/share/convo-recall/config.json` or return defaults."""
+    """Load `~/.local/share/convo-recall/config.json` or return defaults.
+
+    Also re-chmod the file to 0o600 if it was created with a wider mode
+    (e.g. by a shell `echo > config.json` that bypassed `save_config`).
+    """
     if not _CONFIG_PATH.exists():
         return {"agents": ["claude"]}  # default — preserves pre-multi-agent behavior
+    _harden_perms(_CONFIG_PATH, 0o600)
     try:
         return json.loads(_CONFIG_PATH.read_text())
     except (json.JSONDecodeError, OSError) as e:
@@ -554,6 +688,7 @@ def ingest_file(con: apsw.Connection, jsonl_path: Path,
     session_id = _session_id_from_path(jsonl_path)
 
     inserted = 0
+    malformed = 0
     title = None
     lines_read = 0
 
@@ -573,6 +708,7 @@ def ingest_file(con: apsw.Connection, jsonl_path: Path,
             try:
                 rec = json.loads(raw)
             except (json.JSONDecodeError, ValueError):
+                malformed += 1
                 continue
 
             rtype = rec.get("type")
@@ -595,24 +731,10 @@ def ingest_file(con: apsw.Connection, jsonl_path: Path,
             timestamp = rec.get("timestamp")
             model = msg.get("model") if role == "assistant" else None
 
-            try:
-                con.execute(
-                    """INSERT OR IGNORE INTO messages
-                       (uuid, session_id, project_slug, role, content, timestamp, model, agent)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (uuid, session_id, project_slug, role, text, timestamp, model, agent),
-                )
-                changed = con.changes()
-                if changed and do_embed and _vc is not None:
-                    rowid = con.execute(
-                        "SELECT rowid FROM messages WHERE uuid = ?", (uuid,)
-                    ).fetchone()[0]
-                    vec = embed(text)
-                    if vec:
-                        _vec_insert(rowid, vec)
-                inserted += changed
-            except apsw.Error:
-                pass
+            inserted += _persist_message(
+                con, agent, project_slug, session_id, uuid, role, text,
+                timestamp, do_embed, model=model,
+            )
 
             # Index tool_result error blocks within user messages
             if rtype == "user":
@@ -633,74 +755,80 @@ def ingest_file(con: apsw.Connection, jsonl_path: Path,
                         tr_text = _clean_content(raw_tr[:500])
                         if not tr_text:
                             continue
-                        try:
-                            con.execute(
-                                """INSERT OR IGNORE INTO messages
-                                   (uuid, session_id, project_slug, role,
-                                    content, timestamp, model, agent)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                                (tr_uuid, session_id, project_slug, "tool_error",
-                                 tr_text, timestamp, None, agent),
-                            )
-                            tr_changed = con.changes()
-                            if tr_changed and do_embed and _vc is not None:
-                                tr_rowid = con.execute(
-                                    "SELECT rowid FROM messages WHERE uuid = ?", (tr_uuid,)
-                                ).fetchone()[0]
-                                tr_vec = embed(tr_text)
-                                if tr_vec:
-                                    _vec_insert(tr_rowid, tr_vec)
-                            inserted += tr_changed
-                        except apsw.Error:
-                            pass
+                        inserted += _persist_message(
+                            con, agent, project_slug, session_id, tr_uuid,
+                            "tool_error", tr_text, timestamp, do_embed,
+                        )
 
     now = datetime.now(timezone.utc).isoformat()
+    _upsert_session(con, agent, project_slug, session_id, title, now, now)
+    _upsert_ingested_file(con, agent, file_key, session_id, project_slug,
+                           lines_read, stat.st_mtime)
+    if malformed:
+        print(f"[warn] {malformed} malformed JSONL record(s) skipped in "
+              f"{jsonl_path.name}", file=sys.stderr)
+    return inserted
+
+
+def _upsert_session(con: apsw.Connection, agent: str, project_slug: str,
+                    session_id: str, title: str | None,
+                    first_seen: str, now: str) -> None:
+    """Insert or refresh a sessions row. Title is only set if provided."""
     con.execute(
-        """INSERT INTO sessions (session_id, project_slug, title, first_seen, last_updated, agent)
+        """INSERT INTO sessions (session_id, project_slug, title, first_seen,
+                                 last_updated, agent)
            VALUES (?, ?, ?, ?, ?, ?)
            ON CONFLICT(session_id) DO UPDATE SET
                title = COALESCE(excluded.title, sessions.title),
                last_updated = excluded.last_updated,
                agent = excluded.agent""",
-        (session_id, project_slug, title, now, now, agent),
+        (session_id, project_slug, title, first_seen, now, agent),
     )
+
+
+def _upsert_ingested_file(con: apsw.Connection, agent: str, file_key: str,
+                          session_id: str, project_slug: str,
+                          lines_read: int, mtime: float) -> None:
+    """Insert or refresh an ingested_files row."""
     con.execute(
         """INSERT INTO ingested_files
-               (file_path, session_id, project_slug, lines_ingested, last_modified, agent)
+               (file_path, session_id, project_slug, lines_ingested,
+                last_modified, agent)
            VALUES (?, ?, ?, ?, ?, ?)
            ON CONFLICT(file_path) DO UPDATE SET
                lines_ingested = excluded.lines_ingested,
                last_modified  = excluded.last_modified,
                agent          = excluded.agent""",
-        (file_key, session_id, project_slug, lines_read, stat.st_mtime, agent),
+        (file_key, session_id, project_slug, lines_read, mtime, agent),
     )
-    return inserted
 
 
 def _persist_message(con: apsw.Connection, agent: str, project_slug: str,
                      session_id: str, uuid: str, role: str, text: str,
-                     timestamp: str | None, do_embed: bool) -> int:
+                     timestamp: str | None, do_embed: bool,
+                     model: str | None = None) -> int:
     """Insert one message row + (if vec is up) embedding. Returns rows changed
-    (0 or 1). Shared helper used by gemini and codex parsers; ingest_file
-    keeps its own inline INSERT for now to preserve tool_error indexing
-    behavior unchanged from pre-multi-agent code."""
+    (0 or 1). Shared by all per-agent parsers and the tool_error path."""
     try:
-        con.execute(
+        # RETURNING is atomic: returns [(rowid,)] on insert, [] on conflict.
+        # One round-trip instead of INSERT + SELECT after.
+        ret = con.execute(
             """INSERT OR IGNORE INTO messages
                (uuid, session_id, project_slug, role, content, timestamp, model, agent)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (uuid, session_id, project_slug, role, text, timestamp, None, agent),
-        )
-        changed = con.changes()
-        if changed and do_embed and _vc is not None:
-            rowid = con.execute(
-                "SELECT rowid FROM messages WHERE uuid = ?", (uuid,)
-            ).fetchone()[0]
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING rowid""",
+            (uuid, session_id, project_slug, role, text, timestamp, model, agent),
+        ).fetchall()
+        if not ret:
+            return 0
+        rowid = ret[0][0]
+        if do_embed and _vec_ok(con):
             vec = embed(text)
             if vec:
-                _vec_insert(rowid, vec)
-        return changed
-    except apsw.Error:
+                _vec_insert(con, rowid, vec)
+        return 1
+    except apsw.Error as _e:
+        print(f"[warn] _persist_message failed for uuid={uuid!r}: "
+              f"{type(_e).__name__}: {_e}", file=sys.stderr)
         return 0
 
 
@@ -734,10 +862,17 @@ def ingest_gemini_file(con: apsw.Connection, jsonl_path: Path,
         return 0
     lines_already = row["lines_ingested"] if row else 0
 
-    project_slug = _gemini_slug_from_path(jsonl_path)
+    # Three-layer slug resolution:
+    #   1. cwd from session header (set when we see it during the read loop)
+    #   2. alias map at ~/.local/share/convo-recall/gemini-aliases.json
+    #   3. last resort: the SHA-hash dir name unchanged
+    hash_dir = _gemini_slug_from_path(jsonl_path)
+    aliases = _load_gemini_aliases()
+    project_slug = aliases.get(hash_dir, hash_dir)
     session_id = jsonl_path.stem  # fallback if no header
     first_seen = None
     inserted = 0
+    malformed = 0
     lines_read = 0
 
     with open(jsonl_path, "r", errors="replace") as f:
@@ -748,13 +883,17 @@ def ingest_gemini_file(con: apsw.Connection, jsonl_path: Path,
             try:
                 rec = json.loads(raw)
             except (json.JSONDecodeError, ValueError):
+                malformed += 1
                 continue
-            # Header record (no `type`) — extract sessionId/startTime
+            # Header record (no `type`) — extract sessionId/startTime/cwd
             if "$set" in rec:
                 continue
             if "sessionId" in rec and "type" not in rec:
                 session_id = rec.get("sessionId", session_id)
                 first_seen = rec.get("startTime") or first_seen
+                cwd = rec.get("cwd") or rec.get("projectDir")
+                if cwd:
+                    project_slug = _slug_from_cwd(cwd)
                 continue
             rtype = rec.get("type")
             if rtype not in ("user", "gemini"):
@@ -769,29 +908,18 @@ def ingest_gemini_file(con: apsw.Connection, jsonl_path: Path,
                                           uuid, role, text, timestamp, do_embed)
 
     now = datetime.now(timezone.utc).isoformat()
-    con.execute(
-        """INSERT INTO sessions (session_id, project_slug, title, first_seen, last_updated, agent)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(session_id) DO UPDATE SET
-               last_updated = excluded.last_updated,
-               agent        = excluded.agent""",
-        (session_id, project_slug, None, first_seen or now, now, "gemini"),
-    )
-    con.execute(
-        """INSERT INTO ingested_files
-               (file_path, session_id, project_slug, lines_ingested, last_modified, agent)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(file_path) DO UPDATE SET
-               lines_ingested = excluded.lines_ingested,
-               last_modified  = excluded.last_modified,
-               agent          = excluded.agent""",
-        (file_key, session_id, project_slug, lines_read, stat.st_mtime, "gemini"),
-    )
+    _upsert_session(con, "gemini", project_slug, session_id, None,
+                    first_seen or now, now)
+    _upsert_ingested_file(con, "gemini", file_key, session_id, project_slug,
+                          lines_read, stat.st_mtime)
+    if malformed:
+        print(f"[warn] {malformed} malformed JSONL record(s) skipped in "
+              f"{jsonl_path.name}", file=sys.stderr)
     return inserted
 
 
-def _codex_slug_from_cwd(cwd: str) -> str:
-    """Convert a codex session's cwd to a project slug.
+def _slug_from_cwd(cwd: str) -> str:
+    """Convert a session's cwd to a project slug.
 
     `/Users/x/Projects/mcp/Foo` → `mcp_Foo` (matches Claude's slug convention
     for paths under `Projects/`).
@@ -806,6 +934,30 @@ def _codex_slug_from_cwd(cwd: str) -> str:
         # No Projects/ in path — use last 2 path components
         relevant = parts[-2:] if len(parts) >= 2 else parts
         return "_".join(p for p in relevant if p and p != "/")
+
+
+# Codex-specific alias kept for call-site stability (search by name).
+_codex_slug_from_cwd = _slug_from_cwd
+
+
+_GEMINI_ALIAS_PATH = Path(os.environ.get(
+    "CONVO_RECALL_GEMINI_ALIASES",
+    Path.home() / ".local" / "share" / "convo-recall" / "gemini-aliases.json",
+))
+
+
+def _load_gemini_aliases() -> dict[str, str]:
+    """Read the optional `{sha-hash → human-slug}` map.
+
+    The file is hand-editable. Returns an empty dict when missing or
+    malformed; redactions/upgrades shouldn't crash on a stale file.
+    """
+    if not _GEMINI_ALIAS_PATH.exists():
+        return {}
+    try:
+        return json.loads(_GEMINI_ALIAS_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
 
 
 def ingest_codex_file(con: apsw.Connection, jsonl_path: Path,
@@ -845,6 +997,7 @@ def ingest_codex_file(con: apsw.Connection, jsonl_path: Path,
     project_slug = "codex_unknown"
     first_seen = None
     inserted = 0
+    malformed = 0
     lines_read = 0
 
     with open(jsonl_path, "r", errors="replace") as f:
@@ -869,6 +1022,7 @@ def ingest_codex_file(con: apsw.Connection, jsonl_path: Path,
             try:
                 rec = json.loads(raw)
             except (json.JSONDecodeError, ValueError):
+                malformed += 1
                 continue
             ttype = rec.get("type")
             if ttype == "session_meta":
@@ -900,24 +1054,13 @@ def ingest_codex_file(con: apsw.Connection, jsonl_path: Path,
                                           uuid, role, text, timestamp, do_embed)
 
     now = datetime.now(timezone.utc).isoformat()
-    con.execute(
-        """INSERT INTO sessions (session_id, project_slug, title, first_seen, last_updated, agent)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(session_id) DO UPDATE SET
-               last_updated = excluded.last_updated,
-               agent        = excluded.agent""",
-        (session_id, project_slug, None, first_seen or now, now, "codex"),
-    )
-    con.execute(
-        """INSERT INTO ingested_files
-               (file_path, session_id, project_slug, lines_ingested, last_modified, agent)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(file_path) DO UPDATE SET
-               lines_ingested = excluded.lines_ingested,
-               last_modified  = excluded.last_modified,
-               agent          = excluded.agent""",
-        (file_key, session_id, project_slug, lines_read, stat.st_mtime, "codex"),
-    )
+    _upsert_session(con, "codex", project_slug, session_id, None,
+                    first_seen or now, now)
+    _upsert_ingested_file(con, "codex", file_key, session_id, project_slug,
+                          lines_read, stat.st_mtime)
+    if malformed:
+        print(f"[warn] {malformed} malformed JSONL record(s) skipped in "
+              f"{jsonl_path.name}", file=sys.stderr)
     return inserted
 
 
@@ -926,6 +1069,38 @@ _AGENT_INGEST = {
     "gemini": ingest_gemini_file,
     "codex":  ingest_codex_file,
 }
+
+
+def _dispatch_ingest(con: apsw.Connection, agents: list[str], *,
+                     embed_live: bool, verbose: bool) -> tuple[int, int]:
+    """Run the ingest pipeline for the named agents in order.
+
+    Returns (total_messages_inserted, total_files_with_changes). Shared by
+    `scan_one_agent` and `scan_all` so the per-agent dispatch logic lives
+    in one place.
+    """
+    total = 0
+    files = 0
+    for agent_name in agents:
+        if agent_name not in _AGENT_INGEST:
+            print(f"[warn] unknown agent: {agent_name}", file=sys.stderr)
+            continue
+        ingester = _AGENT_INGEST[agent_name]
+        iterator = _AGENT_ITERATORS[agent_name]
+        for jsonl_path in iterator():
+            kwargs = {"do_embed": embed_live}
+            if agent_name == "claude":
+                kwargs["agent"] = "claude"
+            n = ingester(con, jsonl_path, **kwargs)
+            if n > 0:
+                files += 1
+                total += n
+                if verbose:
+                    slug = (_slug_from_path(jsonl_path) if agent_name == "claude"
+                            else _gemini_slug_from_path(jsonl_path) if agent_name == "gemini"
+                            else jsonl_path.parent.name)
+                    print(f"  +{n:4d} msgs  [{agent_name}] {slug}/{jsonl_path.name[:8]}…")
+    return total, files
 
 
 def scan_one_agent(con: apsw.Connection, agent_name: str,
@@ -937,23 +1112,8 @@ def scan_one_agent(con: apsw.Connection, agent_name: str,
         print(f"[error] unknown agent: {agent_name}", file=sys.stderr)
         return 0
     embed_live = EMBED_SOCK.exists() and do_embed
-    ingester = _AGENT_INGEST[agent_name]
-    iterator = _AGENT_ITERATORS[agent_name]
-    total = 0
-    files = 0
-    for jsonl_path in iterator():
-        kwargs = {"do_embed": embed_live}
-        if agent_name == "claude":
-            kwargs["agent"] = "claude"
-        n = ingester(con, jsonl_path, **kwargs)
-        if n > 0:
-            files += 1
-            total += n
-            if verbose:
-                slug = (_slug_from_path(jsonl_path) if agent_name == "claude"
-                        else _gemini_slug_from_path(jsonl_path) if agent_name == "gemini"
-                        else jsonl_path.parent.name)
-                print(f"  +{n:4d} msgs  [{agent_name}] {slug}/{jsonl_path.name[:8]}…")
+    total, files = _dispatch_ingest(con, [agent_name],
+                                     embed_live=embed_live, verbose=verbose)
     if verbose or total > 0:
         print(f"Ingested {total} new [{agent_name}] message(s) from {files} file(s).")
     return total
@@ -1002,46 +1162,29 @@ def scan_all(con: apsw.Connection, verbose: bool = False,
         print("[warn] embed socket not found — running in FTS-only mode", file=sys.stderr)
 
     enabled_agents = load_config().get("agents") or ["claude"]
-
-    total = 0
-    files = 0
-    for agent_name in enabled_agents:
-        if agent_name not in _AGENT_INGEST:
-            print(f"[warn] unknown agent in config: {agent_name}", file=sys.stderr)
-            continue
-        ingester = _AGENT_INGEST[agent_name]
-        iterator = _AGENT_ITERATORS[agent_name]
-        for jsonl_path in iterator():
-            kwargs = {"do_embed": embed_live}
-            if agent_name == "claude":
-                kwargs["agent"] = "claude"
-            n = ingester(con, jsonl_path, **kwargs)
-            if n > 0:
-                files += 1
-                total += n
-                if verbose:
-                    slug = (_slug_from_path(jsonl_path) if agent_name == "claude"
-                            else _gemini_slug_from_path(jsonl_path) if agent_name == "gemini"
-                            else jsonl_path.parent.name)
-                    print(f"  +{n:4d} msgs  [{agent_name}] {slug}/{jsonl_path.name[:8]}…")
+    total, files = _dispatch_ingest(con, enabled_agents,
+                                     embed_live=embed_live, verbose=verbose)
     if verbose or total > 0:
         print(f"Ingested {total} new messages from {files} file(s).")
 
-    # Self-healing embed pass: catch messages ingested while embed service was down
-    if embed_live and _vc is not None:
-        missing = _vc.execute("""
+    # Self-healing embed pass: catch messages ingested while embed service was down.
+    # Order DESC so the most recent (and most-queried) messages heal first
+    # after a fresh install against an existing DB. Cap bumped to 2000 — at
+    # ~200ms/embedding warm this fits well inside the 10s watch tick.
+    if embed_live and _vec_ok(con):
+        missing = con.execute("""
             SELECT m.rowid, m.content FROM messages m
             LEFT JOIN message_vecs v ON v.rowid = m.rowid
             WHERE v.rowid IS NULL
-            ORDER BY m.rowid
-            LIMIT 500
+            ORDER BY m.rowid DESC
+            LIMIT 2000
         """).fetchall()
         if missing:
             healed = 0
             for rowid, content in missing:
                 vec = embed(content)
                 if vec:
-                    _vec_insert(rowid, vec)
+                    _vec_insert(con, rowid, vec)
                     healed += 1
             if verbose or healed > 0:
                 print(f"Healed {healed} missing embedding(s).")
@@ -1074,7 +1217,7 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
     if len(query) > MAX_QUERY_LEN:
         query = query[:MAX_QUERY_LEN]
 
-    use_vec = _vc is not None and EMBED_SOCK.exists()
+    use_vec = _vec_ok(con) and EMBED_SOCK.exists()
     qvec = None
     if use_vec:
         qvec = embed(query, mode="query")
@@ -1107,8 +1250,8 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
     project_rowids = filter_rowids  # keep alias to minimize downstream churn
 
     # Corpus mismatch guard: fall back to FTS if vector coverage < 95%
-    if use_vec and project and _vc is not None:
-        cov = _vc.execute(
+    if use_vec and project and _vec_ok(con):
+        cov = con.execute(
             """SELECT COUNT(*) AS total,
                       SUM(CASE WHEN v.rowid IS NOT NULL THEN 1 ELSE 0 END) AS embedded
                FROM messages m
@@ -1123,21 +1266,55 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
                   f"Run `recall ingest` to heal.", file=sys.stderr)
             use_vec = False
 
-    if use_vec:
-        fts_rows = con.execute(
-            """SELECT m.rowid, ROW_NUMBER() OVER (ORDER BY rank) AS fts_rank
-               FROM messages_fts
-               JOIN messages m ON messages_fts.rowid = m.rowid
-               WHERE messages_fts MATCH ?
-               LIMIT 100""",
-            (query,),
-        ).fetchall()
-        fts_map = {r["rowid"]: r["fts_rank"] for r in fts_rows
-                   if project_rowids is None or r["rowid"] in project_rowids}
+    # Filter-aware retrieval strategy. When the (project, agent) filter set is
+    # a small fraction of the corpus, a global top-100 prefilter rarely
+    # overlaps with it (recall cliff). Choose strategy by cardinality:
+    #   - no filter / >= 5000 rows : global top-100 prefilter, intersect after
+    #   - 500..4999                : bump prefilter to min(n*2, 1000)
+    #   - < 500                    : push filter into FTS, brute-force vec
+    filter_size = len(filter_rowids) if filter_rowids is not None else None
+    if filter_size is None or filter_size >= 5_000:
+        prefilter_k = 100
+    elif filter_size >= 500:
+        prefilter_k = min(filter_size * 2, 1000)
+    else:
+        prefilter_k = filter_size  # exact retrieval below
 
-        vec_rowids = _vec_search(qvec, k=100)
-        vec_map = {rid: rank + 1 for rank, rid in enumerate(vec_rowids)
-                   if project_rowids is None or rid in project_rowids}
+    if use_vec:
+        # FTS side: when the filter is small, push `rowid IN (...)` into the
+        # query so we don't waste a global top-100 fetch that gets filtered
+        # to nothing.
+        if filter_rowids is not None and filter_size < 5_000:
+            placeholders = ",".join("?" * filter_size)
+            fts_rows = con.execute(
+                f"""SELECT m.rowid, ROW_NUMBER() OVER (ORDER BY rank) AS fts_rank
+                    FROM messages_fts
+                    JOIN messages m ON messages_fts.rowid = m.rowid
+                    WHERE messages_fts MATCH ? AND m.rowid IN ({placeholders})
+                    LIMIT ?""",
+                (query, *filter_rowids, prefilter_k),
+            ).fetchall()
+            fts_map = {r["rowid"]: r["fts_rank"] for r in fts_rows}
+        else:
+            fts_rows = con.execute(
+                """SELECT m.rowid, ROW_NUMBER() OVER (ORDER BY rank) AS fts_rank
+                   FROM messages_fts
+                   JOIN messages m ON messages_fts.rowid = m.rowid
+                   WHERE messages_fts MATCH ?
+                   LIMIT ?""",
+                (query, prefilter_k),
+            ).fetchall()
+            fts_map = {r["rowid"]: r["fts_rank"] for r in fts_rows
+                       if project_rowids is None or r["rowid"] in project_rowids}
+
+        vec_rowids = _vec_search(con, qvec, k=prefilter_k,
+                                 restrict_rowids=filter_rowids)
+        if filter_rowids is None or filter_size < 500:
+            # _vec_search already restricted; trust the order
+            vec_map = {rid: rank + 1 for rank, rid in enumerate(vec_rowids)}
+        else:
+            vec_map = {rid: rank + 1 for rank, rid in enumerate(vec_rowids)
+                       if rid in filter_rowids}
 
         all_rowids = list(set(fts_map) | set(vec_map))
 
@@ -1159,24 +1336,46 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
             return rrf
 
         scored = sorted(all_rowids, key=_score, reverse=True)[:limit]
-        placeholders = ",".join("?" * len(scored))
-        rows = con.execute(
-            f"""SELECT rowid, session_id, project_slug, role, timestamp, agent,
-                       SUBSTR(content, 1, 300) AS excerpt
-                FROM messages WHERE rowid IN ({placeholders})""",
-            scored,
-        ).fetchall()
+        if not scored:
+            rows = []
+        else:
+            placeholders = ",".join("?" * len(scored))
+            rows = con.execute(
+                f"""SELECT rowid, session_id, project_slug, role, timestamp, agent,
+                           SUBSTR(content, 1, 300) AS excerpt
+                    FROM messages WHERE rowid IN ({placeholders})""",
+                scored,
+            ).fetchall()
     else:
-        rows = con.execute(
-            """SELECT m.rowid, m.session_id, m.project_slug, m.role, m.timestamp, m.agent,
-                      snippet(messages_fts, 0, '[', ']', '…', 20) AS excerpt
-               FROM messages_fts
-               JOIN messages m ON messages_fts.rowid = m.rowid
-               WHERE messages_fts MATCH ?
-               ORDER BY rank
-               LIMIT ?""",
-            (query, limit),
-        ).fetchall()
+        # FTS-only path. When a filter is set, push `rowid IN (...)` into the
+        # query so the filter is honored (without it, --agent X foo against a
+        # corpus dominated by another agent silently returns 0 hits — the
+        # original recall cliff).
+        if filter_rowids is not None:
+            placeholders = ",".join("?" * filter_size)
+            rows = con.execute(
+                f"""SELECT m.rowid, m.session_id, m.project_slug, m.role,
+                           m.timestamp, m.agent,
+                           snippet(messages_fts, 0, '[', ']', '…', 20) AS excerpt
+                    FROM messages_fts
+                    JOIN messages m ON messages_fts.rowid = m.rowid
+                    WHERE messages_fts MATCH ? AND m.rowid IN ({placeholders})
+                    ORDER BY rank
+                    LIMIT ?""",
+                (query, *filter_rowids, limit),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                """SELECT m.rowid, m.session_id, m.project_slug, m.role,
+                          m.timestamp, m.agent,
+                          snippet(messages_fts, 0, '[', ']', '…', 20) AS excerpt
+                   FROM messages_fts
+                   JOIN messages m ON messages_fts.rowid = m.rowid
+                   WHERE messages_fts MATCH ?
+                   ORDER BY rank
+                   LIMIT ?""",
+                (query, limit),
+            ).fetchall()
 
     if not rows:
         print("No results.")
@@ -1186,10 +1385,16 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
             else "hybrid" if use_vec
             else "fts")
     print(f"[{mode} search]\n")
+    # Only show the agent tag when the result set actually mixes agents (or
+    # the user explicitly filtered to a non-claude agent). Single-Claude
+    # users — the entire pre-v0.2.0 cohort — see output identical to before.
+    distinct_agents = {r["agent"] for r in rows}
+    show_agent = len(distinct_agents) > 1 or distinct_agents != {"claude"}
     for r in rows:
         ts = (r["timestamp"] or "")[:10]
         role_label = "[⚠ error]" if r["role"] == "tool_error" else f"[{r['role']}]"
-        print(f"[{r['project_slug']}] [{r['agent']}] {role_label} {ts}")
+        agent_tag = f"[{r['agent']}] " if show_agent else ""
+        print(f"[{r['project_slug']}] {agent_tag}{role_label} {ts}")
         if context > 0:
             before, after = _fetch_context(con, r["session_id"], r["timestamp"], context)
             for c in before:
@@ -1204,13 +1409,13 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
 # ── Backfill commands ─────────────────────────────────────────────────────────
 
 def embed_backfill(con: apsw.Connection) -> None:
-    if _vc is None:
+    if not _vec_ok(con):
         print("sqlite-vec not loaded", file=sys.stderr)
         return
     if not EMBED_SOCK.exists():
         print("Embed socket not found", file=sys.stderr)
         return
-    existing = {r[0] for r in _vc.execute("SELECT rowid FROM message_vecs").fetchall()}
+    existing = {r[0] for r in con.execute("SELECT rowid FROM message_vecs").fetchall()}
     rows = con.execute("SELECT rowid, content FROM messages").fetchall()
     pending = [r for r in rows if r["rowid"] not in existing]
     total = len(pending)
@@ -1219,7 +1424,7 @@ def embed_backfill(con: apsw.Connection) -> None:
     for r in pending:
         vec = embed(r["content"])
         if vec:
-            _vec_insert(r["rowid"], vec)
+            _vec_insert(con, r["rowid"], vec)
             done += 1
         if done % 500 == 0 and done > 0:
             print(f"  {done}/{total}…")
@@ -1240,11 +1445,100 @@ def backfill_clean(con: apsw.Connection) -> None:
     print("Done.")
 
 
+def backfill_redact(con: apsw.Connection) -> None:
+    """Re-apply secret redaction to all existing rows + rebuild FTS.
+
+    Use this after upgrading to a version with secret redaction, or after
+    `recall doctor --scan-secrets` reports findings on legacy rows that
+    were ingested before redaction was enabled.
+    """
+    rows = con.execute("SELECT rowid, content FROM messages").fetchall()
+    updated = 0
+    for r in rows:
+        redacted = _redact.redact_secrets(r["content"])
+        if redacted != r["content"]:
+            con.execute("UPDATE messages SET content = ? WHERE rowid = ?",
+                        (redacted, r["rowid"]))
+            updated += 1
+    print(f"Redacted {updated:,} messages. Rebuilding FTS…")
+    con.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+    print("Done.")
+
+
+_BAK_STALE_AGE_DAYS = 30
+
+
+def _scan_stale_bak_files(db_dir: Path) -> list[tuple[Path, float, int]]:
+    """Return a list of `(path, age_days, size_bytes)` for `.bak` files in
+    `db_dir` older than `_BAK_STALE_AGE_DAYS`. Used by `recall doctor`."""
+    if not db_dir.exists():
+        return []
+    out: list[tuple[Path, float, int]] = []
+    now = datetime.now().timestamp()
+    for p in db_dir.glob("*.bak"):
+        try:
+            stat = p.stat()
+            age_days = (now - stat.st_mtime) / 86400.0
+            if age_days >= _BAK_STALE_AGE_DAYS:
+                out.append((p, age_days, stat.st_size))
+        except OSError:
+            continue
+    return out
+
+
+def doctor(con: apsw.Connection, scan_secrets: bool = False) -> None:
+    """Run health checks against the DB. Subset is selected by flags.
+
+    Default: scan for stray `.bak` files older than `_BAK_STALE_AGE_DAYS`
+    in the DB directory. With `--scan-secrets`: also counts how many
+    existing rows match each redaction pattern (so users discover what
+    already leaked into their DB pre-redaction).
+    """
+    if scan_secrets:
+        rows = con.execute("SELECT content FROM messages").fetchall()
+        totals: dict[str, int] = {}
+        affected_rows = 0
+        for r in rows:
+            counts = _redact.scan_secrets(r["content"])
+            if counts:
+                affected_rows += 1
+                for label, n in counts.items():
+                    totals[label] = totals.get(label, 0) + n
+        if not totals:
+            print("No secret-shaped tokens found.")
+        else:
+            print(f"Found secret-shaped tokens in {affected_rows:,} row(s):")
+            for label, n in sorted(totals.items()):
+                print(f"  {label:30s}  {n:,}")
+            print("\nRun `recall backfill-redact` to redact existing rows.")
+
+    # DB path drift: warn when CONVO_RECALL_DB overrides the canonical default.
+    canonical_db = Path.home() / ".local" / "share" / "convo-recall" / "conversations.db"
+    if os.environ.get("CONVO_RECALL_DB") and Path(os.environ["CONVO_RECALL_DB"]).resolve() != canonical_db.resolve():
+        print(f"\nCONVO_RECALL_DB override in effect:")
+        print(f"  configured  : {DB_PATH}")
+        print(f"  canonical   : {canonical_db}")
+        print("Different docs may reference different paths. If unintentional, "
+              "unset the env var.")
+
+    stale = _scan_stale_bak_files(DB_PATH.parent)
+    if stale:
+        print(f"\nStale `.bak` files in {DB_PATH.parent} "
+              f"(older than {_BAK_STALE_AGE_DAYS} days):")
+        for path, age, size in sorted(stale):
+            mb = size / (1024 * 1024)
+            print(f"  {path.name}  {age:.0f}d old  {mb:,.1f} MB")
+        print("\nReview and remove manually if no longer needed.")
+    elif not scan_secrets:
+        print("doctor: no issues found. "
+              "Pass `--scan-secrets` to scan for credential-shaped tokens.")
+
+
 def chunk_backfill(con: apsw.Connection) -> None:
     """Re-embed long messages whose vectors may pre-date server-side chunking.
     Chunking now happens inside the sidecar — one HTTP call per message."""
     _BACKFILL_MIN_CHARS = 1800  # ≈ 450 tokens; shorter texts always fit in model window
-    if _vc is None or not EMBED_SOCK.exists():
+    if not _vec_ok(con) or not EMBED_SOCK.exists():
         print("Embed service not available", file=sys.stderr)
         return
     rows = con.execute(
@@ -1257,7 +1551,7 @@ def chunk_backfill(con: apsw.Connection) -> None:
     for r in rows:
         vec = embed(r["content"])
         if vec:
-            _vec_insert(r["rowid"], vec)
+            _vec_insert(con, r["rowid"], vec)
             done += 1
         if done % 100 == 0 and done > 0:
             print(f"  {done}/{total}…")
@@ -1302,30 +1596,143 @@ def tool_error_backfill(con: apsw.Connection) -> None:
                                 tr_text = _clean_content(raw_tr[:500])
                                 if not tr_text:
                                     continue
+                                # tool_error_backfill currently only walks
+                                # claude session files (PROJECTS_DIR is the
+                                # claude root). When Phase 4b/c parsers add
+                                # tool_error detection, the agent argument
+                                # below should be set per source agent.
                                 try:
-                                    con.execute(
+                                    ret = con.execute(
                                         """INSERT OR IGNORE INTO messages
                                            (uuid, session_id, project_slug, role,
-                                            content, timestamp, model)
-                                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                            content, timestamp, model, agent)
+                                           VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING rowid""",
                                         (tr_uuid, session_id, project_slug, "tool_error",
-                                         tr_text, timestamp, None),
-                                    )
-                                    changed = con.changes()
-                                    if changed and _vc is not None:
-                                        tr_rowid = con.execute(
-                                            "SELECT rowid FROM messages WHERE uuid = ?",
-                                            (tr_uuid,),
-                                        ).fetchone()[0]
-                                        tr_vec = embed(tr_text)
-                                        if tr_vec:
-                                            _vec_insert(tr_rowid, tr_vec)
-                                    indexed += changed
-                                except apsw.Error:
-                                    pass
+                                         tr_text, timestamp, None, "claude"),
+                                    ).fetchall()
+                                    if ret:
+                                        tr_rowid = ret[0][0]
+                                        if _vec_ok(con):
+                                            tr_vec = embed(tr_text)
+                                            if tr_vec:
+                                                _vec_insert(con, tr_rowid, tr_vec)
+                                        indexed += 1
+                                except apsw.Error as _e:
+                                    print(f"[warn] tool_error_backfill insert failed: "
+                                          f"{type(_e).__name__}: {_e}", file=sys.stderr)
                 except OSError:
                     pass
     print(f"Indexed {indexed:,} tool_result error(s).")
+
+
+def forget(con: apsw.Connection, *,
+           session: str | None = None,
+           pattern: str | None = None,
+           before: str | None = None,
+           project: str | None = None,
+           agent: str | None = None,
+           uuid: str | None = None,
+           confirm: bool = False) -> int:
+    """Delete messages by scope. Mutually-exclusive scope kwargs.
+
+    Always prints a preview (count + first-3 excerpts). Without `confirm=True`
+    no rows are deleted. Returns the number of rows deleted (0 in dry-run).
+    """
+    scopes = {"session": session, "pattern": pattern, "before": before,
+              "project": project, "agent": agent, "uuid": uuid}
+    set_scopes = [k for k, v in scopes.items() if v is not None]
+    if len(set_scopes) != 1:
+        raise ValueError(
+            "exactly one scope flag is required "
+            f"(--session/--pattern/--before/--project/--agent/--uuid); got {set_scopes!r}"
+        )
+    scope = set_scopes[0]
+
+    where_clauses: list[str] = []
+    params: list = []
+    if session is not None:
+        where_clauses.append("session_id = ?"); params.append(session)
+    elif uuid is not None:
+        where_clauses.append("uuid = ?"); params.append(uuid)
+    elif project is not None:
+        where_clauses.append("project_slug = ?"); params.append(project)
+    elif agent is not None:
+        where_clauses.append("agent = ?"); params.append(agent)
+    elif before is not None:
+        where_clauses.append("timestamp < ?"); params.append(before)
+    elif pattern is not None:
+        where_clauses.append("content REGEXP ?"); params.append(pattern)
+
+    where = " AND ".join(where_clauses)
+
+    # Pattern uses Python regex via apsw's createscalarfunction. Register on
+    # demand so we don't pay the cost when forget() isn't called.
+    if pattern is not None:
+        compiled = re.compile(pattern)
+        con.createscalarfunction(
+            "REGEXP", lambda p, t: 1 if t and compiled.search(t) else 0, 2,
+        )
+
+    matches = con.execute(
+        f"SELECT rowid, uuid, session_id, project_slug, agent, role, "
+        f"       SUBSTR(content, 1, 120) AS excerpt "
+        f"FROM messages WHERE {where} ORDER BY rowid LIMIT ?",
+        (*params, 3),
+    ).fetchall()
+    total = con.execute(
+        f"SELECT COUNT(*) FROM messages WHERE {where}", params
+    ).fetchone()[0]
+
+    print(f"forget [{scope}]: {total:,} message(s) match.")
+    for r in matches:
+        print(f"  · [{r['agent']}] [{r['project_slug']}] {r['role']}: {r['excerpt']}")
+    if total > len(matches):
+        print(f"  · … and {total - len(matches):,} more")
+
+    if not confirm:
+        print("\nDry-run. Re-run with --confirm to delete.")
+        return 0
+
+    if total == 0:
+        return 0
+
+    # Capture rowids before delete so we can prune message_vecs.
+    rowids = [r[0] for r in con.execute(
+        f"SELECT rowid FROM messages WHERE {where}", params
+    ).fetchall()]
+
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        # Messages: deletion triggers messages_ad → FTS row removed.
+        con.execute(f"DELETE FROM messages WHERE {where}", params)
+        # message_vecs: prune by rowid (no triggers on vec0).
+        if _vec_ok(con) and rowids:
+            placeholders = ",".join("?" * len(rowids))
+            try:
+                con.execute(
+                    f"DELETE FROM message_vecs WHERE rowid IN ({placeholders})",
+                    rowids,
+                )
+            except Exception as e:
+                print(f"[warn] message_vecs prune failed: {type(e).__name__}: {e}",
+                      file=sys.stderr)
+        # Prune sessions / ingested_files rows that lost all message refs.
+        con.execute(
+            "DELETE FROM sessions WHERE session_id NOT IN "
+            "(SELECT DISTINCT session_id FROM messages)"
+        )
+        con.execute(
+            "DELETE FROM ingested_files WHERE session_id NOT IN "
+            "(SELECT DISTINCT session_id FROM messages)"
+        )
+        con.execute("COMMIT")
+    except Exception:
+        try: con.execute("ROLLBACK")
+        except Exception: pass
+        raise
+
+    print(f"\nDeleted {total:,} message(s).")
+    return total
 
 
 def stats(con: apsw.Connection) -> None:
@@ -1340,7 +1747,7 @@ def stats(con: apsw.Connection) -> None:
     agent_counts = con.execute(
         "SELECT agent, COUNT(*) FROM messages GROUP BY agent ORDER BY 2 DESC"
     ).fetchall()
-    vec_count = _vec_count()
+    vec_count = _vec_count(con)
     fts_row = con.execute(
         "SELECT sql FROM sqlite_master WHERE name='messages_fts'"
     ).fetchone()
