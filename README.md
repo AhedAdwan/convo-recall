@@ -129,7 +129,12 @@ recall serve                    # start embedding sidecar manually (if not using
 recall embed-backfill           # embed any un-embedded messages
 recall chunk-backfill           # re-embed long messages with chunked mean-pooling
 recall backfill-clean           # re-clean content and rebuild FTS index
+recall backfill-redact          # apply secret redaction to existing rows
 recall tool-error-backfill      # index tool error blocks from existing sessions
+
+# Health checks
+recall doctor                   # general DB health
+recall doctor --scan-secrets    # count credential-shaped tokens in indexed content
 ```
 
 ---
@@ -146,6 +151,107 @@ Override with `--project <slug>` or search everything with `--all-projects`.
 
 ---
 
+## Pre-prompt hooks (Claude / Codex / Gemini)
+
+convo-recall ships a single shell hook that injects a "search history first" hint into the model's context on every user turn. Same script works in all three CLIs — it auto-detects the event from the JSON payload each CLI sends on stdin and echoes back the right `hookEventName` so each accepts the response.
+
+The script is at `src/convo_recall/hooks/conversation-memory.sh`. Without these hooks wired, your AI agents won't know convo-recall exists and will keep guessing/web-searching despite the indexed history sitting right there.
+
+### Quickest path
+
+```bash
+recall install-hooks            # interactive: confirms each detected CLI before wiring
+recall install-hooks -y         # non-interactive: wires every detected CLI
+recall install-hooks --dry-run  # shows what would change without writing
+recall install-hooks --agent claude --agent codex   # subset
+recall uninstall-hooks          # removes only the convo-recall block; user's other hooks stay
+```
+
+`recall install` runs this as one stage of the full wizard and asks before modifying any settings file. Every operation backs up the original file with a `.bak.<timestamp>` suffix.
+
+### Wire it up manually
+
+**Claude Code** (`~/.claude/settings.json`):
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {"type": "command", "command": "/path/to/conversation-memory.sh", "timeout": 5}
+        ]
+      }
+    ]
+  }
+}
+```
+
+**Codex CLI** (`~/.codex/hooks.json`):
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {"type": "command", "command": "/path/to/conversation-memory.sh", "timeout": 5}
+        ]
+      }
+    ]
+  }
+}
+```
+
+**Gemini CLI** (`~/.gemini/settings.json`):
+```json
+{
+  "hooks": {
+    "BeforeAgent": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {"name": "convo-recall", "type": "command", "command": "/path/to/conversation-memory.sh", "timeout": 5000}
+        ]
+      }
+    ]
+  }
+}
+```
+
+Notes:
+- Gemini's `timeout` is in **milliseconds** (default 60000). Claude/Codex use **seconds**. Easy to get wrong.
+- Set `CONVO_RECALL_HOOK_LOG=/some/path.log` to log every hook firing for debugging.
+- Tested e2e in the claude-sandbox container: see `tests/sandbox-hooks-e2e.sh`. The test wires the hook into all three CLIs, runs each headless (`claude -p`, `codex exec`, `gemini -p --yolo --skip-trust`), and verifies the model actually receives the hint by asking it to echo the word "convo-recall" back.
+
+---
+
+## Privacy
+
+convo-recall ingests your conversation history verbatim into a local SQLite DB. To reduce the chance that secrets pasted into chats end up indexed and searchable, ingestion runs a **secret redaction** pass that replaces well-known credential token shapes with stable placeholders before they reach the FTS / vector index.
+
+Patterns redacted by default:
+
+| Shape | Placeholder |
+|---|---|
+| OpenAI keys (`sk-…`) | `«REDACTED-OPENAI-KEY»` |
+| Anthropic keys (`sk-ant-…`) | `«REDACTED-ANTHROPIC-KEY»` |
+| GitHub tokens (`ghp_/gho_/ghs_/ghu_/ghr_`) | `«REDACTED-GITHUB-TOKEN»` |
+| AWS access keys (`AKIA…`) | `«REDACTED-AWS-KEY»` |
+| JWTs (`eyJ….….…`) | `«REDACTED-JWT»` |
+| Slack tokens (`xoxb-/xoxp-/…`) | `«REDACTED-SLACK-TOKEN»` |
+
+Redaction is **on by default**. Set `CONVO_RECALL_REDACT=off` to disable it (e.g. for security-research workflows where you want to grep across raw content).
+
+Helpers for an existing DB that pre-dates redaction:
+
+```bash
+recall doctor --scan-secrets   # count what's already indexed
+recall backfill-redact         # re-apply redaction to existing rows + rebuild FTS
+```
+
+The DB and its WAL/SHM sidecars are chmod-0600 (owner-only) on a multi-user system. The parent directory is chmod-0700.
+
+---
+
 ## Environment variables
 
 | Variable | Default | Description |
@@ -156,6 +262,7 @@ Override with `--project <slug>` or search everything with `--all-projects`.
 | `CONVO_RECALL_CODEX_SESSIONS` | `~/.codex/sessions` | Codex rollout root |
 | `CONVO_RECALL_CONFIG` | `~/.local/share/convo-recall/config.json` | Enabled-agents config file |
 | `CONVO_RECALL_SOCK` | `~/.local/share/convo-recall/embed.sock` | Embedding sidecar socket path |
+| `CONVO_RECALL_REDACT` | _on_ | Set to `off` to disable secret redaction during ingest |
 
 ---
 
@@ -178,4 +285,19 @@ The bundled sidecar uses 1024-dim vectors. If your service uses a different dime
 
 ## License
 
-MIT with Commons Clause — free to use and build products with. Redistribution as a commercial product is not permitted. See [LICENSE](LICENSE).
+**Source-available, noncommercial, no government, no military.** convo-recall is licensed under a modified PolyForm Noncommercial 1.0.0 (SPDX: `LicenseRef-PolyForm-Noncommercial-1.0.0-convo-recall`). It is not OSI-open source. The base license text is the upstream [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0); the licensor has removed government use and added an explicit prohibition on military/defense/weapons/intelligence/mass-surveillance use.
+
+**You may** — for free, with no further permission:
+- Read, fork, modify, and redistribute the source.
+- Use it for personal projects, hobby work, research, experimentation, education, and personal study.
+- Use it inside charitable organizations, educational institutions (including public schools and universities for teaching and academic research), public research organizations, public safety / public health organizations, and environmental protection organizations.
+
+**You may not** — under any circumstance:
+- Use convo-recall in or with any commercial software, product, or service.
+- Embed convo-recall as a dependency in software that any company sells, hosts, or distributes commercially.
+- Use convo-recall internally at a for-profit company for work-related purposes.
+- Use convo-recall by, on behalf of, or for the benefit of any government institution at any level (national, state, provincial, regional, county, municipal, or quasi-public) — except for public schools/universities used solely for teaching and academic research.
+- Use convo-recall for any military, defense, weapons system, intelligence service, or armed-conflict purpose — including reconnaissance, targeting, autonomous-weapons, command-and-control, or any training/deployment/evaluation thereof.
+- Use convo-recall in any mass-surveillance, social-credit, or biometric-identification system operated against a general population.
+
+If you want to use convo-recall commercially, reach out for a commercial license — open to discussion for genuinely civilian, non-military use cases. See [LICENSE](LICENSE) for the full text.

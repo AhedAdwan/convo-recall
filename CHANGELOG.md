@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Secret redaction during ingest.** `_clean_content` now replaces well-known credential token shapes (OpenAI, Anthropic, GitHub, AWS, JWT, Slack) with `«REDACTED-…»` placeholders before content reaches the FTS / vector index. Always-on; opt out with `CONVO_RECALL_REDACT=off`.
+- `recall doctor` — DB health checks. With `--scan-secrets`, counts how many existing rows match each redaction pattern (so users discover what already leaked into their DB pre-redaction). Also surfaces stray `*.bak` files older than 30 days in the DB directory.
+- `recall backfill-redact` — re-applies secret redaction to all existing rows + rebuilds FTS. Use after upgrading from a pre-redaction version.
+- `recall forget` — scoped deletion API with mutually-exclusive scope flags (`--session`, `--pattern`, `--before`, `--project`, `--agent`, `--uuid`). Dry-run by default; pass `--confirm` to actually delete. Cleans up `messages`, FTS, `message_vecs`, and prunes empty `sessions` / `ingested_files` rows.
+- Privacy section in README documenting redaction patterns, opt-out env var, and `recall forget`.
+
+### Changed
+- **Filter-aware retrieval** in `search()` — when `--project` or `--agent` filter is a small fraction of the corpus, the FTS query receives `rowid IN (filter_set)` directly and vec search becomes brute-force exact (Python-side cosine over the filtered subset). Fixes the recall cliff where `--agent codex foo` returned 0 hits against a corpus dominated by another agent. No regression at high cardinality (>5000 rows) — existing top-100 prefilter path is preserved.
+- **Self-heal walks newest-first** (`ORDER BY m.rowid DESC`) and the cap is bumped from 500 → 2000 per pass. Most recent (and most-queried) messages heal first after a fresh install against a backup-imported DB.
+- `recall install --with-embeddings` now runs `embed-backfill` once after the initial ingest. Catches the "fresh-install on existing 60K-row DB" case in one sweep instead of multi-hour self-heal cycles.
+- **Per-connection vec state.** `_VEC_ENABLED` is a `WeakKeyDictionary` keyed by apsw connection rather than a module-level `_vc` flag, so multiple `open_db()` calls in one process (test harnesses, in-memory bench tools) don't clobber each other.
+- **Gemini slug resolution** is now three-layer: header `cwd` first (matches Claude/Codex `Projects/X` convention), then `~/.local/share/convo-recall/gemini-aliases.json` map, then the SHA-hash dir name as last resort.
+
+### Notes for upgraders
+- The v0.2.0 in-place migration creates `<db>.pre-v020.<ts>.bak` next to the DB. After verifying your DB is healthy, you can delete it manually — or run `recall doctor` to surface stale `.bak` files older than 30 days.
+
 ## [0.2.0] — 2026-04-30
 
 ### Added
