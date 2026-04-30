@@ -1,5 +1,7 @@
 # convo-recall
 
+[![Tests](https://github.com/AhedAdwan/convo-recall/actions/workflows/test.yml/badge.svg)](https://github.com/AhedAdwan/convo-recall/actions/workflows/test.yml)
+
 > **AI agents are stateless by design. convo-recall makes them stateful by infrastructure.**
 
 Every coding-agent session starts blind. Decisions made last week, approaches that failed, the exact fix for that recurring bug — all of it vanishes when the context window closes. As sessions grow longer, the cost of keeping that context alive skews toward noise over signal. And when multiple agents work on the same project, each one starts from zero with no knowledge of what the others have done.
@@ -80,9 +82,10 @@ Tool calls and reasoning blocks are NOT indexed — only human-readable user/ass
 
 ## Requirements
 
-- macOS (launchd watcher; Linux support planned)
-- Python 3.11+
-- Claude Code
+- macOS or Linux (Python 3.11+).
+  - macOS: launchd watcher (default).
+  - Linux: systemd-user, cron, or polling fallback — auto-detected. See [Schedulers](#schedulers).
+- Claude Code, Codex, or Gemini CLI (any subset; hooks work across all three).
 
 ---
 
@@ -102,9 +105,32 @@ pipx install 'convo-recall[embeddings]'
 recall install --with-embeddings
 ```
 
-`--with-embeddings` installs a second launchd job that keeps the embedding model warm in the background. The model (BAAI/bge-large-en-v1.5, ~1.3 GB) downloads on first use.
+`--with-embeddings` keeps the embedding model warm in the background (launchd job on macOS, systemd-user `.service` on Linux, fallback to a Popen child elsewhere). The model (BAAI/bge-large-en-v1.5, ~1.3 GB) downloads on first use.
 
 Long texts are chunked with a 450-token sliding window (50-token overlap) and mean-pooled — no silent truncation at 512 tokens.
+
+---
+
+## Schedulers
+
+`recall install` picks one of four schedulers automatically. Override with `--scheduler X`:
+
+| Scheduler | Detected when | Survives reboot | Notes |
+|---|---|---|---|
+| `launchd` | macOS | yes | Uses `~/Library/LaunchAgents` plists. Default on Darwin. |
+| `systemd` | Linux + `systemctl --user is-system-running` succeeds | yes (with linger) | `.service` + `.path` units, file-event driven. Run `loginctl enable-linger $USER` if you want watchers to survive logout — the wizard offers to do this for you. |
+| `cron` | Linux + `crontab` available, no usable systemd-user | yes | `@reboot` lines tagged `# convo-recall:*`. Tagged-line filtering on uninstall preserves your other crontab entries. |
+| `polling` | always | NO | Last-resort fallback: `recall watch` runs as a `Popen` child. Dies at logout/reboot — re-run `recall install` after restart. |
+
+The wizard prints `Selected scheduler: <X>` so you always know which tier you're on. To force a specific tier (e.g. for CI containers where systemd-user reports `running` but doesn't actually work):
+
+```bash
+recall install --scheduler polling -y     # universal Popen fallback
+recall install --scheduler systemd -y     # explicit systemd-user, Linux
+recall install --scheduler launchd -y     # explicit launchd, macOS
+```
+
+`recall uninstall` walks every scheduler so a host that switched OS gets clean teardown.
 
 ---
 

@@ -29,7 +29,8 @@ classifiers = [
     # "Other/Proprietary License" is the canonical PyPI classifier for
     # source-available / non-OSI licenses (avoids falsely claiming OSI status).
     "License :: Other/Proprietary License",
-    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.11",
@@ -54,6 +55,8 @@ embeddings = [
 dev = [
     "pytest>=8.0",
     "pytest-cov",
+    "pexpect>=4.9",
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]
