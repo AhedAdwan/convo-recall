@@ -419,9 +419,9 @@ def test_install_emits_one_plist_per_enabled_agent(tmp_path, monkeypatch):
     macOS launchd interaction happens during the test."""
     from convo_recall import install as _install
     from convo_recall.install.schedulers.launchd import LaunchdScheduler
-    monkeypatch.setattr(_install, "_require_macos", lambda: None)
     monkeypatch.setattr(LaunchdScheduler, "_launchctl_load", lambda self, p: True)
-    monkeypatch.setattr(_install, "_find_recall_bin", lambda: "/fake/bin/recall")
+    monkeypatch.setattr("convo_recall.install._wizard._find_recall_bin",
+                        lambda: "/fake/bin/recall")
     # Subprocess "Running initial ingest" — neuter it
     import subprocess
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: None)
@@ -868,7 +868,7 @@ def test_install_hooks_wires_each_cli_correctly(tmp_path, monkeypatch):
             return home / ".codex" / "hooks.json", "UserPromptSubmit", "codex"
         if agent == "gemini":
             return home / ".gemini" / "settings.json", "BeforeAgent", "gemini"
-    monkeypatch.setattr(_install, "_hook_target", fake_target)
+    monkeypatch.setattr("convo_recall.install._hooks._hook_target", fake_target)
 
     changed = _install.install_hooks(
         agents=["claude", "codex", "gemini"],
@@ -908,7 +908,7 @@ def test_install_hooks_is_idempotent(tmp_path, monkeypatch):
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)
     (home / ".claude" / "settings.json").write_text("{}")
-    monkeypatch.setattr(_install, "_hook_target", lambda a:
+    monkeypatch.setattr("convo_recall.install._hooks._hook_target", lambda a:
         (home / ".claude" / "settings.json", "UserPromptSubmit", "claude"))
 
     n1 = _install.install_hooks(agents=["claude"], non_interactive=True)
@@ -937,7 +937,7 @@ def test_uninstall_hooks_removes_only_convo_recall_block(tmp_path, monkeypatch):
             ]
         }
     }))
-    monkeypatch.setattr(_install, "_hook_target", lambda a:
+    monkeypatch.setattr("convo_recall.install._hooks._hook_target", lambda a:
         (settings_path, "UserPromptSubmit", "claude"))
 
     _install.install_hooks(agents=["claude"], non_interactive=True)
@@ -960,7 +960,7 @@ def test_install_hooks_dry_run_does_not_write(tmp_path, monkeypatch):
     settings_path = home / ".claude" / "settings.json"
     original = json.dumps({"theme": "dark"})
     settings_path.write_text(original)
-    monkeypatch.setattr(_install, "_hook_target", lambda a:
+    monkeypatch.setattr("convo_recall.install._hooks._hook_target", lambda a:
         (settings_path, "UserPromptSubmit", "claude"))
 
     _install.install_hooks(agents=["claude"], dry_run=True, non_interactive=True)

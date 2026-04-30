@@ -22,10 +22,14 @@ def main() -> None:
                            help="Print what would happen without doing it")
     p_install.add_argument("--with-embeddings", action="store_true",
                            help="Also install the embedding sidecar (requires [embeddings] extra)")
+    p_install.add_argument("--scheduler",
+                           choices=["auto", "launchd", "systemd", "cron", "polling"],
+                           default="auto",
+                           help="Override scheduler tier (default: auto-detect).")
 
     p_uninstall = sub.add_parser(
         "uninstall",
-        help="Stop and remove launchd agents (macOS)",
+        help="Stop and remove convo-recall watchers across all schedulers",
     )
     p_uninstall.add_argument("--purge-data", action="store_true",
                              help="Also delete the conversation DB and data directory")
@@ -79,7 +83,8 @@ def main() -> None:
     # Commands that don't need the DB open
     if args.cmd == "install":
         _install.run(dry_run=getattr(args, "dry_run", False),
-                     with_embeddings=getattr(args, "with_embeddings", False))
+                     with_embeddings=getattr(args, "with_embeddings", False),
+                     scheduler=getattr(args, "scheduler", "auto"))
         return
 
     if args.cmd == "uninstall":
