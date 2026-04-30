@@ -33,18 +33,28 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Resolve the runtime dir per _paths.runtime_dir():
-#   Linux: $XDG_RUNTIME_DIR/convo-recall, fallback /tmp/convo-recall-$UID
-#   macOS: ~/Library/Caches/convo-recall (Stage 3 polling still works there)
-if [[ "${OS_NAME}" == "Linux" ]]; then
-    if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
-        RT_DIR="${XDG_RUNTIME_DIR}/convo-recall"
-    else
-        RT_DIR="/tmp/convo-recall-$(id -u)"
+# Shell-side mirror of `_paths.ensure_xdg_runtime_dir`: populate
+# XDG_RUNTIME_DIR if unset but the user bus is reachable. Without this,
+# any direct `systemctl --user` call in this script (Stage 0 cleanup,
+# Stage 4 systemd-user availability check, Stage 4 list-units) fails
+# silently and we falsely skip systemd lifecycle testing.
+if [[ "${OS_NAME}" == "Linux" ]] && [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+    _candidate="/run/user/$(id -u)"
+    if [[ -e "${_candidate}/bus" ]]; then
+        export XDG_RUNTIME_DIR="${_candidate}"
     fi
-else
-    RT_DIR="${HOME}/Library/Caches/convo-recall"
+    unset _candidate
 fi
+
+# Resolve the runtime dir from the SAME logic the wizard uses (including
+# the XDG-bus auto-detect added in `_paths.ensure_xdg_runtime_dir`). Ask
+# Python directly so the script and the wizard never disagree on the
+# PID-file location.
+RT_DIR="$(python3 -c '
+from convo_recall.install._paths import ensure_xdg_runtime_dir, runtime_dir
+ensure_xdg_runtime_dir()
+print(runtime_dir())
+')"
 
 # ─── Result recording ────────────────────────────────────────────────────────
 #
@@ -398,9 +408,14 @@ print(_AGENT_WATCH_DIRS[\"${agent}\"]())")"
         systemctl --user list-units --no-legend 'com.convo-recall.*' || true
         fail "com.convo-recall.* unit still loaded after uninstall"
     fi
-    # And the unit files should be gone.
-    leftover="$(ls "${UNIT_DIR}/com.convo-recall."* 2>/dev/null | head -1)"
-    [[ -z "${leftover}" ]] || fail "leftover unit file after uninstall: ${leftover}"
+    # And the unit files should be gone. Use shell globbing instead of
+    # `ls` — `ls "/path/com.convo-recall."*` exits non-zero when the
+    # glob has no matches (the success case), tripping `set -e`.
+    shopt -s nullglob
+    leftovers=("${UNIT_DIR}"/com.convo-recall.*)
+    shopt -u nullglob
+    [[ "${#leftovers[@]}" -eq 0 ]] || \
+        fail "leftover unit file(s) after uninstall: ${leftovers[*]}"
 
     pass_stage
 fi
@@ -512,24 +527,36 @@ if ! python -c "import build" 2>/dev/null; then
     skip_stage "\`pip install build\` to enable"
 else
     cd "${REPO_ROOT}"
-    rm -rf /tmp/cr-wheel.$$ /tmp/cr-venv.$$
-    python -m build --wheel --outdir /tmp/cr-wheel.$$ >/tmp/build.out.$$ 2>&1 \
-        || { tail -30 /tmp/build.out.$$; rm -f /tmp/build.out.$$; \
+    # Stage 8 stays inside REPO_ROOT — sandboxes / containers often mount
+    # /tmp as noexec, which breaks venv binary execution.
+    WHEEL_DIR="${REPO_ROOT}/.cr-wheel.$$"
+    VENV_DIR="${REPO_ROOT}/.cr-venv.$$"
+    BUILD_LOG="${REPO_ROOT}/.cr-build.$$.log"
+    RUN_LOG_W="${REPO_ROOT}/.cr-run.$$.log"
+
+    find "${WHEEL_DIR}" -mindepth 1 -delete 2>/dev/null || true
+    find "${VENV_DIR}"  -mindepth 1 -delete 2>/dev/null || true
+    rmdir "${WHEEL_DIR}" "${VENV_DIR}" 2>/dev/null || true
+
+    python -m build --wheel --outdir "${WHEEL_DIR}" >"${BUILD_LOG}" 2>&1 \
+        || { tail -30 "${BUILD_LOG}"; rm -f "${BUILD_LOG}"; \
              fail "python -m build --wheel failed"; }
-    rm -f /tmp/build.out.$$
+    rm -f "${BUILD_LOG}"
 
-    python -m venv /tmp/cr-venv.$$
-    /tmp/cr-venv.$$/bin/pip install --quiet /tmp/cr-wheel.$$/convo_recall-*.whl
+    python -m venv "${VENV_DIR}"
+    "${VENV_DIR}/bin/pip" install --quiet "${WHEEL_DIR}"/convo_recall-*.whl
 
-    /tmp/cr-venv.$$/bin/recall install --dry-run -y --scheduler polling \
-        > /tmp/cr-wheel-out.$$ 2>&1 \
-        || { tail -30 /tmp/cr-wheel-out.$$; \
+    "${VENV_DIR}/bin/recall" install --dry-run -y --scheduler polling \
+        > "${RUN_LOG_W}" 2>&1 \
+        || { tail -30 "${RUN_LOG_W}"; \
              fail "wheel-installed recall failed"; }
-    grep -q "polling (Popen fallback)" /tmp/cr-wheel-out.$$ \
+    grep -q "polling (Popen fallback)" "${RUN_LOG_W}" \
         || fail "wheel-installed recall didn't pick polling"
 
-    rm -rf /tmp/cr-wheel.$$ /tmp/cr-venv.$$
-    rm -f  /tmp/cr-wheel-out.$$
+    find "${WHEEL_DIR}" -mindepth 1 -delete 2>/dev/null || true
+    find "${VENV_DIR}"  -mindepth 1 -delete 2>/dev/null || true
+    rmdir "${WHEEL_DIR}" "${VENV_DIR}" 2>/dev/null || true
+    rm -f "${RUN_LOG_W}"
 
     pass_stage
 fi

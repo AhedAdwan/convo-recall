@@ -112,6 +112,12 @@ def run(
     from ._hooks import install_hooks
     import convo_recall.ingest as _ingest
 
+    # Populate XDG_RUNTIME_DIR if unset but the user bus is reachable —
+    # gives every downstream subprocess (systemctl --user, recall watch
+    # spawn, runtime_dir() for PID files) a consistent rendezvous point.
+    from ._paths import ensure_xdg_runtime_dir
+    ensure_xdg_runtime_dir()
+
     if scheduler == "auto":
         sched = detect_scheduler()
     else:
@@ -273,7 +279,22 @@ def run(
     # watchers are installed.
     _ingest.save_config({"agents": enabled})
 
-    # ── 1. Watchers ──────────────────────────────────────────────────────────
+    # Apply order matters: initial ingest runs BEFORE watchers spawn so the
+    # DB is current when the watcher takes over. Otherwise the watcher's
+    # first scan races with `recall ingest` for the WAL writer lock and
+    # one of them dies with apsw.BusyError. Polling tier hits this
+    # deterministically (Popen spawn is synchronous; watcher starts
+    # immediately) but the race exists in any tier whose install is fast.
+
+    # ── 1. Initial ingest + backfill ─────────────────────────────────────────
+    if do_initial_ingest:
+        print("\nRunning initial ingest…")
+        subprocess.run([recall_bin, "ingest"])
+        if do_initial_embed_backfill:
+            print("\nRunning initial embed-backfill…")
+            subprocess.run([recall_bin, "embed-backfill"])
+
+    # ── 2. Watchers ──────────────────────────────────────────────────────────
     if do_watchers:
         for agent in enabled:
             watch_dir = _AGENT_WATCH_DIRS[agent]()
@@ -293,7 +314,7 @@ def run(
             marker = "✅" if r.ok else "⚠ "
             print(f"  {marker} {r.message}")
 
-    # ── 2. Embed sidecar ─────────────────────────────────────────────────────
+    # ── 3. Embed sidecar ─────────────────────────────────────────────────────
     if do_embed_sidecar:
         result = sched.install_sidecar(
             recall_bin=recall_bin,
@@ -306,19 +327,11 @@ def run(
             print(f"     Model will download on first use (~1.3 GB). Check:")
             print(f"     tail -f {LOG_DIR}/convo-recall-embed.log")
 
-    # ── 3. Pre-prompt hooks ──────────────────────────────────────────────────
+    # ── 4. Pre-prompt hooks ──────────────────────────────────────────────────
     if do_hooks:
         print("\nWiring pre-prompt hooks…")
         # User already consented at the wizard level; suppress per-CLI prompts.
         install_hooks(agents=enabled, dry_run=False, non_interactive=True)
-
-    # ── 4. Initial ingest + backfill ─────────────────────────────────────────
-    if do_initial_ingest:
-        print("\nRunning initial ingest…")
-        subprocess.run([recall_bin, "ingest"])
-        if do_initial_embed_backfill:
-            print("\nRunning initial embed-backfill…")
-            subprocess.run([recall_bin, "embed-backfill"])
 
     # ── Final summary ────────────────────────────────────────────────────────
     print("\nInstallation complete.")

@@ -20,7 +20,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from .._paths import scheduler_unit_dir
+from .._paths import ensure_xdg_runtime_dir, scheduler_unit_dir
 from .base import Result, Scheduler
 
 
@@ -30,6 +30,13 @@ _USABLE_STATES = ("running", "degraded", "starting")
 
 
 class SystemdUserScheduler(Scheduler):
+    def __init__(self) -> None:
+        # Belt-and-suspenders: also runs from the wizard at startup, but
+        # `recall uninstall` walks all_schedulers() without going through
+        # the wizard, so make sure the env is right whenever this class
+        # is instantiated. Idempotent.
+        ensure_xdg_runtime_dir()
+
     def available(self) -> bool:
         try:
             v = subprocess.run(
