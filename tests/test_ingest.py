@@ -233,7 +233,10 @@ def test_load_config_defaults_when_absent(tmp_path, monkeypatch):
     assert cfg == {"agents": ["claude"]}
 
 
-def test_search_shows_agent_tag(db, tmp_path, monkeypatch, capsys):
+def test_search_shows_agent_tag_only_when_mixed(db, tmp_path, monkeypatch, capsys):
+    """v0.2.1+: agent tag is only printed when the result set actually mixes
+    agents (or contains a non-claude agent). Single-Claude users see output
+    identical to v0.1.x — no surprise visual regression."""
     monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
     session = tmp_path / "proj_foo" / "session.jsonl"
     _write_session(session, [
@@ -241,10 +244,27 @@ def test_search_shows_agent_tag(db, tmp_path, monkeypatch, capsys):
          "message": {"role": "user", "content": "tagged message body"}},
     ])
     ingest.ingest_file(db, session, do_embed=False)
+
+    # Single-claude result set: tag should NOT appear (no visual regression
+    # for single-agent users, the v0.1.x cohort).
     capsys.readouterr()
     ingest.search(db, "tagged", project="proj_foo", limit=3, context=0)
-    out = capsys.readouterr().out
-    assert "[claude]" in out
+    out_single = capsys.readouterr().out
+    assert "[claude]" not in out_single, \
+        "agent tag should be hidden for single-claude result sets (UX regression fix)"
+
+    # Mixed result set: insert a synthetic gemini row → tag appears for both.
+    db.execute(
+        "INSERT INTO messages(uuid, session_id, project_slug, role, content, "
+        "timestamp, model, agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("g1", "g-1", "proj_foo", "user", "tagged gemini body",
+         "2026-01-01T00:00:00Z", None, "gemini"),
+    )
+    capsys.readouterr()
+    ingest.search(db, "tagged", project="proj_foo", limit=3, context=0)
+    out_mixed = capsys.readouterr().out
+    assert "[claude]" in out_mixed and "[gemini]" in out_mixed, \
+        "agent tag should be visible when results mix agents"
 
 
 # ── Phase 4a: claude parser preserves existing behavior ────────────────────────
@@ -398,8 +418,9 @@ def test_install_emits_one_plist_per_enabled_agent(tmp_path, monkeypatch):
     config. The launchctl bootstrap is monkeypatched to a no-op so no real
     macOS launchd interaction happens during the test."""
     from convo_recall import install as _install
+    from convo_recall.install.schedulers.launchd import LaunchdScheduler
     monkeypatch.setattr(_install, "_require_macos", lambda: None)
-    monkeypatch.setattr(_install, "_launchctl_load", lambda p: True)
+    monkeypatch.setattr(LaunchdScheduler, "_launchctl_load", lambda self, p: True)
     monkeypatch.setattr(_install, "_find_recall_bin", lambda: "/fake/bin/recall")
     # Subprocess "Running initial ingest" — neuter it
     import subprocess
@@ -426,21 +447,24 @@ def test_install_emits_one_plist_per_enabled_agent(tmp_path, monkeypatch):
     (home / ".gemini" / "tmp" / "g1" / "chats" / "session-x.jsonl").write_text("{}\n")
     (home / ".codex" / "sessions" / "2026" / "04" / "30" / "rollout-x.jsonl").write_text("{}\n")
 
-    _install.run(dry_run=False)
+    _install.run(dry_run=False, non_interactive=True)
 
-    plists = sorted(p.name for p in (tmp_path / "LaunchAgents").iterdir())
-    assert plists == [
+    plists = {p.name for p in (tmp_path / "LaunchAgents").iterdir()}
+    # Wizard's non-interactive mode accepts all defaults, so we expect:
+    # - one ingest plist per detected agent
+    # - the embed sidecar plist (default-on when [embeddings] extra is present)
+    assert {
         "com.convo-recall.ingest.claude.plist",
         "com.convo-recall.ingest.codex.plist",
         "com.convo-recall.ingest.gemini.plist",
-    ]
+    }.issubset(plists), f"missing ingest plists: {plists}"
     cfg = json.loads((tmp_path / "config.json").read_text())
     assert sorted(cfg["agents"]) == ["claude", "codex", "gemini"]
 
 
 def test_install_plist_targets_correct_watch_dir(tmp_path, monkeypatch):
-    from convo_recall import install as _install
-    plist_bytes = _install._ingest_plist(
+    from convo_recall.install.schedulers.launchd import LaunchdScheduler
+    plist_bytes = LaunchdScheduler()._ingest_plist(
         label="com.convo-recall.ingest.gemini",
         recall_bin="/usr/local/bin/recall",
         db_path="/db",
@@ -456,6 +480,697 @@ def test_install_plist_targets_correct_watch_dir(tmp_path, monkeypatch):
     assert plist["ProgramArguments"] == ["/usr/local/bin/recall", "ingest", "--agent", "gemini"]
     assert plist["EnvironmentVariables"]["CONVO_RECALL_CONFIG"] == "/cfg"
     assert plist["StandardOutPath"] == "/logs/convo-recall-ingest-gemini.log"
+
+
+# ── Code-review regression tests (RED before fix, GREEN after) ─────────────────
+
+def test_db_file_mode_is_0600_after_open_db(tmp_path, monkeypatch):
+    """P0 #1: open_db must write the DB with mode 0o600 (owner-only).
+    Currently fails: apsw.Connection creates files with the process umask
+    (typically 0o022 → 0o644)."""
+    import stat as _stat
+    db_file = tmp_path / "secret.db"
+    monkeypatch.setattr(ingest, "DB_PATH", db_file)
+    monkeypatch.setattr(ingest, "_vc", None)
+    con = ingest.open_db()
+    try:
+        mode = _stat.S_IMODE(db_file.stat().st_mode)
+        assert mode == 0o600, f"DB file mode is 0o{mode:o}, expected 0o600 (world-readable risk)"
+    finally:
+        con.close()
+
+
+def test_save_config_actually_writes_0600(tmp_path, monkeypatch):
+    """P0 #1 (sub): save_config tries to chmod 0o600 but the resulting file
+    isn't actually 0o600 on at least some platforms. Verify end-state."""
+    import stat as _stat
+    cfg_path = tmp_path / "config.json"
+    monkeypatch.setattr(ingest, "_CONFIG_PATH", cfg_path)
+    ingest.save_config({"agents": ["claude"]})
+    mode = _stat.S_IMODE(cfg_path.stat().st_mode)
+    assert mode == 0o600, f"config.json mode is 0o{mode:o}, expected 0o600"
+
+
+def test_clean_content_redacts_obvious_secrets():
+    """P0 #2: _clean_content currently does NOT redact secrets — they survive
+    verbatim into FTS + vector index. After fix, common token shapes should
+    be replaced with a placeholder."""
+    samples = [
+        ("OPENAI_API_KEY=sk-abc123def456ghi789jkl012mno345pqr678stu901", "sk-"),
+        ("export GITHUB_TOKEN=ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHII", "ghp_"),
+        ("AWS_ACCESS_KEY_ID=AKIA1234567890ABCDEF", "AKIA1234567890ABCDEF"),
+        ("sk-ant-api03-VeRy_LoNg_AnThRoPiC_KeY_Ab123-C456", "sk-ant-"),
+    ]
+    for raw, leak_marker in samples:
+        cleaned = ingest._clean_content(raw)
+        assert leak_marker not in cleaned, (
+            f"secret pattern {leak_marker!r} survived _clean_content: {cleaned!r}"
+        )
+
+
+def test_gemini_slug_from_header_cwd(db, tmp_path, monkeypatch):
+    """P1 #7: Gemini sessions whose header includes cwd should slug from
+    cwd (matching Claude/Codex convention) instead of from the SHA-hash dir."""
+    sha = "1c19fb10eb84a000aaaa1111ccccdddd2222eeee3333ffff4444aaaa5555bbbb"
+    sess_dir = tmp_path / sha / "chats"
+    sess_dir.mkdir(parents=True)
+    sess = sess_dir / "session-001.jsonl"
+    sess.write_text(
+        json.dumps({
+            "sessionId": "g-001",
+            "startTime": "2026-04-01T00:00:00Z",
+            "cwd": "/Users/x/Projects/apps/noema",
+            "kind": "main",
+        }) + "\n"
+        + json.dumps({"id": "m1", "timestamp": "2026-04-01T00:00:01Z",
+                      "type": "user", "content": [{"text": "hello"}]}) + "\n"
+    )
+    ingest.ingest_gemini_file(db, sess, do_embed=False)
+    slug = db.execute(
+        "SELECT project_slug FROM sessions WHERE agent='gemini'"
+    ).fetchone()[0]
+    assert slug == "apps_noema", \
+        f"expected apps_noema slug from cwd, got {slug!r} (header cwd ignored?)"
+
+
+def test_gemini_slug_from_alias_map(db, tmp_path, monkeypatch):
+    """P1 #7: when the header has no cwd, fall back to the user-managed
+    alias map at ~/.local/share/convo-recall/gemini-aliases.json."""
+    sha = "deadbeef0000111122223333444455556666777788889999aaaabbbbccccdddd"
+    sess_dir = tmp_path / sha / "chats"
+    sess_dir.mkdir(parents=True)
+    sess = sess_dir / "session-002.jsonl"
+    sess.write_text(
+        json.dumps({"sessionId": "g-002", "startTime": "2026-04-01T00:00:00Z",
+                    "kind": "main"}) + "\n"
+        + json.dumps({"id": "m1", "timestamp": "2026-04-01T00:00:01Z",
+                      "type": "user", "content": [{"text": "hi"}]}) + "\n"
+    )
+    aliases = tmp_path / "gemini-aliases.json"
+    aliases.write_text(json.dumps({sha: "apps_my_project"}))
+    monkeypatch.setattr(ingest, "_GEMINI_ALIAS_PATH", aliases)
+
+    ingest.ingest_gemini_file(db, sess, do_embed=False)
+    slug = db.execute(
+        "SELECT project_slug FROM sessions WHERE agent='gemini'"
+    ).fetchone()[0]
+    assert slug == "apps_my_project", \
+        f"expected alias-mapped slug, got {slug!r} (alias file not consulted?)"
+
+
+def test_backfill_redact_purges_existing_secrets(db):
+    """P0 #2: existing rows that pre-date redaction can be retroactively
+    cleaned via `recall backfill-redact`. After backfill, neither FTS nor
+    a direct content scan should find the secret token."""
+    leaked = "OPENAI_API_KEY=sk-abc123def456ghi789jkl012mno345pqr678stu901"
+    db.execute(
+        "INSERT INTO messages(uuid, session_id, project_slug, role, content, "
+        "timestamp, model, agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("leaked-1", "s", "p", "user", leaked, "2026-01-01T00:00:00Z", None, "claude"),
+    )
+    secret_token = "sk-abc123def456ghi789jkl012mno345pqr678stu901"
+    fts_query = f'"{secret_token}"'  # FTS5 quote — secret contains a dash
+    # Sanity: pre-backfill the secret IS indexed
+    pre_fts = db.execute(
+        "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?",
+        (fts_query,),
+    ).fetchone()[0]
+    assert pre_fts == 1, "fixture sanity — secret should be findable before backfill"
+
+    ingest.backfill_redact(db)
+
+    # Direct content scan: no row contains the original token
+    survivors = db.execute(
+        "SELECT COUNT(*) FROM messages WHERE content LIKE ?",
+        (f"%{secret_token}%",),
+    ).fetchone()[0]
+    assert survivors == 0, "secret token survived backfill_redact"
+
+    # FTS rebuilt: searching for the secret returns no hits
+    fts_hits = db.execute(
+        "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?",
+        (fts_query,),
+    ).fetchone()[0]
+    assert fts_hits == 0, "FTS still indexes the secret after backfill_redact"
+
+
+def _seed_messages(db, rows):
+    """rows is a list of (uuid, session_id, project_slug, role, content, timestamp, agent)."""
+    for r in rows:
+        db.execute(
+            "INSERT INTO messages(uuid, session_id, project_slug, role, content, "
+            "timestamp, model, agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (r[0], r[1], r[2], r[3], r[4], r[5], None, r[6]),
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO sessions(session_id, project_slug, title, "
+            "first_seen, last_updated, agent) VALUES (?, ?, ?, ?, ?, ?)",
+            (r[1], r[2], None, r[5], r[5], r[6]),
+        )
+
+
+def test_forget_by_session(db):
+    _seed_messages(db, [
+        ("u1", "s1", "p1", "user", "hello s1", "2026-01-01T00:00:00Z", "claude"),
+        ("u2", "s1", "p1", "user", "another s1", "2026-01-01T00:00:01Z", "claude"),
+        ("u3", "s2", "p1", "user", "from s2", "2026-01-01T00:00:00Z", "claude"),
+    ])
+    n = ingest.forget(db, session="s1", confirm=True)
+    assert n == 2
+    remaining = db.execute("SELECT uuid FROM messages ORDER BY uuid").fetchall()
+    assert [r[0] for r in remaining] == ["u3"]
+    # Session row pruned
+    sessions = db.execute("SELECT session_id FROM sessions").fetchall()
+    assert {s[0] for s in sessions} == {"s2"}
+
+
+def test_forget_by_pattern(db):
+    _seed_messages(db, [
+        ("u1", "s1", "p1", "user", "OPENAI_API_KEY=sk-abc123def456ghi789jkl012mno345pqr678",
+         "2026-01-01T00:00:00Z", "claude"),
+        ("u2", "s1", "p1", "user", "harmless content", "2026-01-01T00:00:01Z", "claude"),
+    ])
+    # Note: _clean_content normally redacts on ingest, but raw INSERT here
+    # bypasses that — simulating a pre-redaction legacy DB.
+    n = ingest.forget(db, pattern=r"sk-[A-Za-z0-9]{20,}", confirm=True)
+    assert n == 1
+    survivors = db.execute("SELECT uuid FROM messages").fetchall()
+    assert [r[0] for r in survivors] == ["u2"]
+
+
+def test_forget_by_before_date(db):
+    _seed_messages(db, [
+        ("u1", "s1", "p1", "user", "old", "2025-01-01T00:00:00Z", "claude"),
+        ("u2", "s1", "p1", "user", "new", "2026-04-01T00:00:00Z", "claude"),
+    ])
+    n = ingest.forget(db, before="2026-01-01", confirm=True)
+    assert n == 1
+    survivors = db.execute("SELECT uuid FROM messages").fetchall()
+    assert [r[0] for r in survivors] == ["u2"]
+
+
+def test_forget_by_project(db):
+    _seed_messages(db, [
+        ("u1", "s1", "p1", "user", "p1 row", "2026-01-01T00:00:00Z", "claude"),
+        ("u2", "s2", "p2", "user", "p2 row", "2026-01-01T00:00:01Z", "claude"),
+    ])
+    n = ingest.forget(db, project="p1", confirm=True)
+    assert n == 1
+    survivors = db.execute("SELECT uuid FROM messages").fetchall()
+    assert [r[0] for r in survivors] == ["u2"]
+
+
+def test_forget_by_agent(db):
+    _seed_messages(db, [
+        ("u1", "s1", "p1", "user", "claude row", "2026-01-01T00:00:00Z", "claude"),
+        ("u2", "s2", "p1", "user", "codex row", "2026-01-01T00:00:01Z", "codex"),
+    ])
+    n = ingest.forget(db, agent="codex", confirm=True)
+    assert n == 1
+    survivors = db.execute("SELECT uuid FROM messages").fetchall()
+    assert [r[0] for r in survivors] == ["u1"]
+
+
+def test_forget_by_uuid(db):
+    _seed_messages(db, [
+        ("u1", "s1", "p1", "user", "row1", "2026-01-01T00:00:00Z", "claude"),
+        ("u2", "s1", "p1", "user", "row2", "2026-01-01T00:00:01Z", "claude"),
+    ])
+    n = ingest.forget(db, uuid="u1", confirm=True)
+    assert n == 1
+    survivors = db.execute("SELECT uuid FROM messages").fetchall()
+    assert [r[0] for r in survivors] == ["u2"]
+
+
+def test_forget_dry_run_does_not_delete(db, capsys):
+    _seed_messages(db, [
+        ("u1", "s1", "p1", "user", "foo body", "2026-01-01T00:00:00Z", "claude"),
+        ("u2", "s2", "p1", "user", "foo body too", "2026-01-01T00:00:01Z", "claude"),
+    ])
+    n = ingest.forget(db, pattern="foo", confirm=False)  # default
+    assert n == 0
+    survivors = db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    assert survivors == 2
+    out = capsys.readouterr().out
+    assert "2 message(s) match" in out
+    assert "Dry-run" in out
+
+
+def test_forget_purges_fts_index(db):
+    _seed_messages(db, [
+        ("u1", "s1", "p1", "user",
+         "leaked sk-abc123def456ghi789jkl012mno345pqr678",
+         "2026-01-01T00:00:00Z", "claude"),
+    ])
+    ingest.forget(db, uuid="u1", confirm=True)
+    fts_hits = db.execute(
+        "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?",
+        ("leaked",),
+    ).fetchone()[0]
+    assert fts_hits == 0, "FTS still references the deleted row"
+
+
+def test_recall_cliff_with_skewed_agent_distribution(db, tmp_path, monkeypatch):
+    """P1 #4: recall search --agent X must return matches from agent X even
+    when X is a small minority of the corpus. Reproduces the production
+    scenario: 1000 claude rows + 20 codex rows, search a common term, expect
+    --agent codex to return ~all of the codex matches.
+
+    Today (RED): top-100 prefilter is global → expected 0 codex hits in top-100
+    when claude dominates → search returns 0 even when 20 matches exist.
+    """
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    # 1000 claude messages, all containing the noisy common term "test"
+    claude_session = tmp_path / "p_claude" / "session.jsonl"
+    claude_session.parent.mkdir(parents=True)
+    with open(claude_session, "w") as f:
+        for n in range(1000):
+            f.write(json.dumps({
+                "uuid": f"c-{n}", "type": "user",
+                "timestamp": f"2026-01-01T00:00:{n%60:02d}Z",
+                "message": {"role": "user", "content": f"claude message {n} test"},
+            }) + "\n")
+    ingest.ingest_file(db, claude_session, do_embed=False)
+    # 20 codex messages also containing "test" — synthetic tagged rows
+    for n in range(20):
+        db.execute(
+            "INSERT INTO messages(uuid, session_id, project_slug, role, content, "
+            "timestamp, model, agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (f"x-{n}", "codex-1", "p_codex", "user",
+             f"codex message {n} test", "2026-02-01T00:00:00Z", None, "codex"),
+        )
+
+    ground_truth = db.execute(
+        "SELECT COUNT(*) FROM messages WHERE agent='codex' AND content LIKE '%test%'"
+    ).fetchone()[0]
+    assert ground_truth == 20, "fixture sanity"
+
+    # Run search restricted to codex
+    import io, sys as _sys
+    buf = io.StringIO(); old = _sys.stdout; _sys.stdout = buf
+    try:
+        ingest.search(db, "test", agent="codex", limit=20, context=0)
+    finally:
+        _sys.stdout = old
+    output = buf.getvalue()
+    codex_hits = output.count("[codex]")
+    assert codex_hits >= 10, (
+        f"recall cliff: --agent codex returned {codex_hits} hits "
+        f"out of {ground_truth} ground-truth matches"
+    )
+
+
+def test_schema_migrations_table_records_versions(tmp_path, monkeypatch):
+    """LQ-4: a fresh DB should have schema_migrations rows for every applied
+    migration. Re-opening the same DB should not re-enter migration bodies."""
+    monkeypatch.setattr(ingest, "DB_PATH", tmp_path / "fresh.db")
+    con = ingest.open_db()
+    try:
+        rows = con.execute(
+            "SELECT version, applied_at FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        versions = [r[0] for r in rows]
+        # v2 (agent column) and v3 (FTS porter) should both be recorded
+        assert ingest._MIGRATION_AGENT_COLUMN in versions
+        assert ingest._MIGRATION_FTS_PORTER in versions
+        for r in rows:
+            assert r[1], "applied_at timestamp should be populated"
+    finally:
+        ingest.close_db(con)
+
+    # Reopen — migration bodies should be gated by _migration_applied
+    # (we instrument via a counter monkey-patched onto _record_migration)
+    calls = {"n": 0}
+    real_record = ingest._record_migration
+    def counting(con, version):
+        calls["n"] += 1
+        real_record(con, version)
+    monkeypatch.setattr(ingest, "_record_migration", counting)
+    con2 = ingest.open_db()
+    try:
+        # No migration body should re-execute → no fresh _record_migration calls
+        assert calls["n"] == 0, (
+            f"migrations re-ran on second open ({calls['n']} record calls)"
+        )
+    finally:
+        ingest.close_db(con2)
+
+
+def test_malformed_jsonl_records_surface_in_warning(db, tmp_path, monkeypatch, capsys):
+    """LQ-3: malformed records used to be silently dropped via
+    `try: rec = json.loads(raw); except: continue`. After fix, a per-file
+    counter prints a warning so schema drift becomes visible."""
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    session = tmp_path / "proj_x" / "session-malformed.jsonl"
+    session.parent.mkdir(parents=True)
+    with open(session, "w") as f:
+        f.write(json.dumps({
+            "uuid": "u1", "type": "user",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"role": "user", "content": "good row"},
+        }) + "\n")
+        f.write("{not valid json}\n")
+        f.write("[also broken\n")
+        f.write(json.dumps({
+            "uuid": "u2", "type": "user",
+            "timestamp": "2026-01-01T00:00:01Z",
+            "message": {"role": "user", "content": "another good row"},
+        }) + "\n")
+
+    capsys.readouterr()  # drain
+    n = ingest.ingest_file(db, session, do_embed=False)
+    err = capsys.readouterr().err
+    assert n == 2, "should still ingest the 2 valid rows"
+    assert "2 malformed" in err, \
+        f"expected malformed-counter warning, stderr was: {err!r}"
+
+
+def test_install_hooks_wires_each_cli_correctly(tmp_path, monkeypatch):
+    """install_hooks() writes the right hook block into each CLI's settings:
+       - claude → hooks.UserPromptSubmit
+       - codex  → hooks.UserPromptSubmit
+       - gemini → hooks.BeforeAgent (with `matcher: '*'` and ms timeout)
+    Backs up existing settings before modifying."""
+    from convo_recall import install as _install
+
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".codex").mkdir(parents=True)
+    (home / ".gemini").mkdir(parents=True)
+    (home / ".claude" / "settings.json").write_text(json.dumps({"theme": "dark"}))
+    (home / ".gemini" / "settings.json").write_text(json.dumps({"existing": "config"}))
+    # codex hooks.json doesn't exist yet — install should create it
+
+    def fake_target(agent):
+        if agent == "claude":
+            return home / ".claude" / "settings.json", "UserPromptSubmit", "claude"
+        if agent == "codex":
+            return home / ".codex" / "hooks.json", "UserPromptSubmit", "codex"
+        if agent == "gemini":
+            return home / ".gemini" / "settings.json", "BeforeAgent", "gemini"
+    monkeypatch.setattr(_install, "_hook_target", fake_target)
+
+    changed = _install.install_hooks(
+        agents=["claude", "codex", "gemini"],
+        dry_run=False,
+        non_interactive=True,
+    )
+    assert changed == 3, f"expected 3 hooks wired, got {changed}"
+
+    # Claude
+    claude_cfg = json.loads((home / ".claude" / "settings.json").read_text())
+    assert claude_cfg["theme"] == "dark", "existing claude settings preserved"
+    upr = claude_cfg["hooks"]["UserPromptSubmit"]
+    assert len(upr) == 1
+    assert upr[0]["hooks"][0]["command"].endswith("conversation-memory.sh")
+    assert upr[0]["hooks"][0]["timeout"] == 5
+
+    # Codex (new file)
+    codex_cfg = json.loads((home / ".codex" / "hooks.json").read_text())
+    assert codex_cfg["hooks"]["UserPromptSubmit"][0]["hooks"][0]["timeout"] == 5
+
+    # Gemini — note the BeforeAgent event + matcher: "*" + ms timeout + name
+    gemini_cfg = json.loads((home / ".gemini" / "settings.json").read_text())
+    assert gemini_cfg["existing"] == "config"
+    ba = gemini_cfg["hooks"]["BeforeAgent"]
+    assert ba[0]["matcher"] == "*"
+    assert ba[0]["hooks"][0]["name"] == "convo-recall"
+    assert ba[0]["hooks"][0]["timeout"] == 5000
+
+    # Backup files were created (one per pre-existing settings file).
+    backups = list(home.rglob("*.bak.*"))
+    assert len(backups) == 2, f"expected 2 backups (claude+gemini), got {len(backups)}"
+
+
+def test_install_hooks_is_idempotent(tmp_path, monkeypatch):
+    """Re-running install_hooks() should not create duplicate hook entries."""
+    from convo_recall import install as _install
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / "settings.json").write_text("{}")
+    monkeypatch.setattr(_install, "_hook_target", lambda a:
+        (home / ".claude" / "settings.json", "UserPromptSubmit", "claude"))
+
+    n1 = _install.install_hooks(agents=["claude"], non_interactive=True)
+    n2 = _install.install_hooks(agents=["claude"], non_interactive=True)
+    assert n1 == 1 and n2 == 0, "second call should be a no-op"
+    cfg = json.loads((home / ".claude" / "settings.json").read_text())
+    upr = cfg["hooks"]["UserPromptSubmit"]
+    # Exactly one hook block, not two
+    total_hooks = sum(len(g["hooks"]) for g in upr)
+    assert total_hooks == 1, f"duplicate hook blocks created: {upr}"
+
+
+def test_uninstall_hooks_removes_only_convo_recall_block(tmp_path, monkeypatch):
+    """uninstall_hooks() must leave the user's other UserPromptSubmit hooks
+    intact and only remove the convo-recall block (matched by command path)."""
+    from convo_recall import install as _install
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+
+    # Pre-existing settings: user already has one hook plus convo-recall would be added
+    settings_path = home / ".claude" / "settings.json"
+    settings_path.write_text(json.dumps({
+        "hooks": {
+            "UserPromptSubmit": [
+                {"hooks": [{"type": "command", "command": "/usr/local/bin/their-other-hook.sh"}]},
+            ]
+        }
+    }))
+    monkeypatch.setattr(_install, "_hook_target", lambda a:
+        (settings_path, "UserPromptSubmit", "claude"))
+
+    _install.install_hooks(agents=["claude"], non_interactive=True)
+    cfg = json.loads(settings_path.read_text())
+    assert len(cfg["hooks"]["UserPromptSubmit"]) == 2, "both hooks should be present"
+
+    removed = _install.uninstall_hooks(agents=["claude"])
+    assert removed == 1
+    cfg = json.loads(settings_path.read_text())
+    upr = cfg["hooks"]["UserPromptSubmit"]
+    assert len(upr) == 1, "user's own hook should remain"
+    assert upr[0]["hooks"][0]["command"] == "/usr/local/bin/their-other-hook.sh"
+
+
+def test_install_hooks_dry_run_does_not_write(tmp_path, monkeypatch):
+    """dry_run=True must not modify any settings file."""
+    from convo_recall import install as _install
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    settings_path = home / ".claude" / "settings.json"
+    original = json.dumps({"theme": "dark"})
+    settings_path.write_text(original)
+    monkeypatch.setattr(_install, "_hook_target", lambda a:
+        (settings_path, "UserPromptSubmit", "claude"))
+
+    _install.install_hooks(agents=["claude"], dry_run=True, non_interactive=True)
+    assert settings_path.read_text() == original, "dry_run should not modify file"
+    backups = list(home.rglob("*.bak.*"))
+    assert backups == [], "dry_run should not create backups"
+
+
+def test_conversation_memory_hook_emits_valid_json_for_each_cli():
+    """The pre-prompt hook script auto-detects the firing CLI from the
+    stdin payload and emits the right hookEventName. Verify the contract
+    for all three input shapes:
+
+      - Codex/Claude: includes `hook_event_name`
+      - Gemini: omits `hook_event_name`, has `prompt` only
+      - Empty stdin: defaults to UserPromptSubmit
+    """
+    import subprocess
+
+    hook = (Path(ingest.__file__).parent / "hooks" / "conversation-memory.sh").resolve()
+    assert hook.exists(), f"hook script missing at {hook}"
+    assert os.access(hook, os.X_OK), f"hook script not executable: {hook}"
+
+    cases = [
+        # (stdin payload, expected hookEventName)
+        ('{"hook_event_name":"UserPromptSubmit","prompt":"hi","session_id":"s","cwd":"/x"}', "UserPromptSubmit"),
+        ('{"hook_event_name":"BeforeAgent","prompt":"hi"}', "BeforeAgent"),
+        ('{"prompt":"hi"}', "BeforeAgent"),  # Gemini-shaped, no hook_event_name
+        ('', "UserPromptSubmit"),             # empty stdin defaults
+    ]
+    for payload, expected_event in cases:
+        result = subprocess.run(
+            [str(hook)], input=payload, capture_output=True, text=True, timeout=5,
+        )
+        assert result.returncode == 0, f"hook exit {result.returncode} for {payload!r}: {result.stderr}"
+        data = json.loads(result.stdout)
+        hso = data["hookSpecificOutput"]
+        assert hso["hookEventName"] == expected_event, (
+            f"stdin {payload!r}: expected hookEventName={expected_event!r}, "
+            f"got {hso['hookEventName']!r}"
+        )
+        assert "convo-recall" in hso["additionalContext"], \
+            "additionalContext should mention convo-recall"
+        assert hso["additionalContext"], "additionalContext must not be empty"
+
+
+def test_doctor_bak_warns_on_stale_files(db, tmp_path, monkeypatch, capsys):
+    """Trivia #17: `recall doctor` should surface `.bak` files older than
+    30 days in the DB directory so users can reclaim disk."""
+    import time
+    bak = tmp_path / "test.db.pre-v020.20260101-013233.bak"
+    bak.write_bytes(b"x" * 1024)
+    # mtime 31 days in the past
+    old = time.time() - (31 * 86400)
+    os.utime(bak, (old, old))
+
+    capsys.readouterr()  # drain
+    ingest.doctor(db)
+    out = capsys.readouterr().out
+    assert "test.db.pre-v020.20260101-013233.bak" in out
+    assert "31d" in out or "32d" in out, f"expected age annotation, got: {out!r}"
+
+
+def test_two_connections_have_independent_vec_state(tmp_path, monkeypatch):
+    """P2 #10: opening two DBs in one process must not clobber each other's
+    vec-enabled state. Pre-refactor, the module-level `_vc` got overwritten
+    by the second open_db() call, breaking the first connection's helpers.
+    """
+    # First DB
+    monkeypatch.setattr(ingest, "DB_PATH", tmp_path / "a.db")
+    con_a = ingest.open_db()
+    # Second DB — re-open with a different path
+    monkeypatch.setattr(ingest, "DB_PATH", tmp_path / "b.db")
+    con_b = ingest.open_db()
+
+    try:
+        # Both should report vec-enabled (sqlite_vec is in dependencies)
+        assert ingest._vec_ok(con_a) is True, "con_a lost vec state after con_b opened"
+        assert ingest._vec_ok(con_b) is True, "con_b should be vec-enabled"
+
+        # Each DB sees only its own rows
+        con_a.execute(
+            "INSERT INTO messages(uuid, session_id, project_slug, role, content, "
+            "timestamp, model, agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("a-1", "s1", "p1", "user", "row in db a", "2026-01-01T00:00:00Z", None, "claude"),
+        )
+        con_b.execute(
+            "INSERT INTO messages(uuid, session_id, project_slug, role, content, "
+            "timestamp, model, agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("b-1", "s2", "p2", "user", "row in db b", "2026-01-01T00:00:00Z", None, "claude"),
+        )
+
+        a_uuids = {r[0] for r in con_a.execute("SELECT uuid FROM messages").fetchall()}
+        b_uuids = {r[0] for r in con_b.execute("SELECT uuid FROM messages").fetchall()}
+        assert a_uuids == {"a-1"}, f"db a leaked rows: {a_uuids}"
+        assert b_uuids == {"b-1"}, f"db b leaked rows: {b_uuids}"
+
+        # Closing one must not break the other
+        ingest.close_db(con_a)
+        assert ingest._vec_ok(con_b) is True, "con_b lost vec state when con_a closed"
+        # con_b still functional
+        n = con_b.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        assert n == 1
+    finally:
+        try: con_b.close()
+        except Exception: pass
+
+
+def test_self_heal_orders_newest_first():
+    """P2 #9: self-heal should walk unembedded messages newest-first so the
+    most recent (and most-queried) rows heal before older ones. Source-
+    inspection test — the SELECT lives in `scan_all`."""
+    src = Path(ingest.__file__).read_text()
+    # The relevant query is the LEFT JOIN message_vecs … WHERE v.rowid IS NULL
+    import re as _re
+    m = _re.search(
+        r"LEFT JOIN message_vecs v ON v\.rowid = m\.rowid\s+"
+        r"WHERE v\.rowid IS NULL\s+"
+        r"ORDER BY m\.rowid\s+(\w+)",
+        src,
+    )
+    assert m is not None, "self-heal SELECT not found in ingest.py"
+    direction = m.group(1)
+    assert direction == "DESC", (
+        f"self-heal SELECT uses ORDER BY m.rowid {direction}, "
+        f"expected DESC (newest-first)"
+    )
+
+
+def test_no_silent_apsw_error_pass_in_source():
+    """P1 #5: structural test — ensure no `except apsw.Error: pass` survives
+    in ingest.py. apsw can't be monkey-patched at the cursor level (its
+    Connection.execute is read-only), so we assert via source inspection
+    instead. Every apsw.Error handler must do something visible: log,
+    count, or re-raise. A bare `pass` is the bug we're banning."""
+    src = Path(ingest.__file__).read_text()
+    import re as _re
+    # Find every 'except apsw.Error[...]:' block and the line immediately after.
+    for m in _re.finditer(r"except apsw\.Error[^:]*:\s*\n(\s*)([^\n]+)", src):
+        indent, next_line = m.group(1), m.group(2).strip()
+        assert next_line != "pass", (
+            f"silent `except apsw.Error: pass` found in ingest.py at offset {m.start()} — "
+            f"every apsw.Error handler must log or surface the failure"
+        )
+
+
+def test_tool_error_backfill_uses_correct_agent(db, tmp_path, monkeypatch):
+    """P1 #6: tool_error_backfill INSERT statement is missing the `agent`
+    column. Today it relies on DEFAULT 'claude' — works for claude sessions
+    but mis-tags any tool_error rows discovered in non-claude sessions.
+
+    After fix, the INSERT should explicitly set agent matching the parent
+    session, OR tool_error_backfill should only iterate claude sources.
+    """
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    # Plant a fake claude session with a tool_error block
+    sess = tmp_path / "p" / "session.jsonl"
+    sess.parent.mkdir(parents=True)
+    sess.write_text(json.dumps({
+        "uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_x",
+             "is_error": True,
+             "content": [{"type": "text", "text": "ECONNREFUSED bad host"}]},
+        ]},
+    }) + "\n")
+    ingest.tool_error_backfill(db)
+    rows = db.execute("SELECT agent, role FROM messages WHERE role='tool_error'").fetchall()
+    assert rows, "tool_error_backfill produced no rows"
+    for r in rows:
+        # Must explicitly set agent — not rely on schema default
+        assert r["agent"] == "claude", \
+            f"tool_error row has agent={r['agent']!r}, expected explicit 'claude'"
+
+    # Read the source: the INSERT must list agent in the column list
+    src = Path(ingest.__file__).read_text()
+    # Find the INSERT in tool_error_backfill specifically
+    import re as _re
+    teb_block = _re.search(
+        r"def tool_error_backfill.*?(?=\ndef |\Z)", src, _re.DOTALL
+    ).group(0)
+    inserts = _re.findall(r"INSERT OR IGNORE INTO messages.*?VALUES\s*\([?,\s]+\)", teb_block, _re.DOTALL)
+    assert inserts, "no INSERT statement found in tool_error_backfill"
+    for ins in inserts:
+        assert "agent" in ins, (
+            "tool_error_backfill INSERT does NOT list the `agent` column — "
+            "relies on DEFAULT 'claude' which mis-tags non-claude sessions:\n" + ins
+        )
+
+
+def test_embed_returns_none_on_non_200_response(monkeypatch):
+    """Bonus #14: embed() does not check resp.status — non-200 responses
+    raise KeyError('vector') instead of returning None gracefully.
+    After fix, any non-200 status (e.g. 429/500) returns None and the
+    caller falls back to FTS-only mode."""
+    class FakeResp:
+        status = 429
+        def read(self):
+            return b'{"error":"rate limited"}'
+    class FakeConn:
+        def __init__(self, *a, **k): pass
+        def request(self, *a, **k): pass
+        def getresponse(self): return FakeResp()
+        def close(self): pass
+    monkeypatch.setattr(ingest, "_UnixHTTPConn", FakeConn)
+    # Make the socket "exist" so embed() proceeds past the existence check
+    result = ingest.embed("hello world")
+    assert result is None, (
+        f"embed() returned {result!r} on HTTP 429 — expected None for graceful fallback"
+    )
 
 
 def test_search_no_results_for_unknown_agent(db, tmp_path, monkeypatch, capsys):
