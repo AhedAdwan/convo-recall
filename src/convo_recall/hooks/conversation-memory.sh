@@ -36,6 +36,8 @@ raw_pwd=$(pwd)
 # correct regardless of the project name or path.
 python3 - "$payload" "$raw_pwd" <<'PY'
 import json
+import os
+import re
 import sys
 
 payload_raw = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -54,11 +56,114 @@ elif "prompt" in data and "session_id" not in data:
     # Gemini's BeforeAgent payload has `prompt` but no session_id.
     event = "BeforeAgent"
 
+# ── Throttling — skip the reminder for trivial conversational turns ──────────
+#
+# The reminder fires on every user turn. For one-word interjections ("yes",
+# "ok", "hmm") it's pure context noise — there's nothing to search for. Skip
+# in those cases so the model isn't paying for the reminder on every "yes".
+#
+# Opt-out: set CONVO_RECALL_HOOK_AUTO_SEARCH=off in the env to disable
+# entirely.
+prompt = data.get("prompt") or data.get("user_prompt") or ""
+
+_INTERJECTION_RE = re.compile(
+    r'^\s*(yes|no|ok|okay|sure|yep|nope|hmm+|continue|go|stop|wait|hi|hello|y|n|\.|!|\?)\.?\s*$',
+    re.IGNORECASE,
+)
+
+
+def _should_skip(prompt: str) -> bool:
+    if os.environ.get("CONVO_RECALL_HOOK_AUTO_SEARCH", "").lower() == "off":
+        return True
+    if not prompt or len(prompt.strip()) < 12:
+        return True
+    if _INTERJECTION_RE.match(prompt):
+        return True
+    return False
+
+
+if _should_skip(prompt):
+    # Empty additionalContext = valid hook response, zero token bloat.
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": event,
+            "additionalContext": "",
+        }
+    }))
+    sys.exit(0)
+
 # Derive a slug for the current project, matching convo-recall's convention.
+# Collapse BOTH slashes and hyphens to underscores — Claude's flattened
+# session storage encodes path separators as hyphens, so the ingest side
+# treats `/` and `-` identically. The search/hook side has to match.
 slug = ""
 if "/Projects/" in cwd:
     tail = cwd.split("/Projects/", 1)[1]
-    slug = tail.replace("/", "_").lower()
+    slug = tail.replace("/", "_").replace("-", "_").lower()
+
+# ── Auto-search — actually run the search and inject results as context ──────
+#
+# The agent's #1 finding was "the hook is a reminder, not an integration."
+# This block changes that: for substantive prompts, we run `recall search`
+# against the user's prompt and prepend the top hits to the reminder.
+#
+# Hard-cap latency at ~3s (subprocess timeout) so a slow embedding sidecar
+# doesn't stall every keystroke. On any failure, fall back to the static
+# reminder — never block the user.
+import shutil
+import subprocess
+
+_RECALL_SEARCH_TIMEOUT_S = 3.0
+_RECALL_SEARCH_LIMIT = 3
+_SNIPPET_CHAR_CAP = 200
+
+prior_block = ""
+recall_bin = shutil.which("recall")
+if recall_bin:
+    args = [recall_bin, "search", prompt, "-n", str(_RECALL_SEARCH_LIMIT),
+            "--context", "0", "--json"]
+    if slug:
+        args.extend(["--project", slug])
+    else:
+        args.append("--all-projects")
+    try:
+        res = subprocess.run(
+            args, capture_output=True, text=True,
+            timeout=_RECALL_SEARCH_TIMEOUT_S,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            payload = json.loads(res.stdout)
+            results = payload.get("results", [])
+            # If project-scoped came back empty, retry once with --all-projects.
+            if not results and slug:
+                fallback_args = [recall_bin, "search", prompt,
+                                 "-n", str(_RECALL_SEARCH_LIMIT),
+                                 "--context", "0", "--json", "--all-projects"]
+                res2 = subprocess.run(
+                    fallback_args, capture_output=True, text=True,
+                    timeout=_RECALL_SEARCH_TIMEOUT_S,
+                )
+                if res2.returncode == 0 and res2.stdout.strip():
+                    payload = json.loads(res2.stdout)
+                    results = payload.get("results", [])
+            if results:
+                lines = ["## Prior context from convo-recall\n"]
+                for r in results[:_RECALL_SEARCH_LIMIT]:
+                    snip = (r.get("snippet") or "").replace("\n", " ")
+                    if len(snip) > _SNIPPET_CHAR_CAP:
+                        snip = snip[:_SNIPPET_CHAR_CAP] + "…"
+                    proj = r.get("project_slug", "")
+                    role = r.get("role", "")
+                    ts = (r.get("timestamp") or "")[:10]
+                    agent_tag = r.get("agent", "")
+                    lines.append(
+                        f"- [{proj}] [{agent_tag}/{role}] {ts}: {snip}"
+                    )
+                prior_block = "\n".join(lines) + "\n\n"
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError):
+        # Fall through to static reminder. Don't fail the hook over a
+        # slow / missing recall binary.
+        prior_block = ""
 
 if slug:
     project_line = f'Search current project: recall search "<query>" --project {slug}\n'
@@ -66,6 +171,7 @@ else:
     project_line = ""
 
 context_text = (
+    f"{prior_block}"
     "Before searching the web, guessing, or reinventing something already "
     "solved — this project's full conversation history is searchable via "
     "convo-recall.\n\n"
