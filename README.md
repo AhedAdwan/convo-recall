@@ -82,7 +82,7 @@ Tool calls and reasoning blocks are NOT indexed — only human-readable user/ass
 
 ## Requirements
 
-- macOS or Linux (Python 3.11+).
+- macOS or Linux. Python **3.11, 3.12, 3.13, or 3.14** — CI tests every version on both OSes; the lower bound is 3.11.
   - macOS: launchd watcher (default).
   - Linux: systemd-user, cron, or polling fallback — auto-detected. See [Schedulers](#schedulers).
 - Claude Code, Codex, or Gemini CLI (any subset; hooks work across all three).
