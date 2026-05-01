@@ -414,3 +414,21 @@ The bundled sidecar uses 1024-dim vectors. If your service uses a different dime
 - Use convo-recall in any mass-surveillance, social-credit, or biometric-identification system operated against a general population.
 
 If you want to use convo-recall commercially, reach out for a commercial license — open to discussion for genuinely civilian, non-military use cases. See [LICENSE](LICENSE) for the full text.
+
+---
+
+## Disclaimer
+
+convo-recall is provided **as-is**, without warranty of any kind. While the
+codebase ships with 200+ tests and several end-to-end sandbox runs, your
+environment is not our environment.
+
+**Before installing on a workstation you care about:**
+- Read [`SECURITY.md`](SECURITY.md) and the install wizard's per-step prompts.
+- Run a sandbox first — the `tests/sandbox-*.sh` scripts spin up disposable
+  Docker environments that exercise the full install / search / uninstall path.
+- The source is small (~3K lines of Python) — do your own due diligence.
+
+You run convo-recall at your own risk. The author is not responsible for any
+data loss, system damage, or other consequences. See [`LICENSE`](LICENSE) §
+*No Liability* for the binding legal terms.

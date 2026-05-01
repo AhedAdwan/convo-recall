@@ -1342,6 +1342,296 @@ def _safe_fts_query(query: str) -> str:
     return " ".join(parts)
 
 
+_DEFAULT_TAIL_N = 30
+_TAIL_WIDTH = 220                # per-message char budget before truncation
+_TAIL_BODY_COLS = 76             # body wrap column (right-side body width)
+_TAIL_ROLES = ("user", "assistant")
+_TAIL_USER_LABEL = "YOU"         # display label for the user's own role
+
+_TAIL_GLYPHS = {
+    # `pipe` is shown next to agent rows; `pipe_user` (heavier) marks YOUR rows
+    # so your own messages pop visually without color.
+    "unicode": {"pipe": "│", "pipe_user": "┃", "dot": "·", "ellipsis": "…", "rule": "─"},
+    "ascii":   {"pipe": "|", "pipe_user": "#", "dot": "-", "ellipsis": "...", "rule": "-"},
+}
+
+
+def _resolve_tail_session(con: apsw.Connection, project: str | None,
+                          agent: str | None) -> tuple[str, str] | None:
+    """Pick the latest session matching project/agent filters.
+
+    Returns (session_id, project_slug) or None if no session matches.
+    """
+    where = []
+    params: list = []
+    if project:
+        where.append("project_slug = ?")
+        params.append(project)
+    if agent:
+        where.append("agent = ?")
+        params.append(agent)
+    sql = "SELECT session_id, project_slug FROM sessions"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY last_updated DESC LIMIT 1"
+    row = con.execute(sql, params).fetchone()
+    if row is None:
+        return None
+    return (row[0], row[1])
+
+
+def _tail_parse_ts(ts: str | None) -> "datetime | None":
+    if not ts:
+        return None
+    try:
+        s = ts.replace("Z", "+00:00")
+        # Strip sub-second precision past microsecond cap if present.
+        return datetime.fromisoformat(s)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _tail_format_ago(ts: str | None,
+                     now: "datetime | None" = None) -> str:
+    """Return 'Xs ago' / 'Xm ago' / 'Xh ago' / 'Xd ago' / 'Xw ago'.
+
+    `now` is injectable for deterministic tests; defaults to current UTC.
+    Returns '' for unparseable timestamps and 'now' for sub-second elapsed.
+    """
+    dt = _tail_parse_ts(ts)
+    if dt is None:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    secs = int((now - dt).total_seconds())
+    if secs <= 0:
+        return "now"
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    if secs < 604800:
+        return f"{secs // 86400}d ago"
+    return f"{secs // 604800}w ago"
+
+
+def _tail_clock(ts: str | None) -> str:
+    """Format `ts` as HH:MM:SS, or 'unknown' if unparseable."""
+    dt = _tail_parse_ts(ts)
+    if dt is not None:
+        return dt.strftime("%H:%M:%S")
+    return (ts or "")[11:19] or "unknown"
+
+
+def _tail_session_range(rows: list) -> str:
+    """First-msg date + 'HH:MM→HH:MM' (or '→<date> HH:MM' across days)."""
+    if not rows:
+        return ""
+    first = _tail_parse_ts(rows[0][1])
+    last = _tail_parse_ts(rows[-1][1])
+    if first is None or last is None:
+        return ""
+    if first.date() == last.date():
+        return f"{first.date().isoformat()} {first.strftime('%H:%M')}"\
+               f"→{last.strftime('%H:%M')}"
+    return f"{first.date().isoformat()} {first.strftime('%H:%M')}"\
+           f"→{last.date().isoformat()} {last.strftime('%H:%M')}"
+
+
+def _tail_wrap(text: str, cols: int) -> list[str]:
+    """Word-wrap, preserving paragraph breaks. Empty list never returned."""
+    import textwrap
+    out: list[str] = []
+    for para in text.split("\n"):
+        para = para.rstrip()
+        if not para:
+            out.append("")
+            continue
+        wrapped = textwrap.wrap(
+            para, width=cols,
+            break_long_words=False,   # don't split URLs/identifiers
+            break_on_hyphens=False,
+        )
+        out.extend(wrapped or [""])
+    return out or [""]
+
+
+def tail(con: apsw.Connection, n: int = _DEFAULT_TAIL_N,
+         session: str | None = None,
+         project: str | None = None,
+         agent: str | None = None,
+         roles: tuple[str, ...] | None = None,
+         width: int = _TAIL_WIDTH,
+         expand: set[int] | None = None,
+         ascii_only: bool = False,
+         cols: int = _TAIL_BODY_COLS,
+         json_: bool = False) -> int:
+    """Print the last N messages from a session in chronological order.
+
+    With no `session`, picks the most-recently-updated session matching
+    `project` and `agent` filters. Output is oldest-first so the latest
+    message appears at the bottom — matches a chat-log reading order.
+
+    `expand` is a set of 1-based turn numbers to render in full (no
+    truncation, no inline collapse). `ascii_only` swaps Unicode glyphs
+    for ASCII fallbacks; useful for terminals that don't render box chars.
+
+    Returns: 0 on success, 1 if no session/messages found.
+    """
+    roles = tuple(roles) if roles else _TAIL_ROLES
+    expand = expand or set()
+    if n <= 0:
+        n = _DEFAULT_TAIL_N
+
+    resolved_project = project
+    if session is None:
+        picked = _resolve_tail_session(con, project, agent)
+        if picked is None:
+            label = ", ".join(filter(None, [
+                f"project='{project}'" if project else None,
+                f"agent='{agent}'" if agent else None,
+            ])) or "any project"
+            if json_:
+                import json as _json
+                print(_json.dumps({
+                    "session_id": None,
+                    "project": project,
+                    "agent": agent,
+                    "n": n,
+                    "messages": [],
+                    "error": f"no session found for {label}",
+                }))
+            else:
+                print(f"No sessions found for {label}.", file=sys.stderr)
+            return 1
+        session, resolved_project = picked
+    elif resolved_project is None:
+        # Explicit --session bypassed the picker — recover the project_slug
+        # from the sessions table so the header still shows it.
+        row = con.execute(
+            "SELECT project_slug FROM sessions WHERE session_id = ?",
+            (session,),
+        ).fetchone()
+        if row is not None:
+            resolved_project = row[0]
+
+    placeholders = ",".join(["?"] * len(roles))
+    rows = con.execute(
+        f"SELECT role, timestamp, content, agent "
+        f"FROM messages "
+        f"WHERE session_id = ? AND role IN ({placeholders}) "
+        f"ORDER BY timestamp DESC LIMIT ?",
+        [session, *roles, n],
+    ).fetchall()
+    rows = list(reversed(rows))  # chronological — newest at the bottom
+
+    if json_:
+        import json as _json
+        out = {
+            "session_id": session,
+            "project": resolved_project,
+            "agent": agent,
+            "n": n,
+            "messages": [
+                {"role": r[0], "timestamp": r[1], "content": r[2],
+                 "agent": r[3]}
+                for r in rows
+            ],
+        }
+        print(_json.dumps(out))
+        return 0 if rows else 1
+
+    if not rows:
+        print(f"No messages found in session {session}.", file=sys.stderr)
+        return 1
+
+    g = _TAIL_GLYPHS["ascii" if ascii_only else "unicode"]
+    short_session = session[:8] if len(session) >= 8 else session
+    now = datetime.now(timezone.utc)
+
+    # Pre-compute speaker labels and column widths so the metadata column
+    # is uniform across all rows (Option-E layout). Newest message is #1
+    # (reverse-numbered from the bottom up).
+    total = len(rows)
+
+    def _speaker_for(role: str, msg_agent: str | None) -> str:
+        if role == "user":
+            return _TAIL_USER_LABEL
+        if role == "assistant" and msg_agent:
+            return msg_agent
+        return role
+
+    speakers = [_speaker_for(r[0], r[3]) for r in rows]
+    speaker_w = max((len(s) for s in speakers), default=4)
+    num_w = max(2, len(str(total))) + 1   # +1 for the leading '#'
+    # Pre-compute every metadata-column string so we know its exact width
+    # and can build a matching blank for body continuation lines.
+    meta_strs: list[str] = []
+    for i, (role, ts, _content, _agent) in enumerate(rows):
+        rev_n = total - i                    # newest = #1
+        clock = _tail_clock(ts)
+        ago = _tail_format_ago(ts, now=now)
+        meta_strs.append(
+            f"{('#' + str(rev_n)):<{num_w}} {clock}  {ago:<8}  "
+            f"{speakers[i]:<{speaker_w}} "
+        )
+    meta_w = max((len(m) for m in meta_strs), default=0)
+    blank_meta = " " * meta_w
+
+    # ── header ───────────────────────────────────────────────────────────
+    header_bits = [
+        f"session {short_session}",
+        resolved_project or "?",
+        f"{total} messages",
+    ]
+    rng = _tail_session_range(rows)
+    if rng:
+        header_bits.append(rng)
+    if rows:
+        header_bits.append(f"latest {_tail_format_ago(rows[-1][1], now=now)}")
+    print(f" {g['dot']} ".join(header_bits))
+    print()
+
+    # ── messages ─────────────────────────────────────────────────────────
+    truncated_turns: list[int] = []
+
+    for i, (role, ts, content_raw, msg_agent) in enumerate(rows):
+        content = content_raw if content_raw is not None else ""
+        rev_n = total - i
+        force_full = rev_n in expand
+
+        original_len = len(content)
+        if not force_full and original_len > width:
+            body = content[:width].rstrip()
+            extra = original_len - width
+            body += f" {g['ellipsis']} [+{extra} more]"
+            truncated_turns.append(rev_n)
+        else:
+            body = content
+
+        bar = g["pipe_user"] if role == "user" else g["pipe"]
+        meta = meta_strs[i].ljust(meta_w)
+
+        wrapped = _tail_wrap(body, cols)
+        for j, line in enumerate(wrapped):
+            prefix = meta if j == 0 else blank_meta
+            print(f"{prefix}{bar}  {line}".rstrip())
+        print()
+
+    # ── footer hint ──────────────────────────────────────────────────────
+    if truncated_turns and not expand:
+        sample = truncated_turns[-1]   # most recent truncated turn (smallest #)
+        print(f"(use `recall tail {n} --expand {sample}` "
+              f"to see message #{sample} in full)")
+    return 0
+
+
 def search(con: apsw.Connection, query: str, limit: int = 10,
            recent: bool = False, project: str | None = None,
            context: int = 1, agent: str | None = None,

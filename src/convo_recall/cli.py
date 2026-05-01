@@ -6,6 +6,27 @@ import sys
 from . import __version__, ingest, install as _install
 
 
+def _expand_list(raw: str) -> set[int]:
+    """argparse type for --expand: parses 'N[,N…]' into a set of ints.
+
+    Validated at parse time so the CLI fails fast — before open_db() is
+    called and before any DB access. Bad input → argparse rejects with
+    exit code 2.
+    """
+    out: set[int] = set()
+    for tok in (raw or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.add(int(tok))
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"--expand expects integers (e.g. 3 or 1,4,7), got {tok!r}"
+            )
+    return out
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="recall",
@@ -103,6 +124,40 @@ def main() -> None:
     g.add_argument("--uuid", help="Delete a single message by uuid")
     p_forget.add_argument("--confirm", action="store_true",
                           help="Without this flag, forget runs in dry-run mode (no deletion)")
+
+    p_tail = sub.add_parser(
+        "tail",
+        help="Print the last N user/assistant messages from the most "
+             "recent session (chronological, newest at the bottom)",
+    )
+    p_tail.add_argument("n", nargs="?", type=int, default=30,
+                        help="Number of messages (default 30)")
+    p_tail.add_argument("--session", default=None,
+                        help="Specific session_id (default: latest matching project/agent)")
+    p_tail.add_argument("--project", "-p", default=None,
+                        help="Filter to a project slug. Defaults to current "
+                             "directory if inside a Projects/ subtree.")
+    p_tail.add_argument("--all-projects", action="store_true",
+                        help="Pick the latest session across all projects")
+    p_tail.add_argument("--agent", "-a", default=None,
+                        help="Filter to one agent (claude / gemini / codex)")
+    p_tail.add_argument("--roles", default="user,assistant",
+                        help="Comma-separated roles to include (default: user,assistant; "
+                             "use 'all' for user,assistant,tool_error)")
+    p_tail.add_argument("--width", type=int, default=220, metavar="N",
+                        help="Truncate each message body to N chars (default 220). "
+                             "Bypassed for messages listed in --expand.")
+    p_tail.add_argument("--cols", type=int, default=76, metavar="N",
+                        help="Wrap message body to N columns (default 76)")
+    p_tail.add_argument("--expand", type=_expand_list, default=set(),
+                        metavar="N[,N…]",
+                        help="Comma-separated turn numbers to print in full "
+                             "(no truncation, no inline collapse)")
+    p_tail.add_argument("--ascii", action="store_true",
+                        help="Use ASCII glyphs (|, -, ->, ...) instead of "
+                             "Unicode (│, ·, ↳, …) for terminals that don't render box chars")
+    p_tail.add_argument("--json", action="store_true",
+                        help="Emit machine-readable JSON instead of formatted text")
 
     p_search = sub.add_parser("search", help="Hybrid search (FTS5 + vector if available)")
     p_search.add_argument("query")
@@ -230,6 +285,29 @@ def main() -> None:
                           context=args.context,
                           agent=args.agent,
                           json_=getattr(args, "json", False))
+        elif args.cmd == "tail":
+            if args.project:
+                project = args.project
+            elif args.all_projects:
+                project = None
+            else:
+                project = ingest.slug_from_cwd()
+            roles_arg = (args.roles or "").strip().lower()
+            if roles_arg == "all":
+                roles = ("user", "assistant", "tool_error")
+            else:
+                roles = tuple(r.strip() for r in roles_arg.split(",") if r.strip())
+            rc = ingest.tail(con, n=args.n,
+                             session=args.session,
+                             project=project,
+                             agent=args.agent,
+                             roles=roles,
+                             width=args.width,
+                             expand=args.expand,
+                             ascii_only=getattr(args, "ascii", False),
+                             cols=args.cols,
+                             json_=getattr(args, "json", False))
+            sys.exit(rc)
         else:
             parser.print_help()
             sys.exit(1)
