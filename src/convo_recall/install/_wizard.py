@@ -279,22 +279,62 @@ def run(
     # watchers are installed.
     _ingest.save_config({"agents": enabled})
 
-    # Apply order matters: initial ingest runs BEFORE watchers spawn so the
-    # DB is current when the watcher takes over. Otherwise the watcher's
-    # first scan races with `recall ingest` for the WAL writer lock and
-    # one of them dies with apsw.BusyError. Polling tier hits this
-    # deterministically (Popen spawn is synchronous; watcher starts
-    # immediately) but the race exists in any tier whose install is fast.
+    # Apply order matters — three constraints conspire:
+    #   1. Initial ingest must NOT race the watcher's first scan for the WAL
+    #      writer lock, so the watcher install goes LAST (after the DB is
+    #      already populated). Polling tier hits this deterministically;
+    #      launchd / systemd are async-bootstrap and may or may not race.
+    #   2. Embed-backfill needs the sidecar reachable, so the sidecar must
+    #      be installed AND warmed BEFORE backfill runs.
+    #   3. Initial ingest CAN run with the sidecar still warming up — it
+    #      tolerates a missing socket and queues those rows for backfill.
+    #
+    # Resulting order: sidecar → ingest → wait-for-sidecar → backfill →
+    # watchers → hooks.
 
-    # ── 1. Initial ingest + backfill ─────────────────────────────────────────
+    # ── 1. Embed sidecar (start it FIRST so it can warm up in parallel) ──────
+    if do_embed_sidecar:
+        result = sched.install_sidecar(
+            recall_bin=recall_bin,
+            sock_path=str(SOCK_PATH),
+            log_dir=str(LOG_DIR),
+        )
+        marker = "✅" if result.ok else "⚠ "
+        print(f"  {marker} [{sched.describe()}] {result.message}")
+        if result.ok:
+            print(f"     Model will download on first use (~1.3 GB). Check:")
+            print(f"     tail -f {LOG_DIR}/convo-recall-embed.log")
+
+    # ── 2. Initial ingest (sidecar may be reachable or still warming) ────────
     if do_initial_ingest:
         print("\nRunning initial ingest…")
         subprocess.run([recall_bin, "ingest"])
-        if do_initial_embed_backfill:
-            print("\nRunning initial embed-backfill…")
-            subprocess.run([recall_bin, "embed-backfill"])
 
-    # ── 2. Watchers ──────────────────────────────────────────────────────────
+    # ── 3. Wait for sidecar to be reachable, then run embed-backfill ─────────
+    if do_initial_embed_backfill:
+        if do_embed_sidecar:
+            # Poll for up to 30s for the sidecar's UDS to appear. Cold
+            # model load (1.3 GB → MPS) typically takes 5-15s.
+            import time as _time
+            print("\nWaiting for embed sidecar to be reachable…")
+            deadline = _time.monotonic() + 30
+            while _time.monotonic() < deadline:
+                if SOCK_PATH.exists():
+                    break
+                _time.sleep(0.5)
+            if not SOCK_PATH.exists():
+                print(f"⚠ Embed sidecar didn't come up within 30s.")
+                print(f"  Skipping backfill; self-heal will catch up over time, "
+                      f"or run `recall embed-backfill` manually after the sidecar warms up.")
+            else:
+                print("\nRunning initial embed-backfill…")
+                subprocess.run([recall_bin, "embed-backfill"])
+        else:
+            # User asked for backfill but no sidecar — e.g. [embeddings] extra
+            # missing. Skip cleanly with the install hint.
+            print("\n⚠ embed-backfill skipped — no sidecar configured.")
+
+    # ── 4. Watchers (LAST — DB is populated, sidecar is up, no race) ─────────
     if do_watchers:
         for agent in enabled:
             watch_dir = _AGENT_WATCH_DIRS[agent]()
@@ -314,20 +354,7 @@ def run(
             marker = "✅" if r.ok else "⚠ "
             print(f"  {marker} {r.message}")
 
-    # ── 3. Embed sidecar ─────────────────────────────────────────────────────
-    if do_embed_sidecar:
-        result = sched.install_sidecar(
-            recall_bin=recall_bin,
-            sock_path=str(SOCK_PATH),
-            log_dir=str(LOG_DIR),
-        )
-        marker = "✅" if result.ok else "⚠ "
-        print(f"  {marker} [{sched.describe()}] {result.message}")
-        if result.ok:
-            print(f"     Model will download on first use (~1.3 GB). Check:")
-            print(f"     tail -f {LOG_DIR}/convo-recall-embed.log")
-
-    # ── 4. Pre-prompt hooks ──────────────────────────────────────────────────
+    # ── 5. Pre-prompt hooks ──────────────────────────────────────────────────
     if do_hooks:
         print("\nWiring pre-prompt hooks…")
         # User already consented at the wizard level; suppress per-CLI prompts.
