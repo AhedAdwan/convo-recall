@@ -356,6 +356,67 @@ def test_tail_json_no_session_includes_error(db, capsys):
     assert "error" in payload
 
 
+# ── "Did you mean" hint when slug differs only by hyphen/underscore ──────────
+
+def test_tail_suggests_hyphen_variant_when_underscored_form_misses(db, capsys):
+    """Real bug from /work/projects/app-gemini in the sandbox: cwd-detection
+    derives slug 'app_gemini' but gemini ingest stored 'app-gemini'. Tail
+    should now hint 'Did you mean: app-gemini?' (matches search's behavior)."""
+    # Seed a session/message under the hyphenated slug.
+    ingest._upsert_session(db, "gemini", "app-gemini", "s-g", None,
+                           "2026-04-30T00:00:00Z", "2026-04-30T00:00:00Z")
+    ingest._persist_message(db, "gemini", "app-gemini", "s-g", "u1",
+                            "user", "hi from gemini",
+                            "2026-04-30T00:00:01Z", do_embed=False)
+
+    rc = ingest.tail(db, n=10, project="app_gemini")  # underscored — wrong
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "No sessions found" in err
+    assert "Did you mean" in err
+    assert "app-gemini" in err
+
+
+def test_tail_suggests_underscore_variant_when_hyphen_form_misses(db, capsys):
+    """Symmetric case: user passes hyphen form but only underscored exists."""
+    ingest._upsert_session(db, "claude", "app_claude", "s-c", None,
+                           "2026-04-30T00:00:00Z", "2026-04-30T00:00:00Z")
+    ingest._persist_message(db, "claude", "app_claude", "s-c", "u1",
+                            "user", "hi", "2026-04-30T00:00:01Z",
+                            do_embed=False)
+
+    rc = ingest.tail(db, n=10, project="app-claude")
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "Did you mean: app_claude" in err
+
+
+def test_tail_json_did_you_mean_in_payload(db, capsys):
+    """JSON callers should see the suggestion under `did_you_mean`."""
+    ingest._upsert_session(db, "gemini", "app-gemini", "s-g", None,
+                           "2026-04-30T00:00:00Z", "2026-04-30T00:00:00Z")
+    ingest._persist_message(db, "gemini", "app-gemini", "s-g", "u1",
+                            "user", "hi", "2026-04-30T00:00:01Z",
+                            do_embed=False)
+
+    rc = ingest.tail(db, n=10, project="app_gemini", json_=True)
+    out = capsys.readouterr().out.strip()
+    payload = json.loads(out)
+    assert rc == 1
+    assert payload["messages"] == []
+    assert "did_you_mean" in payload
+    assert "app-gemini" in payload["did_you_mean"]
+
+
+def test_tail_no_suggestion_when_truly_unknown_project(db, capsys):
+    """If the project genuinely doesn't exist (no near-match), no suggestion."""
+    rc = ingest.tail(db, n=10, project="totally-bogus-project")
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "No sessions found" in err
+    assert "Did you mean" not in err
+
+
 # ── CLI smoke tests ────────────────────────────────────────────────────────────
 
 _RECALL = shutil.which("recall")

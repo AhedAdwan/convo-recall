@@ -1493,22 +1493,42 @@ def tail(con: apsw.Connection, n: int = _DEFAULT_TAIL_N,
     if session is None:
         picked = _resolve_tail_session(con, project, agent)
         if picked is None:
+            # "Did you mean" — match `recall search`'s behavior. cwd-detection
+            # collapses hyphens to underscores (claude/codex convention), but
+            # gemini sometimes stores the literal hyphenated dir name. Surface
+            # the variant so the user can re-run with the right --project.
+            suggestions: list[str] = []
+            if project:
+                near = con.execute(
+                    "SELECT DISTINCT project_slug FROM messages "
+                    "WHERE REPLACE(project_slug, '_', '-') = REPLACE(?, '_', '-') "
+                    "  AND project_slug != ? "
+                    "ORDER BY project_slug",
+                    (project, project),
+                ).fetchall()
+                suggestions = [r[0] for r in near[:3]]
             label = ", ".join(filter(None, [
                 f"project='{project}'" if project else None,
                 f"agent='{agent}'" if agent else None,
             ])) or "any project"
             if json_:
                 import json as _json
-                print(_json.dumps({
+                payload: dict = {
                     "session_id": None,
                     "project": project,
                     "agent": agent,
                     "n": n,
                     "messages": [],
                     "error": f"no session found for {label}",
-                }))
+                }
+                if suggestions:
+                    payload["did_you_mean"] = suggestions
+                print(_json.dumps(payload))
             else:
                 print(f"No sessions found for {label}.", file=sys.stderr)
+                if suggestions:
+                    print(f"Did you mean: {', '.join(suggestions)}?",
+                          file=sys.stderr)
             return 1
         session, resolved_project = picked
     elif resolved_project is None:
