@@ -386,31 +386,17 @@ for m in msgs:
 print('json-ok')
 " | grep -q "^json-ok$" || fail "JSON shape missing required keys"
 
-# 13f — --expand bypasses truncation: pick a session with a long message,
-# verify --expand strips the '[+N more]' marker for that turn.
-long_session=$("$PY" -c "
-import os, sys
-sys.path.insert(0, '${REPO_ROOT}/src')
-os.environ['CONVO_RECALL_DB']='$CONVO_RECALL_DB'
-import convo_recall.ingest as i
-con = i.open_db()
-row = con.execute(
-    'SELECT session_id FROM messages WHERE LENGTH(content) > 300 '
-    'ORDER BY timestamp DESC LIMIT 1'
-).fetchone()
-print(row[0] if row else '')
-")
-if [[ -n "$long_session" ]]; then
-    truncated_out=$("$RECALL" tail 1 --session "$long_session" 2>&1)
-    echo "$truncated_out" | grep -q "more]" \
-      || fail "expected truncation marker on long message (--width default 220)"
-    expanded_out=$("$RECALL" tail 1 --session "$long_session" --expand 1 2>&1)
-    echo "$expanded_out" | grep -q "more]" \
-      && fail "--expand 1 should bypass truncation but '[+N more]' still present"
-    ok "tail truncates by default; --expand bypasses (long-message session)"
-else
-    ok "tail truncation tested elsewhere (no >300-char message in fixtures)"
-fi
+# 13f — --width forces truncation; --expand bypasses it.
+# Force --width 50 so even short messages truncate (removes dependency on the
+# longest message in any particular session). Then verify --expand 1 on a
+# single-message tail produces output WITH NO truncation marker anywhere.
+truncated_out=$("$RECALL" tail 5 --session "$tail_session" --width 50 2>&1)
+echo "$truncated_out" | grep -q "more]" \
+  || { echo "$truncated_out"; fail "expected '[+N more]' marker with --width 50"; }
+expanded_out=$("$RECALL" tail 1 --session "$tail_session" --width 50 --expand 1 2>&1)
+echo "$expanded_out" | grep -q "more]" \
+  && { echo "$expanded_out"; fail "--expand 1 should bypass truncation for the only turn shown"; }
+ok "tail truncates with --width 50; --expand 1 bypasses truncation"
 
 # 13g — --ascii swaps Unicode glyphs for ASCII fallbacks
 ascii_out=$("$RECALL" tail 3 --session "$tail_session" --ascii 2>&1)
