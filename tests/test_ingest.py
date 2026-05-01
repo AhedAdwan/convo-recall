@@ -389,6 +389,45 @@ def test_codex_slug_from_cwd():
     assert ingest._codex_slug_from_cwd("/some/random/path") == "random_path"
 
 
+def test_codex_slug_from_cwd_canonicalizes_hyphens_to_underscores():
+    """Regression: pre-fix `/work/projects/app-codex` was stored as `app-codex`
+    while `slug_from_cwd()` (used by recall search/tail) derived `app_codex`,
+    creating a mismatch. Now both produce `app_codex`."""
+    assert ingest._codex_slug_from_cwd("/work/projects/app-codex") == "app_codex"
+    assert ingest._codex_slug_from_cwd("/work/projects/app-gemini") == "app_gemini"
+    assert ingest._codex_slug_from_cwd("/Users/x/Projects/some-multi-hyphen-name") \
+        == "some_multi_hyphen_name"
+    # Hyphens in subpath components also get collapsed.
+    assert ingest._codex_slug_from_cwd("/Users/x/Projects/app-codex/sub-dir") \
+        == "app_codex_sub_dir"
+
+
+def test_codex_slug_matches_slug_from_cwd_for_hyphenated_paths(monkeypatch, tmp_path):
+    """The two functions MUST produce the same slug for the same path —
+    otherwise ingest stores under one slug and search/tail looks for another.
+    This is the invariant the canonicalization fix enforces."""
+    p = tmp_path / "projects" / "app-codex"
+    p.mkdir(parents=True)
+    monkeypatch.chdir(p)
+    cwd_slug = ingest.slug_from_cwd()
+    ingest_slug = ingest._slug_from_cwd(str(p))
+    assert cwd_slug == ingest_slug, (
+        f"slug derivations diverged: search-side='{cwd_slug}', "
+        f"ingest-side='{ingest_slug}' — would re-introduce the hyphen mismatch"
+    )
+
+
+def test_gemini_slug_from_path_canonicalizes_hyphens(tmp_path):
+    """Same regression applies to gemini's path-based slug fallback used when
+    a session header lacks `cwd` — without the fix, gemini stored `app-gemini`
+    while search looked for `app_gemini`."""
+    from pathlib import Path
+    p = Path("/root/.gemini/tmp/app-gemini/chats/session-abc.jsonl")
+    assert ingest._gemini_slug_from_path(p) == "app_gemini"
+    p2 = Path("/root/.gemini/tmp/some-name-with-many-hyphens/chats/session-x.jsonl")
+    assert ingest._gemini_slug_from_path(p2) == "some_name_with_many_hyphens"
+
+
 def test_search_agent_filter(db, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
     s_claude = tmp_path / "p_claude" / "session.jsonl"

@@ -890,8 +890,15 @@ def _persist_message(con: apsw.Connection, agent: str, project_slug: str,
 
 
 def _gemini_slug_from_path(jsonl_path: Path) -> str:
-    """~/.gemini/tmp/{project}/chats/session-*.jsonl → {project}."""
-    return jsonl_path.parent.parent.name
+    """~/.gemini/tmp/{project}/chats/session-*.jsonl → {project}.
+
+    Hyphens are collapsed to underscores to match the canonical slug form
+    used by `slug_from_cwd()` (cwd auto-detection in `recall search/tail`)
+    and by Claude's flattened-path ingest. Without this, a gemini session
+    in `~/.gemini/tmp/app-gemini/chats/` was stored as `app-gemini` while
+    `recall tail` from `/work/projects/app-gemini` looked for `app_gemini`.
+    """
+    return jsonl_path.parent.parent.name.replace("-", "_")
 
 
 def ingest_gemini_file(con: apsw.Connection, jsonl_path: Path,
@@ -981,16 +988,24 @@ def _slug_from_cwd(cwd: str) -> str:
     `/Users/x/Projects/mcp/Foo` → `mcp_Foo` (matches Claude's slug convention
     for paths under `Projects/`).
     `/some/random/path` → `random_path` (best-effort fallback).
+
+    Hyphens are collapsed to underscores so codex/gemini ingest produces the
+    same canonical slugs that `slug_from_cwd()` derives from the user's cwd.
+    Pre-fix, `/work/projects/app-codex` was stored as `app-codex` by codex
+    ingest but searched-for as `app_codex` by `recall tail`, leading to
+    "no sessions found" with a "Did you mean: app-codex?" hint that should
+    never have been needed in the first place.
     """
     parts = Path(cwd).parts
     try:
         idx = next(i for i, p in enumerate(parts) if p.lower() == "projects")
         relevant = parts[idx + 1:]
-        return "_".join(relevant) if relevant else Path(cwd).name
+        slug = "_".join(relevant) if relevant else Path(cwd).name
     except StopIteration:
         # No Projects/ in path — use last 2 path components
         relevant = parts[-2:] if len(parts) >= 2 else parts
-        return "_".join(p for p in relevant if p and p != "/")
+        slug = "_".join(p for p in relevant if p and p != "/")
+    return slug.replace("-", "_")
 
 
 # Codex-specific alias kept for call-site stability (search by name).
