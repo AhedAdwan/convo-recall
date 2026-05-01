@@ -112,6 +112,32 @@ def run(
     from ._hooks import install_hooks
     import convo_recall.ingest as _ingest
 
+    # ── Non-interactive warning ─────────────────────────────────────────────
+    # `recall install -y` auto-accepts every prompt — useful for CI but
+    # dangerous when copy-pasted from a tutorial. Print a loud warning and
+    # give the user 5 seconds to Ctrl-C. Skipped in dry-run (no side effects).
+    if non_interactive and not dry_run:
+        import time
+        print()
+        print("⚠️  ⚠️  ⚠️   NON-INTERACTIVE MODE — AUTO-ACCEPTING EVERY PROMPT   ⚠️  ⚠️  ⚠️")
+        print()
+        print("This will run `recall install` WITHOUT asking for confirmation on:")
+        print("  • Installing watchers (launchd/systemd/cron) for detected agents")
+        print("  • Wiring pre-prompt hooks into claude/codex/gemini settings files")
+        print("  • Starting the embed sidecar (~1.3 GB model download if --with-embeddings)")
+        print("  • Persisting config to ~/.local/share/convo-recall/")
+        print()
+        print("   ⏱️  Press Ctrl-C in the next 5 seconds to abort, or wait to proceed…")
+        try:
+            for i in range(5, 0, -1):
+                print(f"      {i}…", end="", flush=True)
+                time.sleep(1)
+            print()
+        except KeyboardInterrupt:
+            print("\n✅ Aborted by user. Nothing changed.")
+            return
+        print()
+
     # Populate XDG_RUNTIME_DIR if unset but the user bus is reachable —
     # gives every downstream subprocess (systemctl --user, recall watch
     # spawn, runtime_dir() for PID files) a consistent rendezvous point.
