@@ -1578,6 +1578,8 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
 # ── Backfill commands ─────────────────────────────────────────────────────────
 
 def embed_backfill(con: apsw.Connection) -> None:
+    from . import _progress
+
     if not _vec_ok(con):
         print("sqlite-vec not loaded", file=sys.stderr)
         return
@@ -1589,14 +1591,25 @@ def embed_backfill(con: apsw.Connection) -> None:
     pending = [r for r in rows if r["rowid"] not in existing]
     total = len(pending)
     print(f"Embedding {total:,} messages…")
+
+    _progress.start_job("embed-backfill", total=total, phase="embed-backfill")
     done = 0
-    for r in pending:
-        vec = embed(r["content"])
-        if vec:
-            _vec_insert(con, r["rowid"], vec)
-            done += 1
-        if done % 500 == 0 and done > 0:
-            print(f"  {done}/{total}…")
+    try:
+        for r in pending:
+            vec = embed(r["content"])
+            if vec:
+                _vec_insert(con, r["rowid"], vec)
+                done += 1
+            # Update the file every 100 rows — keeps the progress display
+            # fresh without thrashing the disk on per-row writes.
+            if done % 100 == 0 and done > 0:
+                _progress.update_job(done)
+            if done % 500 == 0 and done > 0:
+                print(f"  {done}/{total}…")
+    finally:
+        # Always clear the marker, even on exceptions, so a crashed
+        # backfill doesn't leave a stale snapshot for later stats reads.
+        _progress.finish_job()
     print(f"Done. {done:,} embeddings written.")
 
 
@@ -1930,7 +1943,44 @@ def forget(con: apsw.Connection, *,
     return total
 
 
+def _render_progress_bar(status: dict) -> None:
+    """One-shot progress bar at the top of `recall stats`. Reads a
+    snapshot from `_progress.read_status()` and renders a single line —
+    no live refresh, no persistent display. The user sees current state
+    each time they invoke `recall stats` and nothing more.
+
+    Falls back to a plain text bar if `tqdm` isn't installed (FTS-only
+    users without the [embeddings] extra)."""
+    phase = status.get("phase", status.get("job", "backfill"))
+    completed = int(status.get("completed", 0))
+    total = int(status.get("total", 0)) or 1
+    pct = min(100, completed * 100 // total)
+    try:
+        from tqdm import tqdm  # type: ignore
+        # `file=sys.stdout` so the bar lands in the same stream as the
+        # rest of stats output. tqdm defaults to stderr, which would
+        # split the rendered output across two pipes.
+        bar = tqdm(total=total, initial=completed,
+                   desc=f"  {phase}", unit="msg",
+                   leave=True, dynamic_ncols=True, file=sys.stdout,
+                   bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{rate_fmt}]")
+        bar.refresh()
+        bar.close()
+    except ImportError:
+        bar_width = 30
+        filled = bar_width * completed // total
+        plain = "█" * filled + "░" * (bar_width - filled)
+        print(f"  {phase}: {pct:3d}%|{plain}| {completed:,}/{total:,}")
+    print()  # blank line before stats body
+
+
 def stats(con: apsw.Connection) -> None:
+    from . import _progress
+
+    progress = _progress.read_status()
+    if progress is not None:
+        _render_progress_bar(progress)
+
     msg_count = con.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
     session_count = con.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
     project_count = con.execute(
