@@ -109,6 +109,56 @@ recall install --with-embeddings
 
 Long texts are chunked with a 450-token sliding window (50-token overlap) and mean-pooled — no silent truncation at 512 tokens.
 
+### Verbose / audit install
+
+The plain install is terse. For first-time installs or security audits where you want to see every wheel + URL + hash:
+
+```bash
+pipx install 'convo-recall[embeddings]' --verbose                  # show pipx's own steps
+pipx install 'convo-recall[embeddings]' --verbose --pip-args="-v"  # also pass -v to pip
+```
+
+⚠ pipx pipes pip's stdout through `subprocess.PIPE`, which strips pip's TTY-aware progress bars. Even with `--pip-args="-v"` the heaviest step (`torch` ~750 MB download) prints once at the start and then appears to "hang" until done. **For real progress bars**, install the core first and then add deps directly:
+
+```bash
+pipx install convo-recall                                          # fast core, no embeddings
+pipx runpip convo-recall install \
+    sentence-transformers 'torch>=2.2,<3' 'aiohttp>=3.10.11'       # tqdm progress bars
+```
+
+`pipx runpip` execs pip with stdout attached to your real terminal — same end-state as `pipx install '.[embeddings]'`, but you get live download bars per wheel.
+
+To audit what landed afterward:
+
+```bash
+pipx runpip convo-recall list             # all packages + versions
+pipx environment                          # pipx's directory layout
+pipx runpip convo-recall show torch       # provenance of any one package
+```
+
+### Uninstall
+
+Two-step chain. Order matters — run `recall uninstall` **before** `pipx uninstall`, otherwise the bundled hook script can't be located and entries get left dangling in each agent's settings file:
+
+```bash
+recall uninstall              # removes hooks + watchers + sidecar (DB + config preserved)
+pipx uninstall convo-recall   # removes the package itself
+```
+
+Full purge (also deletes the indexed conversation DB, logs, runtime cruft):
+
+```bash
+recall uninstall --purge-data
+pipx uninstall convo-recall
+```
+
+`--purge-data` removes `~/.local/share/convo-recall/` (DB + config), `~/Library/Caches/convo-recall/` on macOS or `$XDG_RUNTIME_DIR/convo-recall/` on Linux (sockets + cron backups), and `convo-recall-*.log` files in your platform log dir.
+
+**Always preserved** (clean up manually if desired):
+
+- Settings backups: `~/.claude/settings.json.bak.*`, `~/.codex/hooks.json.bak.*`, `~/.gemini/settings.json.bak.*` — kept as a recovery safety net.
+- Embedding model cache: `~/.cache/huggingface/hub/models--BAAI--bge-large-en-v1.5/` — shared across tools (delete only if no other tool uses BGE).
+
 ---
 
 ## Schedulers
