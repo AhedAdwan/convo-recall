@@ -223,7 +223,7 @@ def test_purge_data_removes_runtime_dir_and_logs(monkeypatch, tmp_path):
     monkeypatch.setattr(_paths, "log_dir", lambda: fake_logs)
     monkeypatch.setattr(_paths, "runtime_dir", lambda: fake_runtime)
 
-    install.uninstall(purge_data=True)
+    install.uninstall(purge_data=True, confirm=True)
 
     # F-21: runtime dir gone
     assert not fake_runtime.exists(), "runtime dir should have been removed"
@@ -258,8 +258,9 @@ def test_purge_data_no_op_when_nothing_to_purge(monkeypatch, tmp_path):
     monkeypatch.setattr(_paths, "log_dir", lambda: fake_home / "nonexistent-logs")
     monkeypatch.setattr(_paths, "runtime_dir", lambda: fake_home / "nonexistent-runtime")
 
-    # Should not raise
-    install.uninstall(purge_data=True)
+    # Should not raise (confirm=True so the actual delete branch runs and
+    # exercises the no-op rmtree paths).
+    install.uninstall(purge_data=True, confirm=True)
 
 
 def test_uninstall_surfaces_failures(monkeypatch):
@@ -282,3 +283,168 @@ def test_uninstall_surfaces_failures(monkeypatch):
         install.uninstall(purge_data=False)
 
     assert "bootout failed" in err_buf.getvalue()
+
+
+# ── Safety gate: --purge-data without --confirm must NOT delete ───────────────
+
+def _seed_purge_state(fake_home, monkeypatch):
+    """Helper: stub schedulers and create fake data/runtime/log files."""
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    monkeypatch.setenv("CONVO_RECALL_DB",
+                       str(fake_home / ".local/share/convo-recall/conversations.db"))
+
+    _stub_uninstall(
+        monkeypatch,
+        watcher_result_factory=lambda cls, agent: Result(
+            ok=True, message="watcher not installed", path=None),
+        sidecar_result_factory=lambda cls: Result(
+            ok=True, message="sidecar not installed", path=None),
+    )
+
+    fake_runtime = fake_home / "Library" / "Caches" / "convo-recall"
+    fake_runtime.mkdir(parents=True)
+    (fake_runtime / "embed.sock").touch()
+
+    fake_logs = fake_home / "Library" / "Logs"
+    fake_logs.mkdir(parents=True)
+    (fake_logs / "convo-recall-embed.log").write_text("log\n")
+
+    fake_data = fake_home / ".local" / "share" / "convo-recall"
+    fake_data.mkdir(parents=True)
+    fake_db = fake_data / "conversations.db"
+    fake_db.write_text("fake-db-bytes")
+
+    from convo_recall.install import _paths
+    monkeypatch.setattr(_paths, "log_dir", lambda: fake_logs)
+    monkeypatch.setattr(_paths, "runtime_dir", lambda: fake_runtime)
+    return {"runtime": fake_runtime, "logs": fake_logs, "data": fake_data, "db": fake_db}
+
+
+def test_purge_data_without_confirm_non_tty_is_dry_run(monkeypatch, tmp_path, capsys):
+    """In a non-TTY (CI / piped), --purge-data without --confirm must NOT
+    prompt and must NOT delete. It must exit with a 'use --confirm' hint."""
+    state = _seed_purge_state(tmp_path, monkeypatch)
+    # Force non-TTY
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    install.uninstall(purge_data=True)
+
+    out = capsys.readouterr().out
+    assert "DATA DIRECTORY" in out
+    assert "DRY-RUN" in out
+    assert "--confirm" in out
+    assert state["db"].exists(), "DB must NOT be deleted in non-TTY dry-run"
+    assert state["data"].exists()
+    assert state["runtime"].exists()
+    assert (state["logs"] / "convo-recall-embed.log").exists()
+
+
+def test_purge_data_tty_prompts_and_aborts_on_anything_but_YES(monkeypatch, tmp_path, capsys):
+    """TTY user must be prompted with 'ARE YOU SURE?' and only proceed on
+    typing exactly 'YES'. Anything else aborts without deleting."""
+    state = _seed_purge_state(tmp_path, monkeypatch)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    # Simulate the user typing 'yes' (lowercase — should NOT pass)
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "yes")
+
+    install.uninstall(purge_data=True)
+
+    out = capsys.readouterr().out
+    assert "ARE YOU SURE" in out
+    assert "Aborted" in out
+    # Nothing deleted
+    assert state["db"].exists()
+    assert state["data"].exists()
+    assert state["runtime"].exists()
+
+
+def test_purge_data_tty_proceeds_on_explicit_YES(monkeypatch, tmp_path, capsys):
+    """Typing exactly 'YES' (uppercase) at the prompt MUST proceed with delete."""
+    state = _seed_purge_state(tmp_path, monkeypatch)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "YES")
+
+    install.uninstall(purge_data=True)
+
+    assert not state["db"].exists()
+    assert not state["data"].exists()
+    assert not state["runtime"].exists()
+
+
+def test_purge_data_tty_aborts_on_empty_input(monkeypatch, tmp_path, capsys):
+    """Just hitting Enter must abort (default-deny)."""
+    state = _seed_purge_state(tmp_path, monkeypatch)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "")
+
+    install.uninstall(purge_data=True)
+
+    assert state["db"].exists()
+
+
+def test_purge_data_with_confirm_actually_deletes(monkeypatch, tmp_path, capsys):
+    """`--purge-data --confirm` must delete (the existing behavior is preserved
+    when the user explicitly opts in)."""
+    fake_home = tmp_path
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    monkeypatch.setenv("CONVO_RECALL_DB",
+                       str(fake_home / ".local/share/convo-recall/conversations.db"))
+
+    _stub_uninstall(
+        monkeypatch,
+        watcher_result_factory=lambda cls, agent: Result(
+            ok=True, message="watcher not installed", path=None),
+        sidecar_result_factory=lambda cls: Result(
+            ok=True, message="sidecar not installed", path=None),
+    )
+
+    fake_data = fake_home / ".local" / "share" / "convo-recall"
+    fake_data.mkdir(parents=True)
+    fake_db = fake_data / "conversations.db"
+    fake_db.write_text("bytes")
+
+    from convo_recall.install import _paths
+    monkeypatch.setattr(_paths, "log_dir", lambda: fake_home / "no-logs")
+    monkeypatch.setattr(_paths, "runtime_dir", lambda: fake_home / "no-rt")
+
+    install.uninstall(purge_data=True, confirm=True)
+    assert not fake_db.exists()
+    assert not fake_data.exists()
+
+
+def test_purge_preview_counts_db_messages(monkeypatch, tmp_path):
+    """Preview must surface message + session counts so the user understands
+    the scope of what will be lost (not just the byte size)."""
+    import sqlite3
+    fake_data = tmp_path / "data"
+    fake_data.mkdir()
+    db_path = fake_data / "conversations.db"
+    con = sqlite3.connect(str(db_path))
+    con.execute("CREATE TABLE messages (uuid TEXT)")
+    con.execute("CREATE TABLE sessions (session_id TEXT)")
+    for i in range(42):
+        con.execute("INSERT INTO messages (uuid) VALUES (?)", (f"m{i}",))
+    for i in range(7):
+        con.execute("INSERT INTO sessions (session_id) VALUES (?)", (f"s{i}",))
+    con.commit()
+    con.close()
+
+    monkeypatch.setenv("CONVO_RECALL_DB", str(db_path))
+    summary = install._purge_preview(fake_data, tmp_path / "rt", tmp_path / "logs")
+    assert summary["data_dir"]["exists"] is True
+    assert summary["data_dir"]["messages"] == 42
+    assert summary["data_dir"]["sessions"] == 7
+    assert summary["data_dir"]["db_size"] > 0
+
+
+def test_purge_preview_handles_missing_db_gracefully(tmp_path):
+    """Preview must not crash when the DB doesn't exist or is unreadable."""
+    summary = install._purge_preview(
+        tmp_path / "no-data",
+        tmp_path / "no-rt",
+        tmp_path / "no-logs",
+    )
+    assert summary["data_dir"]["exists"] is False
+    assert summary["data_dir"]["messages"] == 0
+    assert summary["runtime_dir"]["exists"] is False
+    assert summary["log_files"]["exists"] is False

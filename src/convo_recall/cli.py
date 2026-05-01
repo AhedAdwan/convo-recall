@@ -75,7 +75,12 @@ def main() -> None:
         help="Stop and remove convo-recall watchers across all schedulers",
     )
     p_uninstall.add_argument("--purge-data", action="store_true",
-                             help="Also delete the conversation DB and data directory")
+                             help="Also delete the conversation DB and data "
+                                  "directory (DRY-RUN unless --confirm is also given)")
+    p_uninstall.add_argument("--confirm", action="store_true",
+                             help="Required alongside --purge-data to actually "
+                                  "delete. Without it, --purge-data shows a "
+                                  "preview and exits without touching anything.")
 
     p_serve = sub.add_parser("serve", help="Start the embedding sidecar (blocks until Ctrl-C)")
     p_serve.add_argument("--sock", default=None,
@@ -100,9 +105,27 @@ def main() -> None:
         "_backfill-chain",
         help=argparse.SUPPRESS,  # private; spawned by `recall install` wizard
     )
-    sub.add_parser("backfill-clean", help="Re-clean all stored messages and rebuild FTS")
-    sub.add_parser("backfill-redact", help="Re-apply secret redaction to all stored messages and rebuild FTS")
-    sub.add_parser("chunk-backfill", help="Re-embed long messages with chunked mean-pooling")
+    p_bf_clean = sub.add_parser(
+        "backfill-clean",
+        help="Re-clean all stored messages and rebuild FTS "
+             "(DRY-RUN unless --confirm)",
+    )
+    p_bf_clean.add_argument("--confirm", action="store_true",
+                            help="Skip the interactive prompt and apply mutations.")
+    p_bf_redact = sub.add_parser(
+        "backfill-redact",
+        help="Re-apply secret redaction to all stored messages and rebuild FTS "
+             "(DRY-RUN unless --confirm)",
+    )
+    p_bf_redact.add_argument("--confirm", action="store_true",
+                             help="Skip the interactive prompt and apply mutations.")
+    p_chunk = sub.add_parser(
+        "chunk-backfill",
+        help="Re-embed long messages with chunked mean-pooling "
+             "(DRY-RUN unless --confirm)",
+    )
+    p_chunk.add_argument("--confirm", action="store_true",
+                         help="Skip the interactive prompt and re-embed.")
     sub.add_parser("tool-error-backfill", help="Index tool_result error blocks from all JSONL files")
     sub.add_parser("stats", help="Show DB statistics")
 
@@ -192,7 +215,10 @@ def main() -> None:
         return
 
     if args.cmd == "uninstall":
-        _install.uninstall(purge_data=getattr(args, "purge_data", False))
+        _install.uninstall(
+            purge_data=getattr(args, "purge_data", False),
+            confirm=getattr(args, "confirm", False),
+        )
         return
 
     if args.cmd == "install-hooks":
@@ -248,11 +274,11 @@ def main() -> None:
             finally:
                 _progress.finish_run()
         elif args.cmd == "backfill-clean":
-            ingest.backfill_clean(con)
+            ingest.backfill_clean(con, confirm=getattr(args, "confirm", False))
         elif args.cmd == "backfill-redact":
-            ingest.backfill_redact(con)
+            ingest.backfill_redact(con, confirm=getattr(args, "confirm", False))
         elif args.cmd == "chunk-backfill":
-            ingest.chunk_backfill(con)
+            ingest.chunk_backfill(con, confirm=getattr(args, "confirm", False))
         elif args.cmd == "tool-error-backfill":
             ingest.tool_error_backfill(con)
         elif args.cmd == "stats":

@@ -1947,36 +1947,109 @@ def embed_backfill(con: apsw.Connection) -> None:
     print(f"Done. {done:,} embeddings written.")
 
 
-def backfill_clean(con: apsw.Connection) -> None:
+def _confirm_destructive(label: str, n_changed: int, samples: list[tuple[str, str]],
+                         confirm: bool) -> bool:
+    """Shared preview + confirmation gate for backfill mutations.
+
+    Prints a danger banner, the row count, up to 3 before/after diffs, and:
+    - non-TTY without confirm → refuse, return False
+    - TTY without confirm → prompt 'YES', return True only on exact match
+    - confirm=True → skip prompt, return True
+
+    `samples` is a list of (before, after) string pairs to show the user.
+    """
+    print()
+    print("🔥" * 35)
+    print(f"☠️  DANGER — `{label}` will REWRITE {n_changed:,} rows IN PLACE  ☠️")
+    print("🔥" * 35)
+    print()
+    print("This is an in-place mutation of message content. The original text")
+    print("is replaced with the new text. There is NO undo and NO automatic")
+    print("backup. If the cleaning/redaction logic has a bug, every changed")
+    print("row carries the bug.")
+    print()
+    if samples:
+        print(f"📊 Sample of changes (first {len(samples)} of {n_changed:,}):")
+        for i, (before, after) in enumerate(samples, 1):
+            b = before if len(before) <= 100 else before[:100] + "…"
+            a = after  if len(after)  <= 100 else after[:100]  + "…"
+            print(f"  ── #{i} ──")
+            print(f"    BEFORE: {b!r}")
+            print(f"    AFTER : {a!r}")
+        print()
+    if n_changed == 0:
+        print("✅ Nothing to do — every row is already up to date.")
+        return False
+
+    if confirm:
+        print("💥 --confirm passed — proceeding without prompt.\n")
+        return True
+    if not sys.stdin.isatty():
+        print("⚠️  DRY-RUN — non-interactive shell.")
+        print(f"Re-run with --confirm to apply:")
+        print(f"    recall {label} --confirm")
+        return False
+    print("⚠️  ⚠️  ⚠️   ARE YOU SURE?   ⚠️  ⚠️  ⚠️\n")
+    response = input(
+        "Type 'YES' (uppercase) to apply the mutation, anything else to cancel: "
+    ).strip()
+    if response != "YES":
+        print("\n✅ Aborted. No rows changed.")
+        return False
+    print()
+    return True
+
+
+def backfill_clean(con: apsw.Connection, confirm: bool = False) -> None:
+    """Re-run content cleaning on every message.
+
+    Defaults to DRY-RUN (preview only). Pass confirm=True (or --confirm on
+    the CLI) to actually mutate rows. Pattern matches `recall forget`.
+    """
     rows = con.execute("SELECT rowid, content FROM messages").fetchall()
-    updated = 0
+    pending: list[tuple[int, str, str]] = []  # (rowid, old, new)
     for r in rows:
-        cleaned = _clean_content(r["content"])
-        if cleaned != r["content"]:
-            con.execute("UPDATE messages SET content = ? WHERE rowid = ?",
-                        (cleaned, r["rowid"]))
-            updated += 1
-    print(f"Cleaned {updated:,} messages. Rebuilding FTS…")
+        new = _clean_content(r["content"])
+        if new != r["content"]:
+            pending.append((r["rowid"], r["content"], new))
+
+    samples = [(old, new) for _, old, new in pending[:3]]
+    if not _confirm_destructive("backfill-clean", len(pending), samples, confirm):
+        return
+
+    for rowid, _old, new in pending:
+        con.execute("UPDATE messages SET content = ? WHERE rowid = ?",
+                    (new, rowid))
+    print(f"Cleaned {len(pending):,} messages. Rebuilding FTS…")
     con.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
     print("Done.")
 
 
-def backfill_redact(con: apsw.Connection) -> None:
+def backfill_redact(con: apsw.Connection, confirm: bool = False) -> None:
     """Re-apply secret redaction to all existing rows + rebuild FTS.
 
     Use this after upgrading to a version with secret redaction, or after
     `recall doctor --scan-secrets` reports findings on legacy rows that
     were ingested before redaction was enabled.
+
+    Defaults to DRY-RUN (preview only). Pass confirm=True (or --confirm on
+    the CLI) to actually mutate rows.
     """
     rows = con.execute("SELECT rowid, content FROM messages").fetchall()
-    updated = 0
+    pending: list[tuple[int, str, str]] = []
     for r in rows:
-        redacted = _redact.redact_secrets(r["content"])
-        if redacted != r["content"]:
-            con.execute("UPDATE messages SET content = ? WHERE rowid = ?",
-                        (redacted, r["rowid"]))
-            updated += 1
-    print(f"Redacted {updated:,} messages. Rebuilding FTS…")
+        new = _redact.redact_secrets(r["content"])
+        if new != r["content"]:
+            pending.append((r["rowid"], r["content"], new))
+
+    samples = [(old, new) for _, old, new in pending[:3]]
+    if not _confirm_destructive("backfill-redact", len(pending), samples, confirm):
+        return
+
+    for rowid, _old, new in pending:
+        con.execute("UPDATE messages SET content = ? WHERE rowid = ?",
+                    (new, rowid))
+    print(f"Redacted {len(pending):,} messages. Rebuilding FTS…")
     con.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
     print("Done.")
 
@@ -2076,9 +2149,14 @@ def doctor(con: apsw.Connection, scan_secrets: bool = False) -> None:
               "Pass `--scan-secrets` to scan for credential-shaped tokens.")
 
 
-def chunk_backfill(con: apsw.Connection) -> None:
+def chunk_backfill(con: apsw.Connection, confirm: bool = False) -> None:
     """Re-embed long messages whose vectors may pre-date server-side chunking.
-    Chunking now happens inside the sidecar — one HTTP call per message."""
+    Chunking now happens inside the sidecar — one HTTP call per message.
+
+    Defaults to DRY-RUN. Less catastrophic than backfill-clean/redact
+    (only embeddings change, message text stays intact) but still consumes
+    GPU/CPU and time, so we gate it behind a confirm.
+    """
     _BACKFILL_MIN_CHARS = 1800  # ≈ 450 tokens; shorter texts always fit in model window
     if not _vec_ok(con) or not EMBED_SOCK.exists():
         print("Embed service not available", file=sys.stderr)
@@ -2088,6 +2166,35 @@ def chunk_backfill(con: apsw.Connection) -> None:
         (_BACKFILL_MIN_CHARS,),
     ).fetchall()
     total = len(rows)
+
+    print()
+    print("─" * 70)
+    print(f"📊 chunk-backfill: {total:,} long message(s) (>{_BACKFILL_MIN_CHARS} chars) "
+          f"would be re-embedded.")
+    print("─" * 70)
+    print("This re-runs the embedding model — message TEXT is not touched, only")
+    print("the stored vectors are replaced. Lower risk than backfill-clean/redact,")
+    print("but still consumes GPU/CPU and re-downloads chunks via the sidecar.")
+    print()
+
+    if total == 0:
+        print("✅ Nothing to do.")
+        return
+
+    if not confirm:
+        if not sys.stdin.isatty():
+            print("⚠️  DRY-RUN — non-interactive shell.")
+            print("Re-run with --confirm to apply: recall chunk-backfill --confirm")
+            return
+        response = input(
+            f"Type 'YES' (uppercase) to re-embed {total:,} messages, "
+            "anything else to cancel: "
+        ).strip()
+        if response != "YES":
+            print("\n✅ Aborted.")
+            return
+        print()
+
     print(f"Re-embedding {total:,} long messages via sidecar chunking…")
     done = 0
     for r in rows:

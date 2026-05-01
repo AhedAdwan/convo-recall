@@ -604,7 +604,7 @@ def test_backfill_redact_purges_existing_secrets(db):
     ).fetchone()[0]
     assert pre_fts == 1, "fixture sanity — secret should be findable before backfill"
 
-    ingest.backfill_redact(db)
+    ingest.backfill_redact(db, confirm=True)
 
     # Direct content scan: no row contains the original token
     survivors = db.execute(
