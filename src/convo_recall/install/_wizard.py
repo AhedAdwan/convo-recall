@@ -305,34 +305,41 @@ def run(
             print(f"     Model will download on first use (~1.3 GB). Check:")
             print(f"     tail -f {LOG_DIR}/convo-recall-embed.log")
 
-    # ── 2. Initial ingest (sidecar may be reachable or still warming) ────────
-    if do_initial_ingest:
-        print("\nRunning initial ingest…")
-        subprocess.run([recall_bin, "ingest"])
-
-    # ── 3. Wait for sidecar to be reachable, then run embed-backfill ─────────
-    if do_initial_embed_backfill:
-        if do_embed_sidecar:
-            # Poll for up to 30s for the sidecar's UDS to appear. Cold
-            # model load (1.3 GB → MPS) typically takes 5-15s.
-            import time as _time
-            print("\nWaiting for embed sidecar to be reachable…")
-            deadline = _time.monotonic() + 30
-            while _time.monotonic() < deadline:
-                if SOCK_PATH.exists():
-                    break
-                _time.sleep(0.5)
-            if not SOCK_PATH.exists():
-                print(f"⚠ Embed sidecar didn't come up within 30s.")
-                print(f"  Skipping backfill; self-heal will catch up over time, "
-                      f"or run `recall embed-backfill` manually after the sidecar warms up.")
-            else:
-                print("\nRunning initial embed-backfill…")
-                subprocess.run([recall_bin, "embed-backfill"])
-        else:
-            # User asked for backfill but no sidecar — e.g. [embeddings] extra
-            # missing. Skip cleanly with the install hint.
-            print("\n⚠ embed-backfill skipped — no sidecar configured.")
+    # ── 2-3. Backfill (DETACHED — runs in the background after wizard exits) ─
+    # Pre-fix this block ran ingest + embed-backfill SYNCHRONOUSLY, blocking
+    # the wizard for the entire 10-30 min on a large corpus. For users with
+    # 60K+ messages that's a UX disaster. New flow: spawn a detached
+    # `recall _backfill-chain` subprocess that runs ingest → embed-backfill
+    # in sequence, writing progress to <DATA_DIR>/backfill-progress.json.
+    # `recall stats` renders a one-shot tqdm bar from that file any time
+    # the user checks state. Wizard exits immediately with guidance.
+    backfill_log = Path(LOG_DIR) / "convo-recall-wizard-backfill.log"
+    backfill_proc = None
+    if do_initial_ingest or do_initial_embed_backfill:
+        Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+        try:
+            log_fh = open(backfill_log, "ab")
+        except OSError as e:
+            print(f"⚠ Could not open backfill log {backfill_log}: {e}")
+            log_fh = subprocess.DEVNULL  # type: ignore
+        backfill_proc = subprocess.Popen(
+            [recall_bin, "_backfill-chain"],
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            # `start_new_session` detaches: the child survives wizard exit
+            # and is not killed by Ctrl-C in the wizard's session.
+            start_new_session=True,
+            close_fds=True,
+        )
+        print(f"\n📦 Initial ingest + embed-backfill running in background "
+              f"(pid {backfill_proc.pid}).")
+        print(f"   Logs:  tail -f {backfill_log}")
+        print(f"   Progress: run `recall stats` (shows a one-shot progress bar "
+              f"while the job is active).")
+        if do_initial_embed_backfill and not do_embed_sidecar:
+            print("⚠ embed-backfill will be skipped inside the chain — no "
+                  "sidecar configured. Re-run install with --with-embeddings.")
 
     # ── 4. Watchers (LAST — DB is populated, sidecar is up, no race) ─────────
     if do_watchers:
@@ -380,3 +387,15 @@ def run(
     if not do_embed_sidecar and embeddings_extra_present:
         print("\nFor hybrid vector+FTS search (better recall):")
         print("  recall install --with-embeddings")
+
+    # ── Final stats snapshot ─────────────────────────────────────────────────
+    # Show the user the current DB state — and, if a backfill chain just
+    # spawned and beat us to writing the progress file, render the
+    # one-shot tqdm bar at the top so they see it kicking off.
+    print("\n" + "─" * 70)
+    print("Current DB state:")
+    print()
+    try:
+        subprocess.run([recall_bin, "stats"], check=False)
+    except OSError as e:
+        print(f"  (couldn't run `recall stats`: {e})")

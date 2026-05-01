@@ -75,6 +75,10 @@ def main() -> None:
     p_watch.add_argument("--verbose", action="store_true",
                          help="Verbose output for each tick.")
     sub.add_parser("embed-backfill", help="Generate embeddings for all un-embedded messages")
+    sub.add_parser(
+        "_backfill-chain",
+        help=argparse.SUPPRESS,  # private; spawned by `recall install` wizard
+    )
     sub.add_parser("backfill-clean", help="Re-clean all stored messages and rebuild FTS")
     sub.add_parser("backfill-redact", help="Re-apply secret redaction to all stored messages and rebuild FTS")
     sub.add_parser("chunk-backfill", help="Re-embed long messages with chunked mean-pooling")
@@ -170,6 +174,19 @@ def main() -> None:
         elif args.cmd == "watch":
             ingest.watch_loop(con, interval=args.interval, verbose=args.verbose)
         elif args.cmd == "embed-backfill":
+            ingest.embed_backfill(con)
+        elif args.cmd == "_backfill-chain":
+            # Private: spawned detached by `recall install` so the wizard
+            # can return control to the user immediately. Runs ingest →
+            # embed-backfill in sequence and updates the progress file
+            # at each step. Output goes to whatever stdout/stderr the
+            # parent attached (typically a log file under LOG_DIR).
+            from . import _progress
+            _progress.start_job("ingest", total=0, phase="ingest")
+            try:
+                ingest.scan_all(con, verbose=True)
+            finally:
+                _progress.finish_job()
             ingest.embed_backfill(con)
         elif args.cmd == "backfill-clean":
             ingest.backfill_clean(con)

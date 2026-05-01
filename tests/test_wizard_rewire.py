@@ -18,7 +18,11 @@ from convo_recall.install.schedulers import (
 
 def _stub_scheduler_install_methods(monkeypatch):
     """Make every scheduler's install_* / uninstall_* a no-op that returns
-    a benign Result, so dry_run tests never touch real launchd / systemd."""
+    a benign Result, so dry_run tests never touch real launchd / systemd.
+
+    Also stubs `_find_recall_bin` so tests don't fail when run in an env
+    where the `recall` binary isn't on PATH (e.g. pytest run before
+    `pipx install`)."""
     from convo_recall.install.schedulers.base import Result
 
     def fake_install_watcher(self, *a, **kw):
@@ -31,6 +35,8 @@ def _stub_scheduler_install_methods(monkeypatch):
                 CronScheduler, PollingScheduler):
         monkeypatch.setattr(cls, "install_watcher", fake_install_watcher)
         monkeypatch.setattr(cls, "install_sidecar", fake_install_sidecar)
+
+    monkeypatch.setattr(_wizard, "_find_recall_bin", lambda: "/fake/bin/recall")
 
 
 def test_wizard_picks_polling_when_only_polling_available(monkeypatch):
@@ -119,16 +125,18 @@ def test_wizard_macos_path_does_not_ask_about_linger(monkeypatch):
 # ── F-13: apply-phase order — sidecar → ingest → backfill → watchers ─────────
 
 
-def test_wizard_apply_order_sidecar_before_backfill(monkeypatch, tmp_path):
-    """The F-13 bug: pre-fix wizard ran embed-backfill BEFORE installing
-    the sidecar, so backfill always failed with 'Embed socket not found'.
-    Lock the correct order: sidecar install must happen before any
-    subprocess.run('embed-backfill') call, AND watchers must install
-    LAST (to preserve F-3's no-race-with-ingest property)."""
+def test_wizard_apply_order_sidecar_before_backfill_chain(monkeypatch, tmp_path):
+    """F-13 ordering invariant — adapted for the new background-backfill
+    architecture. Pre-fix wizard ran embed-backfill BEFORE installing the
+    sidecar so backfill always failed with 'Embed socket not found'. Now
+    ingest+backfill are spawned as a single detached `_backfill-chain`
+    Popen, but the same ordering invariant must hold: sidecar install
+    must precede the Popen, AND watcher install must follow it (F-3:
+    watchers come last, so the DB is already populated and there's no
+    WAL-write race with the watcher's first scan)."""
     from convo_recall.install.schedulers.base import Result
     from convo_recall.install.schedulers.polling import PollingScheduler
 
-    # Track every install_sidecar / install_watcher call + every subprocess.run
     events: list[str] = []
 
     def _fake_install_sidecar(self, *a, **kw):
@@ -139,142 +147,160 @@ def test_wizard_apply_order_sidecar_before_backfill(monkeypatch, tmp_path):
         events.append(f"install_watcher({kw.get('agent', a[0] if a else '?')})")
         return Result(ok=True, message="stub", path=None)
 
-    def _fake_subprocess_run(args, *a, **kw):
-        events.append(f"subprocess.run({args[1]})")
-        # Pretend the sidecar socket appears partway through, after
-        # install_sidecar fired. Tests that pre-fix wizard didn't rely on
-        # this; it raced the install. Post-fix, the wizard polls.
-        from convo_recall.install import SOCK_PATH
-        SOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-        SOCK_PATH.touch(exist_ok=True)
+    class _FakePopen:
+        def __init__(self, args, **kwargs):
+            cmd = args[1] if len(args) > 1 else "?"
+            events.append(f"Popen({cmd})")
+            self.pid = 11111
+        def wait(self):
+            return 0
+
+    def _fake_run(args, *a, **kw):
+        cmd = args[1] if len(args) > 1 else "?"
+        events.append(f"run({cmd})")
         class _R:
             returncode = 0
         return _R()
 
+    fake_subprocess = type("S", (), {
+        "run": staticmethod(_fake_run),
+        "Popen": _FakePopen,
+        "DEVNULL": -3,
+        "STDOUT": -2,
+    })
+    monkeypatch.setattr(_wizard, "subprocess", fake_subprocess)
     monkeypatch.setattr(PollingScheduler, "install_sidecar", _fake_install_sidecar)
     monkeypatch.setattr(PollingScheduler, "install_watcher", _fake_install_watcher)
-    monkeypatch.setattr(_wizard, "subprocess", type("S", (), {"run": staticmethod(_fake_subprocess_run)}))
-
-    # CI installs only [dev], not [embeddings] — fake the extra as present so
-    # the wizard takes the sidecar branch under test.
+    monkeypatch.setattr(_wizard, "_find_recall_bin", lambda: "/fake/bin/recall")
     monkeypatch.setattr(_wizard, "_check_embeddings_installed", lambda: True)
-
-    # Make the socket initially absent. The wizard's poll loop should see
-    # it appear after install_sidecar runs (via fake_install_sidecar
-    # creating it through subprocess.run side-effect — except, we're not
-    # actually wiring that... so test polling tolerance instead.)
-    from convo_recall.install import SOCK_PATH
-    if SOCK_PATH.exists():
-        SOCK_PATH.unlink()
-
-    # Make install_sidecar create the socket, simulating a fast warmup
-    def _fake_install_sidecar_with_socket(self, *a, **kw):
-        events.append("install_sidecar")
-        SOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-        SOCK_PATH.touch(exist_ok=True)
-        return Result(ok=True, message="stub", path=None)
-
-    monkeypatch.setattr(PollingScheduler, "install_sidecar", _fake_install_sidecar_with_socket)
-
-    # Stub _ask to accept all yeses (non-interactive flow)
     monkeypatch.setattr(_wizard, "_ask", lambda *a, **kw: True)
 
-    try:
-        _wizard.run(non_interactive=True, dry_run=False, scheduler="polling",
-                    with_embeddings=True)
-    finally:
-        # Clean up the test socket if present
-        if SOCK_PATH.exists():
-            try: SOCK_PATH.unlink()
-            except OSError: pass
+    _wizard.run(non_interactive=True, dry_run=False, scheduler="polling",
+                with_embeddings=True)
 
-    # Find positions of the key markers
-    def _idx(prefix):
+    def _idx(token):
         for i, e in enumerate(events):
-            if e.startswith(prefix):
+            if token in e:
                 return i
         return -1
 
     sidecar_at = _idx("install_sidecar")
-    ingest_at = _idx("subprocess.run(ingest)")
-    backfill_at = _idx("subprocess.run(embed-backfill)")
+    chain_at = _idx("_backfill-chain")  # the detached spawn
     watcher_at = _idx("install_watcher")
 
-    # All four should have happened
     assert sidecar_at >= 0, f"install_sidecar never called; events={events}"
-    assert ingest_at >= 0, f"ingest never called; events={events}"
-    assert backfill_at >= 0, f"embed-backfill never called; events={events}"
+    assert chain_at >= 0, f"_backfill-chain Popen never spawned; events={events}"
     assert watcher_at >= 0, f"install_watcher never called; events={events}"
 
-    # F-13 invariant: sidecar BEFORE backfill (the bug we just fixed)
-    assert sidecar_at < backfill_at, (
-        f"F-13 regression: install_sidecar at index {sidecar_at} but "
-        f"embed-backfill at {backfill_at}; sidecar must come first.\n"
+    # F-13: sidecar BEFORE the backfill chain
+    assert sidecar_at < chain_at, (
+        f"F-13 regression: install_sidecar at {sidecar_at}, _backfill-chain "
+        f"spawn at {chain_at}; sidecar must precede the chain.\n"
         f"events: {events}"
     )
 
-    # F-3 invariant: watcher LAST (after ingest, to avoid DB race)
-    assert ingest_at < watcher_at, (
-        f"F-3 regression: install_watcher at {watcher_at} but ingest at "
-        f"{ingest_at}; watcher must come AFTER ingest.\nevents: {events}"
-    )
-
-    # Sanity: the full canonical order
-    assert sidecar_at < ingest_at < backfill_at < watcher_at, (
-        f"apply phase out of order. expected: sidecar < ingest < backfill < watcher\n"
-        f"got: sidecar={sidecar_at} ingest={ingest_at} backfill={backfill_at} "
-        f"watcher={watcher_at}\nevents: {events}"
+    # F-3: watchers AFTER the chain spawn (chain triggers ingest into DB,
+    # watcher install must wait until DB is reachable / not racing).
+    assert chain_at < watcher_at, (
+        f"F-3 regression: _backfill-chain spawn at {chain_at}, "
+        f"install_watcher at {watcher_at}; watcher must come last.\n"
+        f"events: {events}"
     )
 
 
-def test_wizard_skips_backfill_if_sidecar_doesnt_appear(monkeypatch, tmp_path):
-    """If install_sidecar succeeds but the socket never appears within the
-    30s timeout (e.g., model fails to load), backfill should be skipped
-    cleanly with a guidance message rather than running against no
-    sidecar. Same shape as F-10's read-only fallback — degrade gracefully."""
+def test_wizard_spawns_backfill_chain_detached(monkeypatch, tmp_path):
+    """Pre-fix the wizard ran ingest + embed-backfill SYNCHRONOUSLY,
+    blocking 10-30 min on a large corpus. New flow: spawn a detached
+    `recall _backfill-chain` and exit. Assert the wizard calls Popen
+    (not run) for the backfill, with start_new_session=True so the
+    child survives wizard exit."""
     from convo_recall.install.schedulers.base import Result
     from convo_recall.install.schedulers.polling import PollingScheduler
-    from convo_recall.install import SOCK_PATH
 
-    events: list[str] = []
+    popen_calls: list[dict] = []
+    run_calls: list[list] = []
 
-    def _fake_install_sidecar(self, *a, **kw):
-        events.append("install_sidecar")
-        return Result(ok=True, message="stub", path=None)
+    class _FakePopen:
+        def __init__(self, args, **kwargs):
+            popen_calls.append({"args": list(args), **kwargs})
+            self.pid = 99999
+        def wait(self):
+            return 0
 
-    def _fake_install_watcher(self, *a, **kw):
-        events.append("install_watcher")
-        return Result(ok=True, message="stub", path=None)
-
-    def _fake_subprocess_run(args, *a, **kw):
-        events.append(f"subprocess.run({args[1]})")
+    def _fake_run(args, *a, **kw):
+        run_calls.append(list(args))
         class _R:
             returncode = 0
         return _R()
 
-    # Speed up the timeout: monkey-patch time.monotonic so 30s elapses fast
-    import time as _time
-    real_monotonic = _time.monotonic
-    base = real_monotonic()
-    fake_clock = [base]
-    def _fake_monotonic():
-        fake_clock[0] += 5  # advance 5s per call
-        return fake_clock[0]
-    monkeypatch.setattr(_time, "monotonic", _fake_monotonic)
-    monkeypatch.setattr(_time, "sleep", lambda s: None)
-
-    monkeypatch.setattr(PollingScheduler, "install_sidecar", _fake_install_sidecar)
-    monkeypatch.setattr(PollingScheduler, "install_watcher", _fake_install_watcher)
-    monkeypatch.setattr(_wizard, "subprocess", type("S", (), {"run": staticmethod(_fake_subprocess_run)}))
-    monkeypatch.setattr(_wizard, "_ask", lambda *a, **kw: True)
-
-    # CI installs only [dev], not [embeddings] — fake the extra as present so
-    # the wizard takes the sidecar branch under test.
+    fake_subprocess = type("S", (), {
+        "run": staticmethod(_fake_run),
+        "Popen": _FakePopen,
+        "DEVNULL": -3,
+        "STDOUT": -2,
+    })
+    monkeypatch.setattr(_wizard, "subprocess", fake_subprocess)
+    monkeypatch.setattr(PollingScheduler, "install_sidecar",
+                        lambda self, *a, **kw: Result(ok=True, message="stub", path=None))
+    monkeypatch.setattr(PollingScheduler, "install_watcher",
+                        lambda self, *a, **kw: Result(ok=True, message="stub", path=None))
     monkeypatch.setattr(_wizard, "_check_embeddings_installed", lambda: True)
+    monkeypatch.setattr(_wizard, "_ask", lambda *a, **kw: True)
+    monkeypatch.setattr(_wizard, "_find_recall_bin", lambda: "/fake/bin/recall")
 
-    # Ensure the socket is absent so the poll loop will time out
-    if SOCK_PATH.exists():
-        SOCK_PATH.unlink()
+    _wizard.run(non_interactive=True, dry_run=False, scheduler="polling",
+                with_embeddings=True)
+
+    # The backfill chain MUST be spawned via Popen, not run().
+    chain_popens = [c for c in popen_calls
+                    if any("_backfill-chain" in str(a) for a in c["args"])]
+    assert len(chain_popens) == 1, (
+        f"expected exactly one detached Popen for _backfill-chain; "
+        f"got {len(chain_popens)}: {popen_calls}"
+    )
+    # And it MUST be detached so the wizard can exit while it runs.
+    assert chain_popens[0].get("start_new_session") is True, (
+        f"backfill chain must be spawned with start_new_session=True so "
+        f"it survives wizard exit; got: {chain_popens[0]}"
+    )
+    # Pre-fix asserted: regression guard — synchronous run([..., 'embed-backfill'])
+    # must NOT happen anymore.
+    bad = [c for c in run_calls if any("embed-backfill" in str(a) for a in c)]
+    assert not bad, f"embed-backfill must not run synchronously; got: {bad}"
+
+
+def test_wizard_announces_background_job_to_user(monkeypatch, tmp_path):
+    """Wizard exits quickly after spawning the detached backfill chain.
+    The user must see a clear "running in background" message + how to
+    check progress, otherwise the install looks like it's done nothing."""
+    from convo_recall.install.schedulers.base import Result
+    from convo_recall.install.schedulers.polling import PollingScheduler
+
+    class _FakePopen:
+        def __init__(self, args, **kwargs):
+            self.pid = 12345
+        def wait(self):
+            return 0
+
+    def _fake_run(args, *a, **kw):
+        class _R:
+            returncode = 0
+        return _R()
+
+    fake_subprocess = type("S", (), {
+        "run": staticmethod(_fake_run),
+        "Popen": _FakePopen,
+        "DEVNULL": -3,
+        "STDOUT": -2,
+    })
+    monkeypatch.setattr(_wizard, "subprocess", fake_subprocess)
+    monkeypatch.setattr(PollingScheduler, "install_sidecar",
+                        lambda self, *a, **kw: Result(ok=True, message="stub", path=None))
+    monkeypatch.setattr(PollingScheduler, "install_watcher",
+                        lambda self, *a, **kw: Result(ok=True, message="stub", path=None))
+    monkeypatch.setattr(_wizard, "_check_embeddings_installed", lambda: True)
+    monkeypatch.setattr(_wizard, "_ask", lambda *a, **kw: True)
+    monkeypatch.setattr(_wizard, "_find_recall_bin", lambda: "/fake/bin/recall")
 
     buf = io.StringIO()
     with redirect_stdout(buf):
@@ -282,8 +308,9 @@ def test_wizard_skips_backfill_if_sidecar_doesnt_appear(monkeypatch, tmp_path):
                     with_embeddings=True)
     out = buf.getvalue()
 
-    # Backfill should NOT have been invoked (we waited 30s, socket never came)
-    assert not any("subprocess.run(embed-backfill)" in e for e in events), (
-        f"backfill should have been skipped; events: {events}"
-    )
-    assert "didn't come up within 30s" in out
+    # User-facing announcement
+    assert "background" in out.lower(), out
+    # Discoverability: tells user how to inspect progress
+    assert "recall stats" in out, out
+    # PID shown so the user can find/kill the process if needed
+    assert "12345" in out, out

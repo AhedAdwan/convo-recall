@@ -422,9 +422,16 @@ def test_install_emits_one_plist_per_enabled_agent(tmp_path, monkeypatch):
     monkeypatch.setattr(LaunchdScheduler, "_launchctl_load", lambda self, p: True)
     monkeypatch.setattr("convo_recall.install._wizard._find_recall_bin",
                         lambda: "/fake/bin/recall")
-    # Subprocess "Running initial ingest" — neuter it
+    # Subprocess "Running initial ingest" — neuter it. The wizard now
+    # also spawns a detached `_backfill-chain` Popen, so stub that too.
     import subprocess
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: None)
+    class _FakePopen:
+        def __init__(self, *a, **k):
+            self.pid = 12345
+        def wait(self):
+            return 0
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
 
     home = tmp_path / "home"
     monkeypatch.setattr(_install, "LAUNCHAGENTS", tmp_path / "LaunchAgents")
