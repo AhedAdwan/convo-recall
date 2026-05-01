@@ -18,6 +18,7 @@ from pathlib import Path
 
 from .schedulers import detect_scheduler, get_scheduler
 from .schedulers.systemd import SystemdUserScheduler
+from .._spinner import BouncingSpinner
 
 
 def _ask(question: str, *, default: bool = True,
@@ -320,11 +321,12 @@ def run(
 
     # ── 1. Embed sidecar (start it FIRST so it can warm up in parallel) ──────
     if do_embed_sidecar:
-        result = sched.install_sidecar(
-            recall_bin=recall_bin,
-            sock_path=str(SOCK_PATH),
-            log_dir=str(LOG_DIR),
-        )
+        with BouncingSpinner(f"Installing embed sidecar ({sched.describe()})"):
+            result = sched.install_sidecar(
+                recall_bin=recall_bin,
+                sock_path=str(SOCK_PATH),
+                log_dir=str(LOG_DIR),
+            )
         marker = "✅" if result.ok else "⚠ "
         print(f"  {marker} [{sched.describe()}] {result.message}")
         if result.ok:
@@ -371,27 +373,30 @@ def run(
     if do_watchers:
         for agent in enabled:
             watch_dir = _AGENT_WATCH_DIRS[agent]()
-            result = sched.install_watcher(
-                agent=agent,
-                recall_bin=recall_bin,
-                watch_dir=str(watch_dir),
-                db_path=str(db_path),
-                sock_path=str(SOCK_PATH),
-                config_path=str(config_path),
-                log_dir=str(LOG_DIR),
-            )
+            with BouncingSpinner(f"Installing {agent} watcher"):
+                result = sched.install_watcher(
+                    agent=agent,
+                    recall_bin=recall_bin,
+                    watch_dir=str(watch_dir),
+                    db_path=str(db_path),
+                    sock_path=str(SOCK_PATH),
+                    config_path=str(config_path),
+                    log_dir=str(LOG_DIR),
+                )
             marker = "✅" if result.ok else "⚠ "
             print(f"  {marker} [{sched.describe()}] {result.message}")
         if do_linger and isinstance(sched, SystemdUserScheduler):
-            r = sched.enable_linger()
+            with BouncingSpinner("Enabling systemd linger"):
+                r = sched.enable_linger()
             marker = "✅" if r.ok else "⚠ "
             print(f"  {marker} {r.message}")
 
     # ── 5. Pre-prompt hooks ──────────────────────────────────────────────────
     if do_hooks:
-        print("\nWiring pre-prompt hooks…")
-        # User already consented at the wizard level; suppress per-CLI prompts.
-        install_hooks(agents=enabled, dry_run=False, non_interactive=True)
+        print()
+        with BouncingSpinner(f"Wiring pre-prompt hooks ({', '.join(enabled)})"):
+            # User already consented at the wizard level; suppress per-CLI prompts.
+            install_hooks(agents=enabled, dry_run=False, non_interactive=True)
 
     # ── Final summary ────────────────────────────────────────────────────────
     print("\nInstallation complete.")
