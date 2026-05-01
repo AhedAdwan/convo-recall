@@ -580,6 +580,34 @@ def test_cron_uninstall_removes_only_tagged_line(tmp_path, monkeypatch):
     assert "0 * * * * echo hi" in written
 
 
+def test_cron_uninstall_no_op_message_matches_silence_filter(tmp_path, monkeypatch):
+    """F-15: when there's nothing in the crontab to remove, the message must
+    contain one of the substrings the install.uninstall() `_surface()` filter
+    treats as a noop ("not installed", "nothing to remove", "already") — else
+    cron's four no-op tiers print four ✅ lines on every uninstall on a host
+    that's never used cron."""
+    _force_cron_runtime_dir(monkeypatch, tmp_path / "run")
+    fake = _CrontabFake(initial="# only user lines\n0 * * * * echo hi\n")
+    monkeypatch.setattr(subprocess, "run", fake)
+
+    NOOP_SUBSTRINGS = ("not installed", "nothing to remove", "already")
+
+    for agent in ("claude", "gemini", "codex"):
+        result = CronScheduler().uninstall_watcher(agent=agent)
+        assert result.ok
+        assert any(sub in result.message for sub in NOOP_SUBSTRINGS), (
+            f"cron uninstall_watcher noop message must match the silence "
+            f"filter; got: {result.message!r}"
+        )
+
+    sidecar_result = CronScheduler().uninstall_sidecar()
+    assert sidecar_result.ok
+    assert any(sub in sidecar_result.message for sub in NOOP_SUBSTRINGS), (
+        f"cron uninstall_sidecar noop message must match silence filter; "
+        f"got: {sidecar_result.message!r}"
+    )
+
+
 def test_cron_uninstall_preserves_user_lines_with_convo_recall_substring(
     tmp_path, monkeypatch,
 ):

@@ -143,7 +143,10 @@ class CronScheduler(Scheduler):
             kept_lines.append(existing_line)
 
         if removed == 0:
-            return Result(ok=True, message=f"no {kind} line found in crontab")
+            # Phrasing matches install.uninstall()'s `_surface()` noop filter
+            # ("not installed" / "nothing to remove" / "already") so the four
+            # cron tiers stop printing ✅ lines on hosts that never used cron.
+            return Result(ok=True, message=f"{kind} not installed (nothing to remove)")
 
         bak_path = self._backup(existing)
         new_content = ""
