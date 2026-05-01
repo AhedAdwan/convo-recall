@@ -100,19 +100,30 @@ Tool calls and reasoning blocks are NOT indexed — only human-readable user/ass
 
 ```bash
 pipx install convo-recall
-recall install
+recall install                    # interactive wizard — prompts for each decision
 ```
 
 ### Hybrid FTS + vector search
 
 ```bash
 pipx install 'convo-recall[embeddings]'
-recall install --with-embeddings
+recall install --with-embeddings  # interactive wizard
 ```
 
 `--with-embeddings` keeps the embedding model warm in the background (launchd job on macOS, systemd-user `.service` on Linux, fallback to a Popen child elsewhere). The model (BAAI/bge-large-en-v1.5, ~1.3 GB) downloads on first use.
 
 Long texts are chunked with a 450-token sliding window (50-token overlap) and mean-pooled — no silent truncation at 512 tokens.
+
+#### Interactive wizard vs. `-y`
+
+By default `recall install` runs an **interactive wizard** that walks through 4 decisions (watchers, embed sidecar, hooks, initial ingest) — each prompts you and prints what happens if you say yes vs. no. Pass `-y` only for scripted/CI installs where you want defaults applied without prompts:
+
+```bash
+recall install --with-embeddings        # interactive — RECOMMENDED for first install
+recall install --with-embeddings -y     # non-interactive — auto-yes to every default
+```
+
+The wizard kicks off the initial ingest + embed-backfill in a **detached background process** so it returns control immediately. Watch progress any time with `recall stats` (shows a one-shot tqdm bar at the top while the job is active) or `tail -f ~/Library/Logs/convo-recall-wizard-backfill.log`.
 
 ### Verbose / audit install
 
@@ -121,6 +132,7 @@ The plain install is terse. For first-time installs or security audits where you
 ```bash
 pipx install 'convo-recall[embeddings]' --verbose                  # show pipx's own steps
 pipx install 'convo-recall[embeddings]' --verbose --pip-args="-v"  # also pass -v to pip
+recall install --with-embeddings                                   # interactive (no -y)
 ```
 
 ⚠ pipx pipes pip's stdout through `subprocess.PIPE`, which strips pip's TTY-aware progress bars. Even with `--pip-args="-v"` the heaviest step (`torch` ~750 MB download) prints once at the start and then appears to "hang" until done. **For real progress bars**, install the core first and then add deps directly:
@@ -129,6 +141,7 @@ pipx install 'convo-recall[embeddings]' --verbose --pip-args="-v"  # also pass -
 pipx install convo-recall                                          # fast core, no embeddings
 pipx runpip convo-recall install \
     sentence-transformers 'torch>=2.2,<3' 'aiohttp>=3.10.11'       # tqdm progress bars
+recall install --with-embeddings                                   # interactive wizard
 ```
 
 `pipx runpip` execs pip with stdout attached to your real terminal — same end-state as `pipx install '.[embeddings]'`, but you get live download bars per wheel.
