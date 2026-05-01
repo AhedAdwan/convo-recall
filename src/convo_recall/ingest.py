@@ -1135,28 +1135,47 @@ def _dispatch_ingest(con: apsw.Connection, agents: list[str], *,
     Returns (total_messages_inserted, total_files_with_changes). Shared by
     `scan_one_agent` and `scan_all` so the per-agent dispatch logic lives
     in one place.
+
+    Pre-pass counts total session files across all enabled agents and
+    publishes that as the `ingest` phase total via the _progress tracker
+    (no-op if no active run, e.g. the watcher loop). Each file processed
+    ticks the counter so `recall stats` shows a live bar during ingest.
     """
-    total = 0
-    files = 0
+    from . import _progress
+
+    # Build the work list once so we can both count and process from it.
+    # File-path lists are tiny (a few KB even at 10K files) — well worth
+    # the visibility win.
+    work: list[tuple[str, Path]] = []
     for agent_name in agents:
         if agent_name not in _AGENT_INGEST:
             print(f"[warn] unknown agent: {agent_name}", file=sys.stderr)
             continue
+        for jsonl_path in _AGENT_ITERATORS[agent_name]():
+            work.append((agent_name, jsonl_path))
+
+    _progress.set_phase_total("ingest", len(work))
+
+    total = 0
+    files = 0
+    for processed, (agent_name, jsonl_path) in enumerate(work, start=1):
         ingester = _AGENT_INGEST[agent_name]
-        iterator = _AGENT_ITERATORS[agent_name]
-        for jsonl_path in iterator():
-            kwargs = {"do_embed": embed_live}
-            if agent_name == "claude":
-                kwargs["agent"] = "claude"
-            n = ingester(con, jsonl_path, **kwargs)
-            if n > 0:
-                files += 1
-                total += n
-                if verbose:
-                    slug = (_slug_from_path(jsonl_path) if agent_name == "claude"
-                            else _gemini_slug_from_path(jsonl_path) if agent_name == "gemini"
-                            else jsonl_path.parent.name)
-                    print(f"  +{n:4d} msgs  [{agent_name}] {slug}/{jsonl_path.name[:8]}…")
+        kwargs = {"do_embed": embed_live}
+        if agent_name == "claude":
+            kwargs["agent"] = "claude"
+        n = ingester(con, jsonl_path, **kwargs)
+        if n > 0:
+            files += 1
+            total += n
+            if verbose:
+                slug = (_slug_from_path(jsonl_path) if agent_name == "claude"
+                        else _gemini_slug_from_path(jsonl_path) if agent_name == "gemini"
+                        else jsonl_path.parent.name)
+                print(f"  +{n:4d} msgs  [{agent_name}] {slug}/{jsonl_path.name[:8]}…")
+        # Tick on every file so the bar advances at human-perceptible
+        # cadence even when most files have no new messages (the common
+        # case on a re-ingest of an already-populated DB).
+        _progress.update_phase("ingest", processed)
     return total, files
 
 
@@ -1214,13 +1233,28 @@ def watch_loop(con: apsw.Connection, interval: int = 10,
 
 def scan_all(con: apsw.Connection, verbose: bool = False,
              do_embed: bool = True) -> None:
+    from . import _progress
+
     embed_live = EMBED_SOCK.exists() and do_embed
     if not embed_live and do_embed:
         print("[warn] embed socket not found — running in FTS-only mode", file=sys.stderr)
 
     enabled_agents = load_config().get("agents") or ["claude"]
-    total, files = _dispatch_ingest(con, enabled_agents,
-                                     embed_live=embed_live, verbose=verbose)
+
+    # Same own-run pattern as embed_backfill: if a multi-phase chain is
+    # already active (e.g. the wizard's _backfill-chain), we participate
+    # in it and let the parent finish_run. Otherwise create a single-
+    # phase run so standalone `recall ingest` shows a bar in stats.
+    own_run = _progress.read_status() is None
+    if own_run:
+        _progress.start_run([("ingest", 0)])
+    try:
+        total, files = _dispatch_ingest(con, enabled_agents,
+                                         embed_live=embed_live, verbose=verbose)
+        _progress.finish_phase("ingest")
+    finally:
+        if own_run:
+            _progress.finish_run()
     if verbose or total > 0:
         print(f"Ingested {total} new messages from {files} file(s).")
 
@@ -1592,7 +1626,17 @@ def embed_backfill(con: apsw.Connection) -> None:
     total = len(pending)
     print(f"Embedding {total:,} messages…")
 
-    _progress.start_job("embed-backfill", total=total, phase="embed-backfill")
+    # If we're called inside a multi-phase chain (e.g. _backfill-chain),
+    # the parent has already created the progress run with both phases
+    # pre-declared. Otherwise (standalone `recall embed-backfill`),
+    # create our own single-phase run so the user still sees a bar in
+    # `recall stats`.
+    own_run = _progress.read_status() is None
+    if own_run:
+        _progress.start_run([("embed-backfill", total)])
+    else:
+        _progress.set_phase_total("embed-backfill", total)
+
     done = 0
     try:
         for r in pending:
@@ -1603,13 +1647,13 @@ def embed_backfill(con: apsw.Connection) -> None:
             # Update the file every 100 rows — keeps the progress display
             # fresh without thrashing the disk on per-row writes.
             if done % 100 == 0 and done > 0:
-                _progress.update_job(done)
+                _progress.update_phase("embed-backfill", done)
             if done % 500 == 0 and done > 0:
                 print(f"  {done}/{total}…")
+        _progress.finish_phase("embed-backfill")
     finally:
-        # Always clear the marker, even on exceptions, so a crashed
-        # backfill doesn't leave a stale snapshot for later stats reads.
-        _progress.finish_job()
+        if own_run:
+            _progress.finish_run()
     print(f"Done. {done:,} embeddings written.")
 
 
@@ -1943,34 +1987,60 @@ def forget(con: apsw.Connection, *,
     return total
 
 
-def _render_progress_bar(status: dict) -> None:
-    """One-shot progress bar at the top of `recall stats`. Reads a
-    snapshot from `_progress.read_status()` and renders a single line —
-    no live refresh, no persistent display. The user sees current state
-    each time they invoke `recall stats` and nothing more.
+def _render_phase_bar(phase: dict) -> None:
+    """Render one phase as a single line at the top of `recall stats`.
 
-    Falls back to a plain text bar if `tqdm` isn't installed (FTS-only
-    users without the [embeddings] extra)."""
-    phase = status.get("phase", status.get("job", "backfill"))
-    completed = int(status.get("completed", 0))
-    total = int(status.get("total", 0)) or 1
-    pct = min(100, completed * 100 // total)
+    State-dependent:
+    - `pending`         → "⏳ {name}: pending"
+    - `done`, total=0   → "✅ {name}: nothing to do"
+    - `done`            → 100% bar (so user sees what just finished)
+    - `running`         → live snapshot bar with current/total + rate
+    """
+    name = phase.get("name", "phase")
+    state = phase.get("state", "running")
+    total = int(phase.get("total", 0))
+    completed = int(phase.get("completed", 0))
+
+    if state == "pending":
+        print(f"  ⏳ {name}: pending")
+        return
+    if state == "done" and total == 0:
+        print(f"  ✅ {name}: nothing to do")
+        return
+
+    safe_total = total or 1
+    pct = min(100, completed * 100 // safe_total)
     try:
         from tqdm import tqdm  # type: ignore
-        # `file=sys.stdout` so the bar lands in the same stream as the
-        # rest of stats output. tqdm defaults to stderr, which would
-        # split the rendered output across two pipes.
-        bar = tqdm(total=total, initial=completed,
-                   desc=f"  {phase}", unit="msg",
+        # file=sys.stdout so the bar lands in the same stream as stats.
+        marker = "✅" if state == "done" else "  "
+        bar = tqdm(total=safe_total, initial=completed,
+                   desc=f"{marker} {name}",
+                   unit="file" if name == "ingest" else "msg",
                    leave=True, dynamic_ncols=True, file=sys.stdout,
                    bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{rate_fmt}]")
         bar.refresh()
         bar.close()
     except ImportError:
         bar_width = 30
-        filled = bar_width * completed // total
+        filled = bar_width * completed // safe_total
         plain = "█" * filled + "░" * (bar_width - filled)
-        print(f"  {phase}: {pct:3d}%|{plain}| {completed:,}/{total:,}")
+        marker = "✅" if state == "done" else "  "
+        print(f"{marker} {name}: {pct:3d}%|{plain}| {completed:,}/{total:,}")
+
+
+def _render_progress_bar(status: dict) -> None:
+    """Render every phase in the snapshot at the top of `recall stats`.
+
+    No live refresh — one render per stats invocation. Phases are shown
+    in declared order so the user sees the queued sequence (e.g. ingest
+    first, embed-backfill second).
+    """
+    phases = status.get("phases") or []
+    if not phases:
+        return
+    for phase in phases:
+        _render_phase_bar(phase)
     print()  # blank line before stats body
 
 

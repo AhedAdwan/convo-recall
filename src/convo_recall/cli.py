@@ -179,15 +179,19 @@ def main() -> None:
             # Private: spawned detached by `recall install` so the wizard
             # can return control to the user immediately. Runs ingest →
             # embed-backfill in sequence and updates the progress file
-            # at each step. Output goes to whatever stdout/stderr the
-            # parent attached (typically a log file under LOG_DIR).
+            # at each step. Both phases are pre-declared so `recall stats`
+            # renders both bars (showing the user that two phases are
+            # queued up — even if one ends up doing nothing).
             from . import _progress
-            _progress.start_job("ingest", total=0, phase="ingest")
+            _progress.start_run([
+                ("ingest", 0),           # total filled in by _dispatch_ingest
+                ("embed-backfill", 0),   # total filled in by embed_backfill
+            ])
             try:
                 ingest.scan_all(con, verbose=True)
+                ingest.embed_backfill(con)
             finally:
-                _progress.finish_job()
-            ingest.embed_backfill(con)
+                _progress.finish_run()
         elif args.cmd == "backfill-clean":
             ingest.backfill_clean(con)
         elif args.cmd == "backfill-redact":

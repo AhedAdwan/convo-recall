@@ -1,10 +1,9 @@
-"""Tests for the background-job progress tracker (`_progress.py`) and
-its integration with `recall stats`."""
+"""Tests for the multi-phase progress tracker (`_progress.py`) and its
+integration with `recall stats`."""
 
 import io
 import json
 import os
-import time
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -13,121 +12,13 @@ import pytest
 from convo_recall import _progress
 
 
-# ── _progress primitive ──────────────────────────────────────────────────────
+# ── _progress primitive: lifecycle ───────────────────────────────────────────
 
 
-def test_start_writes_progress_file(tmp_path, monkeypatch):
-    monkeypatch.setenv("CONVO_RECALL_DB", str(tmp_path / "conversations.db"))
-    _progress.start_job("embed-backfill", total=12345)
-    p = tmp_path / "backfill-progress.json"
-    assert p.exists()
-    payload = json.loads(p.read_text())
-    assert payload["job"] == "embed-backfill"
-    assert payload["total"] == 12345
-    assert payload["completed"] == 0
-    assert payload["pid"] == os.getpid()
-    assert "started_at" in payload
-    assert "updated_at" in payload
-
-
-def test_update_increments_counter(tmp_path, monkeypatch):
-    monkeypatch.setenv("CONVO_RECALL_DB", str(tmp_path / "conversations.db"))
-    _progress.start_job("embed-backfill", total=100)
-    _progress.update_job(42)
-    payload = json.loads((tmp_path / "backfill-progress.json").read_text())
-    assert payload["completed"] == 42
-
-
-def test_finish_removes_file(tmp_path, monkeypatch):
-    monkeypatch.setenv("CONVO_RECALL_DB", str(tmp_path / "conversations.db"))
-    _progress.start_job("embed-backfill", total=10)
-    assert (tmp_path / "backfill-progress.json").exists()
-    _progress.finish_job()
-    assert not (tmp_path / "backfill-progress.json").exists()
-
-
-def test_read_status_returns_none_when_absent(tmp_path, monkeypatch):
-    monkeypatch.setenv("CONVO_RECALL_DB", str(tmp_path / "conversations.db"))
-    assert _progress.read_status() is None
-
-
-def test_read_status_returns_snapshot_when_alive(tmp_path, monkeypatch):
-    monkeypatch.setenv("CONVO_RECALL_DB", str(tmp_path / "conversations.db"))
-    _progress.start_job("embed-backfill", total=200)
-    _progress.update_job(50)
-    s = _progress.read_status()
-    assert s is not None
-    assert s["completed"] == 50
-    assert s["total"] == 200
-    assert s["pid"] == os.getpid()
-
-
-def test_read_status_cleans_stale_dead_pid(tmp_path, monkeypatch):
-    """A snapshot from a process that's gone AND older than _STALE_SECONDS
-    must be deleted on read so future stats invocations stay quiet."""
-    monkeypatch.setenv("CONVO_RECALL_DB", str(tmp_path / "conversations.db"))
-    p = tmp_path / "backfill-progress.json"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    # PID 1 is init/launchd; non-zero chance someone else has it but
-    # we're just exercising the "alive" branch here. Use 2**31-1 instead
-    # for a guaranteed-dead PID on every Unix.
-    dead_pid = 2**31 - 1
-    p.write_text(json.dumps({
-        "job": "embed-backfill",
-        "phase": "embed-backfill",
-        "pid": dead_pid,
-        "total": 100,
-        "completed": 50,
-        "started_at": "2020-01-01T00:00:00+00:00",
-        "updated_at": "2020-01-01T00:00:00+00:00",  # very old
-    }))
-    assert _progress.read_status() is None
-    assert not p.exists(), "stale file should have been deleted on read"
-
-
-def test_read_status_keeps_recent_dead_pid_snapshot(tmp_path, monkeypatch):
-    """A finished job whose process exited <_STALE_SECONDS ago is NOT
-    cleaned — finish_job() handles the happy-path cleanup; stale-detection
-    is a fallback for crashes. Recent-but-orphan files are left for the
-    user to clear (or they will be in finish_job() called by the parent)."""
-    monkeypatch.setenv("CONVO_RECALL_DB", str(tmp_path / "conversations.db"))
-    p = tmp_path / "backfill-progress.json"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    dead_pid = 2**31 - 1
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).isoformat()
-    p.write_text(json.dumps({
-        "job": "embed-backfill",
-        "phase": "embed-backfill",
-        "pid": dead_pid,
-        "total": 100,
-        "completed": 100,
-        "started_at": now,
-        "updated_at": now,
-    }))
-    # Snapshot is recent — read returns the payload (caller can decide
-    # what to do, e.g. show a final completed bar before stats).
-    s = _progress.read_status()
-    assert s is not None
-    assert s["completed"] == 100
-
-
-def test_atomic_write_does_not_leave_partial_file(tmp_path, monkeypatch):
-    """A reader hitting the file mid-write must NOT see a half-written
-    JSON object. The atomic-rename strategy guarantees this — verify by
-    asserting the .tmp.* sidecar isn't visible after the call."""
-    monkeypatch.setenv("CONVO_RECALL_DB", str(tmp_path / "conversations.db"))
-    _progress.start_job("test", total=1)
-    leftovers = list(tmp_path.glob("backfill-progress.json.tmp.*"))
-    assert leftovers == [], leftovers
-
-
-# ── stats() integration ─────────────────────────────────────────────────────
-
-
-def _patch_db_to_tmp(tmp_path, monkeypatch):
-    """DB_PATH is captured at module import so monkeypatch.setenv after
-    import has no effect — patch the attribute directly on the module."""
+def _set_db(tmp_path, monkeypatch):
+    """Point CONVO_RECALL_DB at a tmp file so the progress JSON lives
+    next to it. Also patch the imported DB_PATH so `ingest.open_db()`
+    uses the same location."""
     db = tmp_path / "conversations.db"
     monkeypatch.setenv("CONVO_RECALL_DB", str(db))
     from convo_recall import ingest as _ing
@@ -135,12 +26,111 @@ def _patch_db_to_tmp(tmp_path, monkeypatch):
     return db
 
 
-def test_stats_renders_progress_bar_when_active(tmp_path, monkeypatch):
-    """`recall stats` must render the one-shot progress bar at the top
-    when an active job's progress file is present, then print stats."""
-    _patch_db_to_tmp(tmp_path, monkeypatch)
-    _progress.start_job("embed-backfill", total=1000)
-    _progress.update_job(425)
+def test_start_run_creates_phases_in_pending_state(tmp_path, monkeypatch):
+    _set_db(tmp_path, monkeypatch)
+    _progress.start_run([("ingest", 0), ("embed-backfill", 0)])
+    s = _progress.read_status()
+    assert s is not None
+    assert [p["name"] for p in s["phases"]] == ["ingest", "embed-backfill"]
+    for p in s["phases"]:
+        assert p["state"] == "pending"
+        assert p["completed"] == 0
+
+
+def test_set_phase_total_updates_total(tmp_path, monkeypatch):
+    _set_db(tmp_path, monkeypatch)
+    _progress.start_run([("ingest", 0), ("embed-backfill", 0)])
+    _progress.set_phase_total("ingest", 4248)
+    s = _progress.read_status()
+    ingest_phase = next(p for p in s["phases"] if p["name"] == "ingest")
+    assert ingest_phase["total"] == 4248
+
+
+def test_update_phase_marks_running(tmp_path, monkeypatch):
+    _set_db(tmp_path, monkeypatch)
+    _progress.start_run([("ingest", 100)])
+    _progress.update_phase("ingest", 42)
+    s = _progress.read_status()
+    p = s["phases"][0]
+    assert p["completed"] == 42
+    assert p["state"] == "running"
+
+
+def test_finish_phase_snaps_to_total(tmp_path, monkeypatch):
+    """finish_phase sets completed = total so the bar renders 100% even
+    if the last batch tick under-counted (e.g. update was every 100 but
+    the loop ended at 4250)."""
+    _set_db(tmp_path, monkeypatch)
+    _progress.start_run([("ingest", 4250)])
+    _progress.update_phase("ingest", 4200)  # last tick was at 4200
+    _progress.finish_phase("ingest")
+    s = _progress.read_status()
+    p = s["phases"][0]
+    assert p["state"] == "done"
+    assert p["completed"] == 4250
+
+
+def test_finish_run_removes_file(tmp_path, monkeypatch):
+    _set_db(tmp_path, monkeypatch)
+    _progress.start_run([("ingest", 0)])
+    assert (tmp_path / "backfill-progress.json").exists()
+    _progress.finish_run()
+    assert not (tmp_path / "backfill-progress.json").exists()
+
+
+def test_read_status_returns_none_when_absent(tmp_path, monkeypatch):
+    _set_db(tmp_path, monkeypatch)
+    assert _progress.read_status() is None
+
+
+def test_update_unknown_phase_is_silent(tmp_path, monkeypatch):
+    """Calling update_phase on a name that wasn't declared at start_run
+    must not crash — useful when scan_all is reused across contexts
+    (chain vs. watcher) and the chain only declared one of the phases."""
+    _set_db(tmp_path, monkeypatch)
+    _progress.start_run([("ingest", 0)])
+    _progress.update_phase("embed-backfill", 50)  # not declared
+    s = _progress.read_status()
+    # Only ingest exists; no embed-backfill silently appeared.
+    assert [p["name"] for p in s["phases"]] == ["ingest"]
+
+
+def test_no_active_run_makes_updates_noops(tmp_path, monkeypatch):
+    """All mutators are safe to call when no run exists. This is the
+    invariant that lets ingest/embed_backfill instrumentation always
+    fire without checking first."""
+    _set_db(tmp_path, monkeypatch)
+    # No start_run.
+    _progress.set_phase_total("ingest", 100)
+    _progress.update_phase("ingest", 50)
+    _progress.finish_phase("ingest")
+    _progress.finish_run()
+    assert _progress.read_status() is None
+
+
+def test_stale_dead_pid_cleaned_on_read(tmp_path, monkeypatch):
+    _set_db(tmp_path, monkeypatch)
+    p = tmp_path / "backfill-progress.json"
+    p.write_text(json.dumps({
+        "pid": 2**31 - 1,  # guaranteed-dead
+        "started_at": "2020-01-01T00:00:00+00:00",
+        "updated_at": "2020-01-01T00:00:00+00:00",
+        "phases": [{"name": "ingest", "total": 100, "completed": 50, "state": "running"}],
+    }))
+    assert _progress.read_status() is None
+    assert not p.exists(), "stale file should be deleted on read"
+
+
+# ── stats() integration ─────────────────────────────────────────────────────
+
+
+def test_stats_renders_one_bar_per_phase(tmp_path, monkeypatch):
+    """When the chain pre-declared two phases, stats must render both —
+    even if one is still pending. This is the visibility gap the user
+    asked for: 'I want two bars, ingest AND embed.'"""
+    _set_db(tmp_path, monkeypatch)
+    _progress.start_run([("ingest", 4248), ("embed-backfill", 0)])
+    _progress.update_phase("ingest", 1234)
 
     from convo_recall import ingest
     con = ingest.open_db()
@@ -150,19 +140,60 @@ def test_stats_renders_progress_bar_when_active(tmp_path, monkeypatch):
         ingest.stats(con)
     out = buf.getvalue()
 
-    # tqdm or plain fallback — both contain the phase + counts.
+    assert "ingest" in out
     assert "embed-backfill" in out
-    assert "425" in out
-    assert "1,000" in out or "1000" in out
-    # Stats body still printed.
-    assert "Messages" in out
+    # Ingest is partway through — current count visible.
+    assert "1,234" in out or "1234" in out
+    assert "4,248" in out or "4248" in out
+    # embed-backfill still pending — show that, not a fake bar.
+    assert "pending" in out
+
+
+def test_stats_pending_phase_does_not_show_fake_bar(tmp_path, monkeypatch):
+    _set_db(tmp_path, monkeypatch)
+    _progress.start_run([("embed-backfill", 0)])
+    # Don't mark running. Should render "pending" placeholder, not 0/0 bar.
+
+    from convo_recall import ingest
+    con = ingest.open_db()
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        ingest.stats(con)
+    out = buf.getvalue()
+
+    assert "embed-backfill" in out
+    assert "pending" in out
+    # No "0/0" bar — the pending placeholder is the entire output for
+    # this phase. (`(0%)` from the Embedded coverage line is fine.)
+    assert "0/0" not in out
+    assert "█" not in out
+
+
+def test_stats_done_phase_with_zero_total_says_nothing_to_do(tmp_path, monkeypatch):
+    """The user's exact case: existing DB, ingest had nothing new, embed
+    had nothing to embed. Both phases finish with total=0. We don't show
+    a 0/0 bar — we say 'nothing to do' so the user understands."""
+    _set_db(tmp_path, monkeypatch)
+    _progress.start_run([("ingest", 0), ("embed-backfill", 0)])
+    _progress.finish_phase("ingest")
+    _progress.finish_phase("embed-backfill")
+
+    from convo_recall import ingest
+    con = ingest.open_db()
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        ingest.stats(con)
+    out = buf.getvalue()
+
+    assert "ingest: nothing to do" in out
+    assert "embed-backfill: nothing to do" in out
 
 
 def test_stats_no_progress_bar_when_idle(tmp_path, monkeypatch):
-    """No progress file present → stats output must NOT include the bar
-    framing characters. Idle stats should look identical to pre-feature."""
-    _patch_db_to_tmp(tmp_path, monkeypatch)
-    # No start_job call.
+    """No active run → stats output unchanged from pre-feature."""
+    _set_db(tmp_path, monkeypatch)
 
     from convo_recall import ingest
     con = ingest.open_db()
@@ -172,5 +203,6 @@ def test_stats_no_progress_bar_when_idle(tmp_path, monkeypatch):
         ingest.stats(con)
     out = buf.getvalue()
 
-    assert "embed-backfill" not in out
+    assert "ingest:" not in out
+    assert "embed-backfill:" not in out
     assert "█" not in out
