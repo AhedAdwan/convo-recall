@@ -97,6 +97,9 @@ def uninstall(purge_data: bool = False) -> None:
 
     if purge_data:
         import shutil as _shutil
+        from ._paths import log_dir as _log_dir, runtime_dir as _runtime_dir
+
+        # ── DB + config (~/.local/share/convo-recall) ────────────────────────
         data_dir = Path(os.environ.get(
             "CONVO_RECALL_DB",
             Path.home() / ".local" / "share" / "convo-recall" / "conversations.db"
@@ -106,6 +109,32 @@ def uninstall(purge_data: bool = False) -> None:
             print(f"  ✅ Deleted data directory: {data_dir}")
         else:
             print(f"  Data directory not found: {data_dir}")
+
+        # ── F-21/F-19: runtime dir (sockets + cron backups) ──────────────────
+        # Always our directory on both platforms — safe to rmtree.
+        rt = _runtime_dir()
+        if rt.exists():
+            _shutil.rmtree(rt)
+            print(f"  ✅ Deleted runtime directory: {rt}")
+
+        # ── F-18: log files ──────────────────────────────────────────────────
+        # On Linux, log_dir() returns <state>/convo-recall (our dir → rmtree).
+        # On macOS, log_dir() returns ~/Library/Logs (shared dir → glob delete).
+        ld = _log_dir()
+        if ld.exists():
+            if ld.name == "convo-recall":
+                _shutil.rmtree(ld)
+                print(f"  ✅ Deleted log directory: {ld}")
+            else:
+                removed = 0
+                for log in ld.glob("convo-recall-*.log"):
+                    log.unlink(missing_ok=True)
+                    removed += 1
+                for elog in ld.glob("convo-recall-*.error.log"):
+                    elog.unlink(missing_ok=True)
+                    removed += 1
+                if removed:
+                    print(f"  ✅ Removed {removed} log file(s) from {ld}")
 
     print("\nconvo-recall uninstalled." + (" Data purged." if purge_data else
           "\nConversation DB kept. Re-run with --purge-data to delete it."))

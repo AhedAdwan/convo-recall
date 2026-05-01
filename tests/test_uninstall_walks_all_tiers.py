@@ -4,6 +4,7 @@ switched OS still gets clean teardown."""
 import io
 import sys
 from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 
 import pytest
 
@@ -174,6 +175,91 @@ def test_uninstall_runs_hooks_before_scheduler_walk(monkeypatch):
     assert order[0] == "hooks", (
         f"hooks must be removed first; got order: {order[:3]}…"
     )
+
+
+# ── F-17/F-18/F-19/F-21: purge-data sweeps logs + runtime dir ───────────────
+
+
+def test_purge_data_removes_runtime_dir_and_logs(monkeypatch, tmp_path):
+    """`recall uninstall --purge-data` must clean up log files (F-18),
+    cron backups in the runtime dir (F-19), and the runtime dir itself
+    (F-21) — not just the DB. Pre-fix only the DB's data directory was
+    removed, leaving stale logs accumulating across reinstall cycles."""
+    fake_home = tmp_path
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    monkeypatch.setenv("CONVO_RECALL_DB", str(fake_home / ".local/share/convo-recall/conversations.db"))
+
+    # Stub schedulers + uninstall_hooks so the test only exercises the
+    # purge_data branch.
+    _stub_uninstall(
+        monkeypatch,
+        watcher_result_factory=lambda cls, agent: Result(
+            ok=True, message="watcher not installed", path=None,
+        ),
+        sidecar_result_factory=lambda cls: Result(
+            ok=True, message="sidecar not installed", path=None,
+        ),
+    )
+
+    # Patch the path helpers to point inside tmp_path
+    fake_runtime = fake_home / "Library" / "Caches" / "convo-recall"
+    fake_runtime.mkdir(parents=True)
+    (fake_runtime / "crontab.bak.1234567890").write_text("* * * * * old\n")
+    (fake_runtime / "embed.sock").touch()
+
+    fake_logs = fake_home / "Library" / "Logs"
+    fake_logs.mkdir(parents=True)
+    (fake_logs / "convo-recall-embed.log").write_text("warmup\n")
+    (fake_logs / "convo-recall-ingest-claude.error.log").write_text("err\n")
+    (fake_logs / "system.log").write_text("unrelated\n")  # MUST survive
+
+    fake_data = fake_home / ".local" / "share" / "convo-recall"
+    fake_data.mkdir(parents=True)
+    (fake_data / "conversations.db").write_text("fake-db")
+    (fake_data / "config.json").write_text('{"agents":["claude"]}')
+
+    # Re-route the helpers in the purge_data branch
+    from convo_recall.install import _paths
+    monkeypatch.setattr(_paths, "log_dir", lambda: fake_logs)
+    monkeypatch.setattr(_paths, "runtime_dir", lambda: fake_runtime)
+
+    install.uninstall(purge_data=True)
+
+    # F-21: runtime dir gone
+    assert not fake_runtime.exists(), "runtime dir should have been removed"
+    # F-18: convo-recall log files gone
+    assert not (fake_logs / "convo-recall-embed.log").exists()
+    assert not (fake_logs / "convo-recall-ingest-claude.error.log").exists()
+    # Critical: unrelated files in shared log dir are NOT touched
+    assert (fake_logs / "system.log").exists(), (
+        "purge_data must not glob-delete unrelated files in ~/Library/Logs"
+    )
+    # F-20 sanity: data dir gone (DB + config.json)
+    assert not fake_data.exists()
+
+
+def test_purge_data_no_op_when_nothing_to_purge(monkeypatch, tmp_path):
+    """If runtime/log/data dirs don't exist, purge_data must not crash."""
+    fake_home = tmp_path
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    monkeypatch.setenv("CONVO_RECALL_DB", str(fake_home / ".local/share/convo-recall/conversations.db"))
+
+    _stub_uninstall(
+        monkeypatch,
+        watcher_result_factory=lambda cls, agent: Result(
+            ok=True, message="watcher not installed", path=None,
+        ),
+        sidecar_result_factory=lambda cls: Result(
+            ok=True, message="sidecar not installed", path=None,
+        ),
+    )
+
+    from convo_recall.install import _paths
+    monkeypatch.setattr(_paths, "log_dir", lambda: fake_home / "nonexistent-logs")
+    monkeypatch.setattr(_paths, "runtime_dir", lambda: fake_home / "nonexistent-runtime")
+
+    # Should not raise
+    install.uninstall(purge_data=True)
 
 
 def test_uninstall_surfaces_failures(monkeypatch):
