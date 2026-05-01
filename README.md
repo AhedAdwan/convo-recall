@@ -4,6 +4,8 @@
 
 > **AI agents are stateless by design. convo-recall makes them stateful by infrastructure.**
 
+_Inspired by Andrej Karpathy's [LLM Wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f). Where Karpathy's wiki has the LLM synthesize external sources into curated markdown, convo-recall captures verbatim agent session transcripts in SQLite — same instinct (agents need persistent state across sessions), different object. The two are complementary, not competing._
+
 Every coding-agent session starts blind. Decisions made last week, approaches that failed, the exact fix for that recurring bug — all of it vanishes when the context window closes. As sessions grow longer, the cost of keeping that context alive skews toward noise over signal. And when multiple agents work on the same project, each one starts from zero with no knowledge of what the others have done.
 
 convo-recall fixes this. It indexes every conversation from your coding agents — **Claude Code, Gemini CLI, and Codex** — into one local SQLite database and makes it searchable by keyword, by semantic meaning, or both. Your agents get a shared memory that survives the context window AND crosses tool boundaries.
