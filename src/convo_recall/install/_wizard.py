@@ -419,6 +419,42 @@ def run(
         print("\nFor hybrid vector+FTS search (better recall):")
         print("  recall install --with-embeddings")
 
+    # ── Wait for sidecar socket so the final stats don't false-alarm ─────────
+    # The sidecar systemd unit was started ~1s ago, but loading the
+    # sentence-transformers model + binding the socket takes ~5s on a warm
+    # cache (longer on first download). Without this wait, the final
+    # `recall stats` check runs before the socket exists and prints
+    # "⚠ Vector search disabled — embed sidecar not running" — making
+    # the install look broken when it isn't. Poll briefly with a spinner
+    # so the user sees real progress instead of a misleading warning.
+    if do_embed_sidecar:
+        import time as _time
+
+        class _SidecarTimeout(RuntimeError):
+            pass
+
+        timeout_s = 15.0
+        try:
+            with BouncingSpinner(
+                f"Waiting for embed sidecar to bind socket (~5s typical, "
+                f"{timeout_s:.0f}s timeout)"
+            ):
+                deadline = _time.time() + timeout_s
+                while _time.time() < deadline:
+                    if SOCK_PATH.exists():
+                        break
+                    _time.sleep(0.2)
+                else:
+                    raise _SidecarTimeout()
+        except _SidecarTimeout:
+            print(
+                f"  ⚠ Sidecar didn't bind socket within {timeout_s:.0f}s — "
+                f"likely still loading the model in the background.\n"
+                f"     Re-run `recall stats` in ~30s; if it still says "
+                f"'sidecar not running', check the log:\n"
+                f"     tail -f {LOG_DIR}/convo-recall-embed.log"
+            )
+
     # ── Final stats snapshot ─────────────────────────────────────────────────
     # Show the user the current DB state — and, if a backfill chain just
     # spawned and beat us to writing the progress file, render the
