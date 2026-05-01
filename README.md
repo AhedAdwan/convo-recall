@@ -17,22 +17,25 @@ recall search "the prompt that worked" --agent gemini      # filter to one agent
 
 ---
 
-## Why not Claude's built-in memory or compaction?
+## Why not the agent's built-in memory or compaction?
 
-| | Claude compaction | Claude memory | convo-recall |
+Most coding agents ship with two related-but-distinct features for surviving long conversations: **in-session compaction** and a **curated memory layer**. Names vary — Claude has *compaction* + *memory*, Codex has *resumable sessions*, Gemini has `/chat save` + the *Memory MCP* — but the shape is similar everywhere.
+
+| | In-session compaction | Curated memory layer | convo-recall |
 |---|---|---|---|
 | Survives across sessions | — | ✅ | ✅ |
 | Full verbatim transcript | — | — | ✅ |
 | Semantic search | — | — | ✅ |
-| Automatic, zero-setup | ✅ | ✅ | ✅ (launchd) |
+| Automatic, zero-setup | ✅ | ✅ | ✅ (launchd / systemd / cron) |
 | Cross-project recall | — | — | ✅ |
+| Cross-agent recall (Claude ↔ Codex ↔ Gemini) | — | — | ✅ |
 | Source-traceable | — | — | ✅ |
 
 **Compaction** summarizes and discards — the detail is gone. Useful for staying within a context window, but it only knows the current session.
 
-**Claude memory** is curated prose — an agent decides what's worth saving, which means it misses everything it didn't think to record. No semantic search, no source tracing.
+**Curated memory layers** are agent-written prose — the model decides what's worth saving, which means everything it didn't think to record is permanently lost. No semantic search, no source tracing. Each agent's memory layer is also walled off from the others: Claude's memory file can't see what Codex did yesterday.
 
-**convo-recall** indexes everything automatically, keeps the full transcript, and lets you query it with natural language. The two approaches are complementary: use Claude memory for high-signal curated facts, convo-recall for full verbatim history on demand.
+**convo-recall** indexes everything automatically across every supported agent, keeps the full transcript, and lets you query it with natural language. The two approaches are complementary: use the agent's own memory for high-signal curated facts (intent, preferences, ongoing goals), use convo-recall for full verbatim history on demand — including across agents.
 
 ---
 
