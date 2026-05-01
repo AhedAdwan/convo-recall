@@ -61,6 +61,11 @@ def uninstall(purge_data: bool = False) -> None:
     to see launchd plists cleaned up too — and vice versa. Each tier's
     `uninstall_*` no-ops gracefully when nothing was installed, so this
     is safe even when most tiers have nothing to do.
+
+    Hooks come FIRST so the package is still installed when we resolve
+    the bundled `conversation-memory.sh` script path. If hooks were
+    deferred to after `pipx uninstall`, the script path can no longer be
+    located and entries get left dangling in each CLI's settings file.
     """
     from .schedulers import all_schedulers
 
@@ -78,6 +83,13 @@ def uninstall(purge_data: bool = False) -> None:
         elif not r.ok:
             print(f"  ⚠  [{sched_describe}] {msg}", file=sys.stderr)
 
+    # ── Pre-prompt hooks ────────────────────────────────────────────────────
+    # Walk all three CLIs so a host that previously installed for a different
+    # subset still gets cleaned. uninstall_hooks() prints per-CLI status and
+    # no-ops on agents with no settings file or no convo-recall block.
+    uninstall_hooks(agents=None)
+
+    # ── Watchers + sidecars across every tier ───────────────────────────────
     for sched in all_schedulers():
         for agent in ("claude", "gemini", "codex"):
             _surface(sched.describe(), sched.uninstall_watcher(agent))

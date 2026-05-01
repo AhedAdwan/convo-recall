@@ -21,9 +21,14 @@ _ALL_CLASSES = (LaunchdScheduler, SystemdUserScheduler,
                 CronScheduler, PollingScheduler)
 
 
-def _stub_uninstall(monkeypatch, watcher_result_factory, sidecar_result_factory):
+def _stub_uninstall(monkeypatch, watcher_result_factory, sidecar_result_factory,
+                    hooks_recorder: list[str] | None = None):
     """Replace every scheduler's `uninstall_watcher`/`uninstall_sidecar`
-    with mocks that record calls and return canned results."""
+    with mocks that record calls and return canned results.
+
+    Also stubs `install.uninstall_hooks` to a no-op (with optional
+    recording) so tests don't mutate the dev machine's real
+    `~/.claude/settings.json` / `~/.codex/hooks.json` / `~/.gemini/...`."""
     watcher_calls: list[tuple[type, str]] = []
     sidecar_calls: list[type] = []
 
@@ -42,6 +47,13 @@ def _stub_uninstall(monkeypatch, watcher_result_factory, sidecar_result_factory)
     for cls in _ALL_CLASSES:
         monkeypatch.setattr(cls, "uninstall_watcher", make_uninstall_watcher(cls))
         monkeypatch.setattr(cls, "uninstall_sidecar", make_uninstall_sidecar(cls))
+
+    def fake_uninstall_hooks(agents=None):
+        if hooks_recorder is not None:
+            hooks_recorder.append(f"uninstall_hooks(agents={agents})")
+        return 0
+
+    monkeypatch.setattr(install, "uninstall_hooks", fake_uninstall_hooks)
 
     return watcher_calls, sidecar_calls
 
@@ -95,6 +107,72 @@ def test_uninstall_does_not_print_no_op_results(monkeypatch):
     output = buf.getvalue()
     assert "✅" not in output, (
         f"no-op tiers should not surface success lines; got:\n{output}"
+    )
+
+
+# ── F-16: hooks must be removed alongside watchers + sidecars ────────────────
+
+
+def test_uninstall_calls_uninstall_hooks(monkeypatch):
+    """Pre-fix `recall uninstall` walked schedulers but never touched the
+    pre-prompt hook entries, so each CLI's settings.json was left with a
+    dangling reference to a (now-uninstalled) conversation-memory.sh.
+    Lock that uninstall_hooks() runs as part of the walk."""
+    hooks_calls: list[str] = []
+    _stub_uninstall(
+        monkeypatch,
+        watcher_result_factory=lambda cls, agent: Result(
+            ok=True, message="watcher not installed", path=None,
+        ),
+        sidecar_result_factory=lambda cls: Result(
+            ok=True, message="sidecar not installed", path=None,
+        ),
+        hooks_recorder=hooks_calls,
+    )
+
+    install.uninstall(purge_data=False)
+
+    assert hooks_calls, (
+        "uninstall_hooks was never called; F-16 fix missing — see "
+        "src/convo_recall/install/__init__.py:uninstall()"
+    )
+    # agents=None means "walk every CLI", which is what we want for
+    # uninstall (clean across whatever subset was wired previously).
+    assert "agents=None" in hooks_calls[0], hooks_calls
+
+
+def test_uninstall_runs_hooks_before_scheduler_walk(monkeypatch):
+    """Hooks must be removed BEFORE the package's bundled hook script
+    becomes unresolvable (e.g. after a subsequent `pipx uninstall`).
+    Capture call ordering so a regression to "hooks at the end" fails."""
+    order: list[str] = []
+
+    def fake_uninstall_hooks(agents=None):
+        order.append("hooks")
+        return 0
+
+    def make_uninstall_watcher(cls):
+        def fn(self, agent):
+            order.append(f"watcher({cls.__name__},{agent})")
+            return Result(ok=True, message="watcher not installed", path=None)
+        return fn
+
+    def make_uninstall_sidecar(cls):
+        def fn(self):
+            order.append(f"sidecar({cls.__name__})")
+            return Result(ok=True, message="sidecar not installed", path=None)
+        return fn
+
+    for cls in _ALL_CLASSES:
+        monkeypatch.setattr(cls, "uninstall_watcher", make_uninstall_watcher(cls))
+        monkeypatch.setattr(cls, "uninstall_sidecar", make_uninstall_sidecar(cls))
+    monkeypatch.setattr(install, "uninstall_hooks", fake_uninstall_hooks)
+
+    install.uninstall(purge_data=False)
+
+    assert order, "uninstall did nothing"
+    assert order[0] == "hooks", (
+        f"hooks must be removed first; got order: {order[:3]}…"
     )
 
 
