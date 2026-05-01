@@ -1672,3 +1672,49 @@ def test_open_db_falls_back_to_readonly_on_wal_cantopen(tmp_path, monkeypatch, c
     rows = con.execute("SELECT session_id FROM sessions").fetchall()
     assert rows[0]["session_id"] == "s1"
     con.close()
+
+# ── _wait_for_embed_socket: race-condition fix for chain → embed pipeline ─────
+
+def test_wait_for_embed_socket_returns_true_when_socket_already_exists(tmp_path, monkeypatch):
+    sock = tmp_path / 'embed.sock'
+    sock.touch()
+    monkeypatch.setattr(ingest, 'EMBED_SOCK', sock)
+    import time
+    start = time.time()
+    assert ingest._wait_for_embed_socket(timeout_s=5.0) is True
+    assert (time.time() - start) < 0.05, 'should return immediately when socket exists'
+
+
+def test_wait_for_embed_socket_returns_true_when_socket_appears(tmp_path, monkeypatch):
+    sock = tmp_path / 'embed.sock'
+    monkeypatch.setattr(ingest, 'EMBED_SOCK', sock)
+    # Spawn a thread that creates the socket after 0.3s.
+    import threading, time
+    def _create_later():
+        time.sleep(0.3)
+        sock.touch()
+    threading.Thread(target=_create_later, daemon=True).start()
+    start = time.time()
+    assert ingest._wait_for_embed_socket(timeout_s=2.0, poll_interval_s=0.05) is True
+    elapsed = time.time() - start
+    assert 0.25 < elapsed < 0.6, f'should wait for socket; elapsed={elapsed:.2f}s'
+
+
+def test_wait_for_embed_socket_returns_false_on_timeout(tmp_path, monkeypatch):
+    sock = tmp_path / 'embed.sock'
+    monkeypatch.setattr(ingest, 'EMBED_SOCK', sock)
+    import time
+    start = time.time()
+    assert ingest._wait_for_embed_socket(timeout_s=0.3, poll_interval_s=0.05) is False
+    elapsed = time.time() - start
+    assert 0.25 < elapsed < 0.5, f'should respect timeout; elapsed={elapsed:.2f}s'
+
+
+def test_wait_for_embed_socket_verbose_logs_to_stderr(tmp_path, monkeypatch, capsys):
+    sock = tmp_path / 'embed.sock'
+    monkeypatch.setattr(ingest, 'EMBED_SOCK', sock)
+    ingest._wait_for_embed_socket(timeout_s=0.2, poll_interval_s=0.05, verbose=True)
+    err = capsys.readouterr().err
+    assert 'waiting up to' in err
+    assert 'did not appear within' in err
+

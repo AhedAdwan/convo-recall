@@ -188,6 +188,48 @@ def _vec_bytes(v: list[float]) -> bytes:
     return struct.pack(f"{len(v)}f", *v)
 
 
+def _wait_for_embed_socket(timeout_s: float = 5.0,
+                           poll_interval_s: float = 0.2,
+                           verbose: bool = False) -> bool:
+    """Poll for `EMBED_SOCK.exists()` up to `timeout_s` seconds.
+
+    Returns True if the socket exists by the deadline (immediately if it
+    already does), False on timeout. Used by ingest + embed-backfill to
+    close the race where:
+
+      1. The wizard starts the embed sidecar systemd unit.
+      2. The wizard immediately spawns the detached _backfill-chain.
+      3. The chain calls `open_db()` and ingest before the sidecar has
+         finished loading the model + binding the socket (~5s on Linux).
+      4. `embed_live = EMBED_SOCK.exists()` was set to False at the start
+         of ingest → self-heal pass + embed-backfill silently no-op.
+
+    Pre-fix the race only manifested on truly cold installs (the bug
+    pattern the user hit on a fresh Linux sandbox). On warm systems
+    (e.g. macOS rerunning install with the launchd sidecar already up)
+    the socket exists at step 4 → no race → coincidentally "just works".
+    """
+    if EMBED_SOCK.exists():
+        return True
+    if verbose:
+        print(f"[ingest] waiting up to {timeout_s:.0f}s for embed socket "
+              f"at {EMBED_SOCK} …", file=sys.stderr)
+    import time as _time
+    deadline = _time.time() + timeout_s
+    while _time.time() < deadline:
+        if EMBED_SOCK.exists():
+            if verbose:
+                elapsed = timeout_s - (deadline - _time.time())
+                print(f"[ingest] embed socket appeared after {elapsed:.1f}s",
+                      file=sys.stderr)
+            return True
+        _time.sleep(poll_interval_s)
+    if verbose:
+        print(f"[ingest] embed socket did not appear within {timeout_s:.0f}s — "
+              f"running in FTS-only mode", file=sys.stderr)
+    return False
+
+
 # ── DB setup ──────────────────────────────────────────────────────────────────
 
 def _harden_perms(path: Path, mode: int) -> None:
@@ -1250,6 +1292,14 @@ def scan_all(con: apsw.Connection, verbose: bool = False,
              do_embed: bool = True) -> None:
     from . import _progress
 
+    # Close the race where the embed sidecar systemd unit was started
+    # moments ago but hasn't bound its socket yet (~5s Linux, can be longer
+    # for first-ever model download). Without this, embed_live=False here
+    # → self-heal pass below silently skips → DB stays at 0% embedded.
+    # On warm systems the socket already exists, so the wait is a no-op.
+    if do_embed and _vec_ok(con):
+        _wait_for_embed_socket(timeout_s=30.0, verbose=verbose)
+
     embed_live = EMBED_SOCK.exists() and do_embed
     if not embed_live and do_embed:
         print("[warn] embed socket not found — running in FTS-only mode", file=sys.stderr)
@@ -1942,8 +1992,11 @@ def embed_backfill(con: apsw.Connection) -> None:
     if not _vec_ok(con):
         print("sqlite-vec not loaded", file=sys.stderr)
         return
-    if not EMBED_SOCK.exists():
-        print("Embed socket not found", file=sys.stderr)
+    # Same race fix as scan_all: the wizard's chain calls embed_backfill
+    # right after spawning the sidecar, before the socket is bound.
+    # Wait up to 30s for the socket to appear before declaring failure.
+    if not _wait_for_embed_socket(timeout_s=30.0, verbose=True):
+        print("Embed socket not found (waited 30s)", file=sys.stderr)
         return
     existing = {r[0] for r in con.execute("SELECT rowid FROM message_vecs").fetchall()}
     rows = con.execute("SELECT rowid, content FROM messages").fetchall()
