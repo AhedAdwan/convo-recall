@@ -2580,6 +2580,23 @@ def stats(con: apsw.Connection) -> None:
         elif not EMBED_SOCK.exists():
             print("⚠ Vector search disabled — embed sidecar not running.")
             print("  recall serve --sock " + str(EMBED_SOCK) + "  (or restart `recall install`)")
+        elif progress is not None:
+            # A backfill chain is currently running — re-word the message so
+            # the user doesn't manually re-trigger something already in flight.
+            # First-run on a 60K-msg DB takes 5-15 min; small DBs finish in
+            # seconds. The progress bar at the top shows live status.
+            print("ℹ First-run embedding in progress — see the progress bar above.")
+            print("  Re-run `recall stats` to track. Vector search becomes "
+                  "available as embeddings complete.")
         else:
-            print("⚠ Vector search ready but no rows embedded yet.")
-            print("  recall embed-backfill")
+            # No active chain — the user can manually start one OR wait for
+            # the next watcher-driven ingest tick (which auto-heals up to
+            # 2000 missing rows per call).
+            print("ℹ Vector search ready but rows aren't embedded yet.")
+            print("  • First-run? Embedding takes time proportional to DB size")
+            print("    (~50ms per message; 60K msgs ≈ 5-15 min).")
+            print("  • Track progress: re-run `recall stats` until the bar")
+            print("    completes, then it disappears.")
+            print("  • To kick it off now: `recall embed-backfill`")
+            print("    (otherwise next watcher-driven ingest auto-heals 2000")
+            print("    rows/tick — fully automatic but slower).")

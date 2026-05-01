@@ -362,9 +362,15 @@ def run(
         )
         print(f"\n📦 Initial ingest + embed-backfill running in background "
               f"(pid {backfill_proc.pid}).")
-        print(f"   Logs:  tail -f {backfill_log}")
-        print(f"   Progress: run `recall stats` (shows a one-shot progress bar "
-              f"while the job is active).")
+        print(f"   ⏱  This is a ONE-TIME first-run cost. Duration depends on "
+              f"DB size:")
+        print(f"     • Small DB (<1K msgs)     : seconds")
+        print(f"     • Medium DB (1K–10K msgs) : 1–3 minutes")
+        print(f"     • Large DB (10K–60K msgs) : 5–15 minutes")
+        print(f"     • Very large DB (>60K)    : 15–30 minutes")
+        print(f"   📊 Track live: `recall stats` (re-run as the bar climbs;")
+        print(f"      vector search becomes available as embeddings complete).")
+        print(f"   📜 Detailed logs: tail -f {backfill_log}")
         if do_initial_embed_backfill and not do_embed_sidecar:
             print("⚠ embed-backfill will be skipped inside the chain — no "
                   "sidecar configured. Re-run install with --with-embeddings.")

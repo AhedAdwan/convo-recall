@@ -1456,6 +1456,69 @@ def test_stats_no_warning_when_no_messages(db, tmp_path, capsys):
     assert "Vector search disabled" not in out
 
 
+def test_stats_friendly_message_when_chain_active(db, tmp_path, monkeypatch, capsys):
+    """When `Embedded: 0` but a backfill chain is currently running, stats
+    must NOT tell the user to "run recall embed-backfill" — that's already
+    happening. Show a friendly "in progress" message + tracking hint."""
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    sess = tmp_path / "p" / "s.jsonl"
+    _write_session(sess, [
+        {"uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+         "message": {"role": "user", "content": "hello world"}},
+    ])
+    ingest.ingest_file(db, sess, do_embed=False)
+
+    # Force the "sidecar running + extra installed" branch so we hit the
+    # message we want to test.
+    fake_sock = tmp_path / "embed.sock"
+    fake_sock.touch()
+    monkeypatch.setattr(ingest, "EMBED_SOCK", fake_sock)
+
+    # Simulate an active backfill chain.
+    from convo_recall import _progress
+    monkeypatch.setattr(_progress, "_progress_path", lambda: tmp_path / "progress.json")
+    _progress.start_run([("ingest", 1), ("embed-backfill", 1)])
+
+    capsys.readouterr()
+    ingest.stats(db)
+    out = capsys.readouterr().out
+    # Friendly "in progress" wording, NOT the manual-action hint.
+    assert "First-run embedding in progress" in out, f"got:\n{out}"
+    assert "recall embed-backfill" not in out or \
+        "auto-heals" in out  # the auto-heal hint mentions it acceptably
+
+
+def test_stats_guidance_when_no_chain_running(db, tmp_path, monkeypatch, capsys):
+    """When no chain is active, stats must give the user a clear, multi-line
+    guidance block explaining first-run cost + how to track + how to kick it
+    off — replacing the old terse '⚠ Vector search ready but no rows
+    embedded yet. recall embed-backfill' that confused users."""
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    sess = tmp_path / "p" / "s.jsonl"
+    _write_session(sess, [
+        {"uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+         "message": {"role": "user", "content": "hi"}},
+    ])
+    ingest.ingest_file(db, sess, do_embed=False)
+
+    fake_sock = tmp_path / "embed.sock"
+    fake_sock.touch()
+    monkeypatch.setattr(ingest, "EMBED_SOCK", fake_sock)
+
+    # No chain active — make sure we're not reading a stale progress file.
+    from convo_recall import _progress
+    monkeypatch.setattr(_progress, "_progress_path", lambda: tmp_path / "progress.json")
+
+    capsys.readouterr()
+    ingest.stats(db)
+    out = capsys.readouterr().out
+    # Verify the new guidance includes:
+    assert "First-run" in out, f"missing first-run framing; got:\n{out}"
+    assert "Track progress" in out
+    assert "recall embed-backfill" in out  # explicit kick-off hint
+    assert "auto-heals" in out             # mentions watcher fallback
+
+
 def test_doctor_reports_embed_status_lines(db, tmp_path, monkeypatch, capsys):
     """`recall doctor` prints three lines reporting embed extra / sidecar /
     coverage so the user sees the full picture in one place."""
