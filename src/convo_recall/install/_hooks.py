@@ -138,9 +138,31 @@ def _wire_hook(agent: str, hook_script: Path,
     return True, f"  ✅ {label}: hook wired into {settings_path}{backup_msg}"
 
 
+_ORPHAN_HOOK_SUFFIX = "convo_recall/hooks/conversation-memory.sh"
+
+
+def _is_convo_recall_hook(cmd: str | None, current_sig: str) -> bool:
+    """Match anything that is or was a convo-recall hook entry.
+
+    `current_sig` matches the package's CURRENT install path. The suffix
+    fallback catches orphan entries left over from a previous install
+    at a different path — e.g. you ran `pipx install -e <pathA>` once,
+    moved sources, and reinstalled from `<pathB>`. Without the suffix
+    match, the prior entry survives uninstall_hooks and silently fires
+    a broken script on every agent turn.
+    """
+    if not cmd:
+        return False
+    if cmd == current_sig:
+        return True
+    return cmd.endswith(_ORPHAN_HOOK_SUFFIX)
+
+
 def _unwire_hook(agent: str, hook_script: Path) -> tuple[bool, str]:
-    """Remove the convo-recall hook block from a CLI's settings (matched
-    by command path). Leaves user's other hooks untouched."""
+    """Remove the convo-recall hook block from a CLI's settings — matched
+    by current install path AND by suffix `convo_recall/hooks/conversation-memory.sh`
+    so orphans from prior installs at other paths are cleaned too.
+    Leaves user's other hooks untouched."""
     settings_path, event, label = _hook_target(agent)
     if not settings_path.exists():
         return False, f"  · {label}: no settings file; nothing to remove"
@@ -154,7 +176,10 @@ def _unwire_hook(agent: str, hook_script: Path) -> tuple[bool, str]:
     new_groups = []
     removed = 0
     for group in event_groups:
-        kept_hooks = [h for h in group.get("hooks", []) if h.get("command") != sig]
+        kept_hooks = [
+            h for h in group.get("hooks", [])
+            if not _is_convo_recall_hook(h.get("command"), sig)
+        ]
         if not kept_hooks:
             removed += 1
             continue
