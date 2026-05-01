@@ -613,3 +613,72 @@ def test_cron_writes_backup_before_modification(tmp_path, monkeypatch):
     backups = list(bak_dir.glob("crontab.bak.*"))
     assert backups, "backup file not written"
     assert backups[0].read_text() == "# pre-existing\n"
+
+
+# ── F-14: SystemdUserScheduler.uninstall_* must be safe on macOS ─────────────
+
+
+def test_systemd_uninstall_watcher_no_op_when_units_absent(tmp_path, monkeypatch):
+    """`recall uninstall` walks all_schedulers() including SystemdUserScheduler
+    on macOS. Without the guard, systemctl FileNotFoundError crashed the
+    whole walk after launchd uninstalled successfully. Early-return
+    when no unit files exist for the agent."""
+    monkeypatch.setattr(
+        "convo_recall.install.schedulers.systemd.scheduler_unit_dir",
+        lambda: tmp_path / "units-empty",
+    )
+
+    # Sentinel that fires if we accidentally call systemctl
+    called = []
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: called.append(a) or _ok())
+
+    result = SystemdUserScheduler().uninstall_watcher(agent="claude")
+
+    assert result.ok
+    assert "not installed" in result.message
+    assert called == [], (
+        f"systemctl should NOT have been called when no units exist; "
+        f"calls: {called}"
+    )
+
+
+def test_systemd_uninstall_watcher_survives_missing_systemctl(tmp_path, monkeypatch):
+    """Pathological case: unit files exist but systemctl binary doesn't.
+    Could happen on macOS if someone manually copied unit files, or on
+    Linux during a failed package upgrade. Should remove the orphan
+    files cleanly, not crash."""
+    unit_dir = tmp_path / "units"
+    unit_dir.mkdir()
+    (unit_dir / "com.convo-recall.ingest.claude.service").write_text("[Service]")
+    (unit_dir / "com.convo-recall.ingest.claude.path").write_text("[Path]")
+    monkeypatch.setattr(
+        "convo_recall.install.schedulers.systemd.scheduler_unit_dir",
+        lambda: unit_dir,
+    )
+
+    def boom(*a, **kw):
+        raise FileNotFoundError("systemctl: no such file")
+    monkeypatch.setattr(subprocess, "run", boom)
+
+    result = SystemdUserScheduler().uninstall_watcher(agent="claude")
+    assert result.ok
+    # Files removed despite systemctl being missing
+    assert not (unit_dir / "com.convo-recall.ingest.claude.service").exists()
+    assert not (unit_dir / "com.convo-recall.ingest.claude.path").exists()
+
+
+def test_systemd_uninstall_sidecar_no_op_when_unit_absent(tmp_path, monkeypatch):
+    """Same guard for sidecar."""
+    monkeypatch.setattr(
+        "convo_recall.install.schedulers.systemd.scheduler_unit_dir",
+        lambda: tmp_path / "units-empty",
+    )
+
+    called = []
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: called.append(a) or _ok())
+
+    result = SystemdUserScheduler().uninstall_sidecar()
+
+    assert result.ok
+    assert "not installed" in result.message
+    assert called == []

@@ -155,6 +155,10 @@ def test_wizard_apply_order_sidecar_before_backfill(monkeypatch, tmp_path):
     monkeypatch.setattr(PollingScheduler, "install_watcher", _fake_install_watcher)
     monkeypatch.setattr(_wizard, "subprocess", type("S", (), {"run": staticmethod(_fake_subprocess_run)}))
 
+    # CI installs only [dev], not [embeddings] — fake the extra as present so
+    # the wizard takes the sidecar branch under test.
+    monkeypatch.setattr(_wizard, "_check_embeddings_installed", lambda: True)
+
     # Make the socket initially absent. The wizard's poll loop should see
     # it appear after install_sidecar runs (via fake_install_sidecar
     # creating it through subprocess.run side-effect — except, we're not
@@ -263,6 +267,10 @@ def test_wizard_skips_backfill_if_sidecar_doesnt_appear(monkeypatch, tmp_path):
     monkeypatch.setattr(PollingScheduler, "install_watcher", _fake_install_watcher)
     monkeypatch.setattr(_wizard, "subprocess", type("S", (), {"run": staticmethod(_fake_subprocess_run)}))
     monkeypatch.setattr(_wizard, "_ask", lambda *a, **kw: True)
+
+    # CI installs only [dev], not [embeddings] — fake the extra as present so
+    # the wizard takes the sidecar branch under test.
+    monkeypatch.setattr(_wizard, "_check_embeddings_installed", lambda: True)
 
     # Ensure the socket is absent so the poll loop will time out
     if SOCK_PATH.exists():

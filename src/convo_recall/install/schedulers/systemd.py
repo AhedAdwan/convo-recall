@@ -166,30 +166,59 @@ class SystemdUserScheduler(Scheduler):
         service_path = unit_dir / f"{label}.service"
         path_path = unit_dir / f"{label}.path"
 
-        subprocess.run(
-            ["systemctl", "--user", "disable", "--now", f"{label}.path"],
-            capture_output=True, text=True,
-        )
+        # Early return when no unit files exist for this agent — e.g.
+        # `recall uninstall` walks all_schedulers() including this one
+        # on macOS where systemctl doesn't exist. Without this guard,
+        # the systemctl call below raises FileNotFoundError on missing-
+        # binary platforms and crashes the whole uninstall walk.
+        if not (service_path.exists() or path_path.exists()):
+            return Result(ok=True, message=f"{agent} watcher not installed",
+                          path=path_path)
+
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "disable", "--now", f"{label}.path"],
+                capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            # Files exist but systemctl missing — treat as orphan units;
+            # remove the files anyway and skip the bus call.
+            pass
         path_path.unlink(missing_ok=True)
         service_path.unlink(missing_ok=True)
-        subprocess.run(
-            ["systemctl", "--user", "daemon-reload"],
-            capture_output=True, text=True,
-        )
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "daemon-reload"],
+                capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            pass
         return Result(ok=True, message=f"{label} disabled and removed", path=path_path)
 
     def uninstall_sidecar(self) -> Result:
         unit_dir = scheduler_unit_dir()
         service_path = unit_dir / f"{_EMBED_LABEL}.service"
-        subprocess.run(
-            ["systemctl", "--user", "disable", "--now", f"{_EMBED_LABEL}.service"],
-            capture_output=True, text=True,
-        )
+
+        # Same early-return guard as uninstall_watcher.
+        if not service_path.exists():
+            return Result(ok=True, message=f"{_EMBED_LABEL} sidecar not installed",
+                          path=service_path)
+
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "disable", "--now", f"{_EMBED_LABEL}.service"],
+                capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            pass
         service_path.unlink(missing_ok=True)
-        subprocess.run(
-            ["systemctl", "--user", "daemon-reload"],
-            capture_output=True, text=True,
-        )
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "daemon-reload"],
+                capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            pass
         return Result(ok=True, message=f"{_EMBED_LABEL} disabled and removed", path=service_path)
 
     # ── Lingering (opt-in by wizard) ─────────────────────────────────────────
