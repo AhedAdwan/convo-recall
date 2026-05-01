@@ -56,3 +56,32 @@ def test_runtime_dir_linux_falls_back_to_tmp(monkeypatch):
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
     expected = Path(f"/tmp/convo-recall-{__import__('os').getuid()}")
     assert _paths.runtime_dir() == expected
+
+
+# ── Regression: install.LOG_DIR must use _paths.log_dir() ────────────────────
+
+def test_install_LOG_DIR_uses_paths_helper_not_hardcoded_macos_path():
+    """Pre-fix `install.LOG_DIR` was hardcoded to `~/Library/Logs` — leaking
+    a macOS path onto Linux installs (logs ended up in `/root/Library/Logs`
+    on the sandbox). The fix wires it through `_paths.log_dir()` which IS
+    XDG-aware. This test pins the wiring so it can't regress.
+    """
+    import convo_recall.install as install
+    assert install.LOG_DIR == _paths.log_dir(), (
+        f"install.LOG_DIR drifted from _paths.log_dir(): "
+        f"install={install.LOG_DIR}, paths={_paths.log_dir()}"
+    )
+
+
+@pytest.mark.skipif(_paths.is_macos(), reason="Linux-specific path check")
+def test_install_LOG_DIR_is_under_xdg_state_on_linux():
+    """On Linux, install.LOG_DIR must NOT be `~/Library/Logs` — that's the
+    macOS path. This is the exact bug observed when running `recall install`
+    in the claude-sandbox container."""
+    import convo_recall.install as install
+    assert "Library/Logs" not in str(install.LOG_DIR), (
+        f"macOS path leaked onto Linux: install.LOG_DIR={install.LOG_DIR}"
+    )
+    # Should land under either XDG_STATE_HOME or ~/.local/state
+    s = str(install.LOG_DIR)
+    assert "convo-recall" in s

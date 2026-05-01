@@ -32,7 +32,11 @@ CODEX_SESSIONS = Path(os.environ.get("CONVO_RECALL_CODEX_SESSIONS",
                       Path.home() / ".codex" / "sessions"))
 SOCK_PATH = Path(os.environ.get("CONVO_RECALL_SOCK",
                  Path.home() / ".local" / "share" / "convo-recall" / "embed.sock"))
-LOG_DIR = Path.home() / "Library" / "Logs"
+# LOG_DIR uses the platform-aware helper so Linux gets `~/.local/state/convo-recall`
+# (XDG-compliant) and macOS gets `~/Library/Logs`. Pre-fix this was hardcoded to
+# the macOS path, leaking `~/Library/Logs` onto Linux hosts.
+from ._paths import log_dir as _log_dir
+LOG_DIR = _log_dir()
 
 # Per-agent watch path. Lambdas read module-level globals at call-time
 # so `monkeypatch.setattr(_install, "PROJECTS_DIR", ...)` works.

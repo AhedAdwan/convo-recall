@@ -226,7 +226,20 @@ class SystemdUserScheduler(Scheduler):
     def enable_linger(self, user: str | None = None) -> Result:
         user = user or os.environ.get("USER", "")
         if not user:
-            return Result(ok=False, message="USER not set; cannot enable linger")
+            # Fallback for environments where $USER isn't exported (cron,
+            # `docker exec` without `-e USER`, fresh systemd units). Uses
+            # the pwd database via UID — works without any env vars.
+            try:
+                import getpass
+                user = getpass.getuser()
+            except (ImportError, KeyError, OSError):
+                user = ""
+        if not user:
+            return Result(
+                ok=False,
+                message="could not derive current user (USER unset, "
+                        "getpass.getuser() failed); cannot enable linger",
+            )
         r = subprocess.run(
             ["loginctl", "enable-linger", user],
             capture_output=True, text=True,

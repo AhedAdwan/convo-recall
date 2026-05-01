@@ -435,6 +435,41 @@ def test_systemd_enable_linger_returns_failure_when_loginctl_errors(monkeypatch)
     assert "loginctl enable-linger" in result.message
 
 
+def test_systemd_enable_linger_falls_back_to_getpass_when_USER_unset(monkeypatch):
+    """Regression: docker exec / cron / fresh systemd units don't export USER.
+    Without the getpass fallback, linger silently fails with "USER not set",
+    leaving watchers vulnerable to dying at session end. The fix uses the
+    pwd database via UID — works without any env vars."""
+    import getpass
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.setattr(getpass, "getuser", lambda: "from-pwd")
+
+    rec = _RunRecorder({
+        ("loginctl", "enable-linger"): _ok(),
+    })
+    monkeypatch.setattr(subprocess, "run", rec)
+
+    result = SystemdUserScheduler().enable_linger()
+    assert result.ok is True, f"expected success, got: {result.message}"
+    assert "from-pwd" in result.message
+    # Verify loginctl was actually called with the pwd-derived username.
+    call = next(c for c in rec.calls if c[0] == "loginctl")
+    assert "from-pwd" in call
+
+
+def test_systemd_enable_linger_surfaces_clear_error_when_no_user_resolvable(monkeypatch):
+    """If both USER env AND getpass.getuser() fail, surface a useful message."""
+    import getpass
+    monkeypatch.delenv("USER", raising=False)
+    def _raise_keyerror():
+        raise KeyError("no pwd entry")
+    monkeypatch.setattr(getpass, "getuser", _raise_keyerror)
+
+    result = SystemdUserScheduler().enable_linger()
+    assert result.ok is False
+    assert "could not derive current user" in result.message
+
+
 def test_systemd_install_watcher_fails_loud_when_verify_warns(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "convo_recall.install.schedulers.systemd.scheduler_unit_dir",
