@@ -15,10 +15,52 @@
 #  11. backfills are no-ops when fully populated
 #  12. watch loop picks up appended content
 #  13. FTS-only fallback when sidecar is gone
+#  14. recall tail: reverse numbering, agent label, ago deltas, --json, --expand, --ascii
+#  15. safety gates: --purge-data, backfill-*, sandbox-script guard all default-deny
 #
 # Run:
 #   docker exec claude-sandbox bash /work/convo-recall/tests/sandbox-e2e-full.sh
 set -euo pipefail
+
+# ── DESTRUCTIVE-SCRIPT GUARD ─────────────────────────────────────────────────
+# This script wipes convo-recall state to test from a clean slate. Refuse to
+# run unless we're inside a sandbox: either a Docker container (has /.dockerenv)
+# or an explicit CONVO_RECALL_SANDBOX=1 override. Without this guard, a typo
+# like `bash tests/sandbox-test.sh` on the live host destroys real state.
+if [[ ! -f /.dockerenv && "${CONVO_RECALL_SANDBOX:-}" != "1" ]]; then
+    cat <<'WARN' >&2
+
+🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥
+☠️  DESTRUCTIVE SCRIPT — NOT INSIDE A SANDBOX  ☠️
+🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥
+
+This script wipes convo-recall state to test from a clean slate. It WILL:
+  📁 Delete the conversation DB at \$CONVO_RECALL_DB
+  ⚙️  Remove launchd / systemd / cron watchers
+  🪝 Strip convo-recall hook entries from claude / codex / gemini settings
+  💥 Kill any running embed sidecar
+
+If you are NOT inside the claude-sandbox Docker container, you WILL lose
+state on THIS host. There is NO undo.
+
+To run anyway (e.g. you have a one-off VM you don't care about):
+    CONVO_RECALL_SANDBOX=1 bash $0
+WARN
+    if [[ -t 0 ]]; then
+        printf '\n⚠️  Type "YES" (uppercase) to proceed anyway, anything else to abort: ' >&2
+        read -r _sandbox_guard_response
+        if [[ "$_sandbox_guard_response" != "YES" ]]; then
+            echo "" >&2
+            echo "✅ Aborted. Nothing changed." >&2
+            exit 0
+        fi
+    else
+        echo "" >&2
+        echo "✗ Refusing in non-interactive shell. Set CONVO_RECALL_SANDBOX=1 to override." >&2
+        exit 1
+    fi
+fi
+
 
 : "${CONVO_RECALL_SOCK:=/tmp/convo-recall/embed.sock}"
 : "${CONVO_RECALL_DB:=/root/.local/share/convo-recall/conversations.db}"
@@ -41,14 +83,14 @@ ok()    { green "  ✅ $current — $*"; }
 sec()   { current="$1"; echo; echo "═══ $1 ═══"; }
 
 # ── Shared fresh-state bootstrap ───────────────────────────────────────────────
-sec "0/13 bootstrap"
+sec "0/15 bootstrap"
 mkdir -p "$(dirname "$CONVO_RECALL_CONFIG")"
 echo '{"agents": ["claude", "gemini", "codex"]}' > "$CONVO_RECALL_CONFIG"
 rm -f "$CONVO_RECALL_DB" "$CONVO_RECALL_DB-wal" "$CONVO_RECALL_DB-shm"
 ok "fresh DB + 3-agent config"
 
 # ── 1. sidecar health ─────────────────────────────────────────────────────────
-sec "1/13 sidecar health"
+sec "1/15 sidecar health"
 healthz=$(curl --silent --unix-socket "$CONVO_RECALL_SOCK" http://localhost/healthz)
 echo "$healthz" \
   | "$PY" -c 'import json,sys; d=json.load(sys.stdin); assert d.get("dim")==1024 and "model" in d, d' \
@@ -56,7 +98,7 @@ echo "$healthz" \
 ok "sidecar reports model + dim=1024"
 
 # ── 2. agent detection ────────────────────────────────────────────────────────
-sec "2/13 detect_agents()"
+sec "2/15 detect_agents()"
 detect_out=$("$PY" -c "
 import sys; sys.path.insert(0, '${REPO_ROOT}/src')
 import convo_recall.ingest as i
@@ -69,7 +111,7 @@ echo "$detect_out" | grep -qE '^codex\s+[1-9]'  || fail "codex not detected"
 ok "all three agents detected with file_count > 0"
 
 # ── 3. config round-trip ──────────────────────────────────────────────────────
-sec "3/13 config save/load round-trip"
+sec "3/15 config save/load round-trip"
 "$PY" -c "
 import os, sys
 sys.path.insert(0, '${REPO_ROOT}/src')
@@ -85,7 +127,7 @@ rm -f /tmp/cr-roundtrip.json
 ok "save_config + load_config preserve {'agents': [...]} exactly"
 
 # ── 4. fresh ingest of all three agents ───────────────────────────────────────
-sec "4/13 fresh 3-agent ingest"
+sec "4/15 fresh 3-agent ingest"
 ingest_log=$(mktemp)
 "$RECALL" ingest > "$ingest_log" 2>&1 || { cat "$ingest_log"; fail "exit nonzero"; }
 grep -q "Traceback (most recent call last)" "$ingest_log" \
@@ -102,7 +144,7 @@ print(con.execute('SELECT COUNT(*) FROM messages').fetchone()[0])
 ok "$total_inserted messages from 3 agents, no tracebacks"
 
 # ── 5. idempotent re-ingest ───────────────────────────────────────────────────
-sec "5/13 idempotent re-ingest"
+sec "5/15 idempotent re-ingest"
 before=$total_inserted
 "$RECALL" ingest > /dev/null 2>&1
 after=$("$PY" -c "
@@ -117,14 +159,14 @@ print(con.execute('SELECT COUNT(*) FROM messages').fetchone()[0])
 ok "second ingest added 0 rows ($after total unchanged)"
 
 # ── 6. --agent X scoped ingest ────────────────────────────────────────────────
-sec "6/13 recall ingest --agent codex"
+sec "6/15 recall ingest --agent codex"
 out=$("$RECALL" ingest --agent codex 2>&1)
 # Should be 0 new (already ingested) but should not error
 echo "$out" | grep -q "Traceback" && fail "traceback in --agent codex ingest"
 ok "per-agent ingest accepted, no new rows expected"
 
 # ── 7. legacy-schema migration ────────────────────────────────────────────────
-sec "7/13 migration on legacy schema (no agent column)"
+sec "7/15 migration on legacy schema (no agent column)"
 LEGACY_DB=/tmp/cr-legacy-test.db
 rm -f "$LEGACY_DB"*
 "$PY" -c "
@@ -163,7 +205,7 @@ rm -f "$LEGACY_DB"*
 ok "ALTER TABLE + FTS rebuild + agent backfill all worked"
 
 # ── 8a. search --all-projects with all 3 tags ────────────────────────────────
-sec "8a/13 search --all-projects shows all 3 tags"
+sec "8a/15 search --all-projects shows all 3 tags"
 all_log=$(mktemp)
 "$RECALL" search "the" --all-projects -n 50 -c 0 > "$all_log" 2>&1
 for agent in claude gemini codex; do
@@ -172,7 +214,7 @@ done
 ok "all 3 tags present"
 
 # ── 8b. --agent X exclusivity ────────────────────────────────────────────────
-sec "8b/13 --agent X is exclusive"
+sec "8b/15 --agent X is exclusive"
 for agent in claude gemini codex; do
   out=$(mktemp)
   "$RECALL" search "the" --agent "$agent" --all-projects -n 50 -c 0 > "$out" 2>&1 || true
@@ -187,7 +229,7 @@ done
 ok "no agent tag leakage with --agent X"
 
 # ── 8c. --project filter ──────────────────────────────────────────────────────
-sec "8c/13 --project X filter (without --all-projects)"
+sec "8c/15 --project X filter (without --all-projects)"
 # Note: convo-recall CLI currently has surprising behavior where --all-projects
 # silently nullifies an explicit --project X. So we test --project alone here.
 # (See E2E_FINDING_001 in TECH_DEBT — argparse logic bug in cli.py.)
@@ -202,13 +244,13 @@ fi
 ok "project filter restricted to app-codex"
 
 # ── 8d. --context N before/after ──────────────────────────────────────────────
-sec "8d/13 --context 1 shows before/after lines"
+sec "8d/15 --context 1 shows before/after lines"
 ctx_out=$("$RECALL" search "the" --all-projects -n 1 -c 1 2>&1)
 echo "$ctx_out" | grep -qE "↑|↓" || { echo "$ctx_out"; fail "--context 1 produced no ↑/↓ lines"; }
 ok "context lines printed"
 
 # ── 8e. --recent decay ────────────────────────────────────────────────────────
-sec "8e/13 --recent flag accepted"
+sec "8e/15 --recent flag accepted"
 "$RECALL" search "the" --all-projects --recent -n 3 -c 0 > /tmp/recent.log 2>&1 \
   || { cat /tmp/recent.log; fail "--recent crashed"; }
 grep -q "\[hybrid+recent search\]" /tmp/recent.log \
@@ -216,7 +258,7 @@ grep -q "\[hybrid+recent search\]" /tmp/recent.log \
 ok "--recent runs and reports recent-mode header"
 
 # ── 8f. cwd auto-scope ────────────────────────────────────────────────────────
-sec "8f/13 cwd auto-scope (slug_from_cwd)"
+sec "8f/15 cwd auto-scope (slug_from_cwd)"
 mkdir -p /Users/ahed_isir/Projects/app-codex
 cd /Users/ahed_isir/Projects/app-codex
 auto=$("$RECALL" search "the" -n 3 -c 0 2>&1 || true)
@@ -227,14 +269,14 @@ echo "$auto" | grep -qE "(\[app-codex\]|No messages found for)" \
 ok "cwd-derived project filter active when no --all-projects"
 
 # ── 8g. no-results query (via nonexistent project filter) ────────────────────
-sec "8g/13 no-results path via nonexistent --project"
+sec "8g/15 no-results path via nonexistent --project"
 "$RECALL" search "anything" --project no_such_project_zwxq 2>&1 \
   | grep -q "No messages found" \
   || fail "expected 'No messages found' for nonexistent project"
 ok "no-results path"
 
 # ── 9. per-agent stats + embed coverage ───────────────────────────────────────
-sec "9/13 stats + embed coverage"
+sec "9/15 stats + embed coverage"
 stats_log=$(mktemp)
 "$RECALL" stats > "$stats_log"
 embed_pct=$(grep "^Embedded" "$stats_log" | grep -oE "[0-9]+%" | head -1 | tr -d '%')
@@ -246,7 +288,7 @@ done
 ok "embed=$embed_pct%, all 3 agents counted"
 
 # ── 10. backfill commands are no-ops when populated ───────────────────────────
-sec "10/13 backfills are idempotent no-ops"
+sec "10/15 backfills are idempotent no-ops"
 for cmd in embed-backfill backfill-clean tool-error-backfill; do
   out=$("$RECALL" $cmd 2>&1 || true)
   echo "$out" | grep -q "Traceback" && { echo "$out"; fail "traceback in $cmd"; }
@@ -254,7 +296,7 @@ done
 ok "embed-backfill, backfill-clean, tool-error-backfill all clean"
 
 # ── 11. watch loop picks up appended content ─────────────────────────────────
-sec "11/13 watch loop picks up new content"
+sec "11/15 watch loop picks up new content"
 "$RECALL" watch --interval 3 --verbose > /tmp/watch.log 2>&1 &
 WATCH_PID=$!
 trap 'kill $WATCH_PID 2>/dev/null || true' EXIT
@@ -271,7 +313,7 @@ trap - EXIT
 ok "watch loop ingested appended content within 8s"
 
 # ── 12. FTS-only fallback when sidecar gone ──────────────────────────────────
-sec "12/13 FTS-only fallback when sidecar is missing"
+sec "12/15 FTS-only fallback when sidecar is missing"
 SAVED_SOCK="$CONVO_RECALL_SOCK"
 export CONVO_RECALL_SOCK=/tmp/no-such-socket-here.sock
 fts_only_out=$("$RECALL" search "the" --all-projects -n 3 -c 0 2>&1)
@@ -282,10 +324,185 @@ echo "$fts_only_out" | grep -E "^\[" | grep -qE "claude|gemini|codex" \
 export CONVO_RECALL_SOCK="$SAVED_SOCK"
 ok "search degrades to FTS-only when sidecar absent"
 
-# ── 13. summary ──────────────────────────────────────────────────────────────
-sec "13/13 summary"
+# ── 13. recall tail ───────────────────────────────────────────────────────────
+sec "13/15 recall tail (reverse numbering, ago deltas, agent labels)"
+
+# Pick a session_id known to have at least one user + one assistant message.
+# The fresh ingest in section 4 imported real fixtures from all three agents,
+# so any session with mixed roles will do.
+tail_session=$("$PY" -c "
+import os, sys
+sys.path.insert(0, '${REPO_ROOT}/src')
+os.environ['CONVO_RECALL_DB']='$CONVO_RECALL_DB'
+import convo_recall.ingest as i
+con = i.open_db()
+row = con.execute('''
+    SELECT m.session_id
+    FROM messages m
+    GROUP BY m.session_id
+    HAVING COUNT(DISTINCT m.role) >= 2
+    ORDER BY MAX(m.timestamp) DESC
+    LIMIT 1
+''').fetchone()
+print(row[0] if row else '')
+")
+[[ -n "$tail_session" ]] || fail "no session has mixed user+assistant messages"
+
+# 13a — default formatted output: header + at least one row, no traceback
+tail_out=$("$RECALL" tail 5 --session "$tail_session" 2>&1) \
+  || { echo "$tail_out"; fail "recall tail exited non-zero"; }
+echo "$tail_out" | grep -q "Traceback" && { echo "$tail_out"; fail "traceback in tail output"; }
+echo "$tail_out" | grep -q "^session " || { echo "$tail_out"; fail "missing session header line"; }
+echo "$tail_out" | grep -qE "messages " || { echo "$tail_out"; fail "header missing 'messages' count"; }
+
+# 13b — reverse numbering: #1 must appear, and at least one row prefix must use it
+echo "$tail_out" | grep -qE "^#1 " || { echo "$tail_out"; fail "expected '#1 ' row (newest = #1)"; }
+
+# 13c — agent label: 'assistant' must NOT appear as a speaker; the actual
+# agent name (claude / codex / gemini) MUST.
+echo "$tail_out" | grep -qE "(claude|codex|gemini)" \
+  || { echo "$tail_out"; fail "no agent name in tail output"; }
+# A speaker label of "assistant" would appear with surrounding whitespace
+# and the bar; a substring match is enough to flag it.
+echo "$tail_out" | grep -qE " assistant +[│|]" \
+  && { echo "$tail_out"; fail "raw 'assistant' role label leaked into output"; }
+
+# 13d — 'ago' delta string from current time
+echo "$tail_out" | grep -qE "(now|[0-9]+(s|m|h|d|w) ago)" \
+  || { echo "$tail_out"; fail "no 'X ago' / 'now' delta in tail output"; }
+
+# 13e — JSON shape exposes role, content, agent, timestamp
+tail_json=$("$RECALL" tail 3 --session "$tail_session" --json 2>&1) \
+  || { echo "$tail_json"; fail "recall tail --json exited non-zero"; }
+echo "$tail_json" | "$PY" -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+assert data['session_id'], 'missing session_id'
+msgs = data['messages']
+assert len(msgs) >= 1, 'no messages in JSON'
+for m in msgs:
+    for k in ('role', 'content', 'timestamp', 'agent'):
+        assert k in m, f'JSON message missing {k}: {m}'
+print('json-ok')
+" | grep -q "^json-ok$" || fail "JSON shape missing required keys"
+
+# 13f — --expand bypasses truncation: pick a session with a long message,
+# verify --expand strips the '[+N more]' marker for that turn.
+long_session=$("$PY" -c "
+import os, sys
+sys.path.insert(0, '${REPO_ROOT}/src')
+os.environ['CONVO_RECALL_DB']='$CONVO_RECALL_DB'
+import convo_recall.ingest as i
+con = i.open_db()
+row = con.execute(
+    'SELECT session_id FROM messages WHERE LENGTH(content) > 300 '
+    'ORDER BY timestamp DESC LIMIT 1'
+).fetchone()
+print(row[0] if row else '')
+")
+if [[ -n "$long_session" ]]; then
+    truncated_out=$("$RECALL" tail 1 --session "$long_session" 2>&1)
+    echo "$truncated_out" | grep -q "more]" \
+      || fail "expected truncation marker on long message (--width default 220)"
+    expanded_out=$("$RECALL" tail 1 --session "$long_session" --expand 1 2>&1)
+    echo "$expanded_out" | grep -q "more]" \
+      && fail "--expand 1 should bypass truncation but '[+N more]' still present"
+    ok "tail truncates by default; --expand bypasses (long-message session)"
+else
+    ok "tail truncation tested elsewhere (no >300-char message in fixtures)"
+fi
+
+# 13g — --ascii swaps Unicode glyphs for ASCII fallbacks
+ascii_out=$("$RECALL" tail 3 --session "$tail_session" --ascii 2>&1)
+echo "$ascii_out" | grep -q "│" \
+  && { echo "$ascii_out"; fail "--ascii output still contains Unicode pipe"; }
+echo "$ascii_out" | grep -q " | " \
+  || { echo "$ascii_out"; fail "--ascii output missing ASCII pipe"; }
+
+# 13h — --all-projects picks the latest session globally (no project filter)
+all_out=$("$RECALL" tail 1 --all-projects 2>&1) \
+  || { echo "$all_out"; fail "--all-projects exited non-zero"; }
+echo "$all_out" | grep -q "^session " \
+  || { echo "$all_out"; fail "--all-projects missing header"; }
+
+ok "tail: header / reverse-# / agent label / ago delta / JSON / ascii / --all-projects"
+
+# ── 14. safety gates: every destructive command default-denies ─────────────────
+sec "14/15 safety gates default-deny without --confirm"
+
+# 14a — `recall uninstall --purge-data` with no TTY and no --confirm MUST
+#       leave the DB intact and print DRY-RUN.
+db_size_before=$(stat -c%s "$CONVO_RECALL_DB" 2>/dev/null || stat -f%z "$CONVO_RECALL_DB")
+purge_out=$("$RECALL" uninstall --purge-data </dev/null 2>&1) \
+  || { echo "$purge_out"; fail "uninstall --purge-data exited non-zero"; }
+echo "$purge_out" | grep -qiE "dry.?run" \
+  || { echo "$purge_out"; fail "expected 'DRY-RUN' marker in --purge-data output"; }
+[[ -f "$CONVO_RECALL_DB" ]] \
+  || fail "DB was DELETED in dry-run! Safety gate broken."
+db_size_after=$(stat -c%s "$CONVO_RECALL_DB" 2>/dev/null || stat -f%z "$CONVO_RECALL_DB")
+[[ "$db_size_before" -eq "$db_size_after" ]] \
+  || fail "DB size changed during dry-run (before=$db_size_before, after=$db_size_after)"
+
+# Side-effect: --purge-data walks schedulers + hooks BEFORE the purge gate
+# (existing design). Re-install so future re-runs of this script start clean.
+"$RECALL" install -y > /dev/null 2>&1 || true
+ok "14a uninstall --purge-data without --confirm did NOT delete the DB"
+
+# 14b — backfill-clean default-deny
+msg_count_before=$("$PY" -c "
+import os, sys; sys.path.insert(0, '${REPO_ROOT}/src')
+os.environ['CONVO_RECALL_DB']='$CONVO_RECALL_DB'
+import convo_recall.ingest as i
+con = i.open_db()
+print(con.execute('SELECT COUNT(*) FROM messages').fetchone()[0])
+")
+"$RECALL" backfill-clean </dev/null > /dev/null 2>&1 \
+  || fail "backfill-clean exited non-zero in dry-run"
+msg_count_after=$("$PY" -c "
+import os, sys; sys.path.insert(0, '${REPO_ROOT}/src')
+os.environ['CONVO_RECALL_DB']='$CONVO_RECALL_DB'
+import convo_recall.ingest as i
+con = i.open_db()
+print(con.execute('SELECT COUNT(*) FROM messages').fetchone()[0])
+")
+[[ "$msg_count_before" -eq "$msg_count_after" ]] \
+  || fail "backfill-clean changed row count in dry-run ($msg_count_before → $msg_count_after)"
+ok "14b backfill-clean without --confirm did NOT mutate row count"
+
+# 14c — backfill-redact default-deny
+"$RECALL" backfill-redact </dev/null > /dev/null 2>&1 \
+  || fail "backfill-redact exited non-zero in dry-run"
+ok "14c backfill-redact without --confirm exited cleanly"
+
+# 14d — chunk-backfill default-deny
+"$RECALL" chunk-backfill </dev/null > /dev/null 2>&1 \
+  || fail "chunk-backfill exited non-zero in dry-run"
+ok "14d chunk-backfill without --confirm exited cleanly"
+
+# 14e — sandbox-script guard block must be present in every destructive script.
+# (We can't directly test the refusal here because /.dockerenv exists in the
+# sandbox; structural check ensures the guard isn't accidentally removed.)
+guard_pattern='DESTRUCTIVE-SCRIPT GUARD'
+for f in tests/sandbox-e2e-full.sh tests/sandbox-hooks-e2e.sh \
+         tests/sandbox-linux-port-e2e.sh tests/sandbox-multi-agent.sh \
+         tests/sandbox-test.sh; do
+    grep -q "$guard_pattern" "${REPO_ROOT}/$f" \
+      || fail "guard block missing from $f — destructive script unprotected"
+done
+ok "14e sandbox-script guard block present in all 5 destructive scripts"
+
+# 14f — --confirm bypasses the prompt. If argparse plumbing for --confirm
+# regresses, the command hangs on stdin read; the timeout catches that.
+timeout 30 "$RECALL" chunk-backfill --confirm </dev/null > /dev/null 2>&1
+rc=$?
+[[ $rc -ne 124 ]] || fail "chunk-backfill --confirm hung — argparse plumbing for --confirm regressed"
+[[ $rc -eq 0 ]]   || fail "chunk-backfill --confirm crashed (rc=$rc)"
+ok "14f --confirm bypasses the prompt (no hang on stdin)"
+
+# ── 15. summary ──────────────────────────────────────────────────────────────
+sec "15/15 summary"
 "$RECALL" stats
 green ""
 green "=========================================="
-green "  ALL 13 SECTIONS PASSED — convo-recall E2E"
+green "  ALL 15 SECTIONS PASSED — convo-recall E2E"
 green "=========================================="
