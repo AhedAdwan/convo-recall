@@ -25,7 +25,12 @@ set -euo pipefail
 : "${CONVO_RECALL_CONFIG:=/root/.local/share/convo-recall/config.json}"
 export CONVO_RECALL_SOCK CONVO_RECALL_DB CONVO_RECALL_CONFIG
 
-VENV=/work/convo-recall/.venv
+# Repo root resolved from this script's location so the harness works
+# regardless of where the repo is mounted (was hardcoded to /work/...
+# in v1; current claude-sandbox uses /workspace). Override with
+# REPO_ROOT or VENV env vars if needed.
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
 RECALL="$VENV/bin/recall"
 PY="$VENV/bin/python3"
 
@@ -53,7 +58,7 @@ ok "sidecar reports model + dim=1024"
 # ── 2. agent detection ────────────────────────────────────────────────────────
 sec "2/13 detect_agents()"
 detect_out=$("$PY" -c "
-import sys; sys.path.insert(0, '/work/convo-recall/src')
+import sys; sys.path.insert(0, '${REPO_ROOT}/src')
 import convo_recall.ingest as i
 for a in i.detect_agents(): print(a['name'], a['file_count'])
 ")
@@ -67,7 +72,7 @@ ok "all three agents detected with file_count > 0"
 sec "3/13 config save/load round-trip"
 "$PY" -c "
 import os, sys
-sys.path.insert(0, '/work/convo-recall/src')
+sys.path.insert(0, '${REPO_ROOT}/src')
 os.environ['CONVO_RECALL_CONFIG']='/tmp/cr-roundtrip.json'
 import convo_recall.ingest as i
 i._CONFIG_PATH = __import__('pathlib').Path(os.environ['CONVO_RECALL_CONFIG'])
@@ -87,7 +92,7 @@ grep -q "Traceback (most recent call last)" "$ingest_log" \
   && { cat "$ingest_log"; fail "Python traceback in stderr"; }
 total_inserted=$("$PY" -c "
 import os, sys
-sys.path.insert(0, '/work/convo-recall/src')
+sys.path.insert(0, '${REPO_ROOT}/src')
 os.environ['CONVO_RECALL_DB']='$CONVO_RECALL_DB'
 import convo_recall.ingest as i
 con = i.open_db()
@@ -102,7 +107,7 @@ before=$total_inserted
 "$RECALL" ingest > /dev/null 2>&1
 after=$("$PY" -c "
 import os, sys
-sys.path.insert(0, '/work/convo-recall/src')
+sys.path.insert(0, '${REPO_ROOT}/src')
 os.environ['CONVO_RECALL_DB']='$CONVO_RECALL_DB'
 import convo_recall.ingest as i
 con = i.open_db()
@@ -145,7 +150,7 @@ con.execute('INSERT INTO messages(uuid, session_id, project_slug, role, content)
 CONVO_RECALL_DB=$LEGACY_DB "$PY" -c "
 import os, sys
 os.environ['CONVO_RECALL_DB']='$LEGACY_DB'
-sys.path.insert(0, '/work/convo-recall/src')
+sys.path.insert(0, '${REPO_ROOT}/src')
 import convo_recall.ingest as i
 con = i.open_db()
 agent = con.execute(\"SELECT agent FROM messages\").fetchone()[0]

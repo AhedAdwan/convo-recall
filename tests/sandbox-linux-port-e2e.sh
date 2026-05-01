@@ -626,6 +626,118 @@ PY
     pass_stage
 fi
 
+# ─── Stage 10: full-feature e2e (sandbox-e2e-full.sh) ─────────────────────────
+#
+# Existing 13-section script covering sidecar / agent detection / config /
+# ingest / re-ingest / per-agent ingest / legacy migration / search flag
+# matrix / cwd auto-scope / stats / backfills / watch loop / FTS-only.
+#
+# Was orphaned (never wired into a runner) — wires up now. Skips
+# gracefully if the embed sidecar's UDS isn't reachable (Stage 1 of that
+# script asserts it, so a missing sock just means we can't run this).
+
+STAGE=10
+stage 10 "full-feature e2e (search/ingest/stats/watch surface)"
+
+if [[ ! -S "${CONVO_RECALL_SOCK:-/tmp/convo-recall/embed.sock}" ]]; then
+    skip_stage "embed sidecar not running (set CONVO_RECALL_SOCK or run 'recall serve' first)"
+else
+    # Derive VENV from the resolved recall binary so this works regardless
+    # of whether the venv lives inside the repo (default in sandbox-e2e-
+    # full.sh) or alongside it (current claude-sandbox layout).
+    _venv_dir="$(dirname "$(dirname "${RECALL}")")"
+    if ! REPO_ROOT="${REPO_ROOT}" VENV="${_venv_dir}" \
+            bash "${REPO_ROOT}/tests/sandbox-e2e-full.sh" \
+            >/tmp/cr-full.$$.log 2>&1; then
+        tail -60 /tmp/cr-full.$$.log >&2
+        rm -f /tmp/cr-full.$$.log
+        fail "sandbox-e2e-full.sh failed — see tail above"
+    fi
+    rm -f /tmp/cr-full.$$.log
+    pass_stage
+fi
+
+# ─── Stage 11: hook integration e2e (sandbox-hooks-e2e.sh) ───────────────────
+#
+# Existing 4-section script: hook script smoke + Claude/Codex/Gemini
+# wiring + model-receives-injected-context end-to-end probe. The model
+# checks (4/4) need real API creds for at least one CLI; the script
+# already skips per-CLI when creds are absent.
+
+STAGE=11
+stage 11 "hook integration (Claude/Codex/Gemini)"
+
+if ! bash "${REPO_ROOT}/tests/sandbox-hooks-e2e.sh" >/tmp/cr-hooks.$$.log 2>&1; then
+    tail -40 /tmp/cr-hooks.$$.log >&2
+    rm -f /tmp/cr-hooks.$$.log
+    fail "sandbox-hooks-e2e.sh failed — see tail above"
+else
+    rm -f /tmp/cr-hooks.$$.log
+    pass_stage
+fi
+
+# ─── Stage 12: adversarial-input regression for F-1 / F-9 / F-10 ─────────────
+#
+# Three real bugs caught by real agent sessions. These specific failure
+# modes are unit-tested too, but a stage-level test exercises the full
+# CLI surface — the only way to prove the fixes survive future
+# refactors that touch the actual `recall` invocation path.
+
+STAGE=12
+stage 12 "adversarial-input regression (F-1 / F-9 / F-10)"
+
+# 12a — F-1: hyphenated cwd auto-scope. cd into a hyphenated dir and
+# verify search returns hits (not zero) for content that's in the DB.
+HYPHEN_DIR="/tmp/Projects/app-claude"
+mkdir -p "${HYPHEN_DIR}"
+hyphen_out=$(cd "${HYPHEN_DIR}" && "${RECALL}" search "the" -n 5 -c 0 2>&1 || true)
+if echo "${hyphen_out}" | grep -q "No messages found for project"; then
+    # Acceptable IF the DB legitimately has no rows under that slug. Check
+    # for the did-you-mean hint, which would surface if the slug is wrong.
+    if echo "${hyphen_out}" | grep -q "Did you mean"; then
+        fail "F-1 regression: hyphenated cwd produced 0 results AND did-you-mean hint, slug mismatch is back"
+    fi
+    echo "  · F-1: no rows under app_claude in this sandbox (legitimate)"
+fi
+# Either way, no traceback should occur.
+echo "${hyphen_out}" | grep -q "Traceback" && fail "F-1 regression: traceback on hyphenated cwd search"
+
+# 12b — F-9: FTS5-special-char queries shouldn't crash.
+for q in "app-gemini" ".*" "url:https" "(query)" "AND OR NOT" "foo*bar"; do
+    out=$("${RECALL}" search "${q}" --all-projects -n 3 -c 0 2>&1 || true)
+    if echo "${out}" | grep -qE "syntax error|no such column|apsw\."; then
+        echo "${out}" >&2
+        fail "F-9 regression: query ${q@Q} crashed FTS5"
+    fi
+done
+
+# 12c — F-10: chmod the DB parent read-only, search should fall back
+# gracefully to read-only mode with a warning, not a traceback.
+DB_DIR="$(dirname "$("${PY:-python3}" -c '
+from convo_recall.ingest import DB_PATH
+print(DB_PATH)
+' 2>/dev/null || echo /root/.local/share/convo-recall/conversations.db)")"
+if [[ -d "${DB_DIR}" ]]; then
+    saved_perms=$(stat -c %a "${DB_DIR}" 2>/dev/null || stat -f %p "${DB_DIR}" | tail -c 4)
+    chmod 0500 "${DB_DIR}"
+    sandbox_out=$("${RECALL}" search "anything" --all-projects -n 3 -c 0 2>&1 || true)
+    chmod "${saved_perms}" "${DB_DIR}" 2>/dev/null || chmod 0700 "${DB_DIR}"
+    if echo "${sandbox_out}" | grep -q "Traceback"; then
+        echo "${sandbox_out}" >&2
+        fail "F-10 regression: sandboxed env triggered traceback"
+    fi
+    if ! echo "${sandbox_out}" | grep -q "DB write access denied"; then
+        # Only enforce the warning when it actually had to fall back. On
+        # macOS host running as the owner, chmod 0500 doesn't always
+        # block apsw; if WAL succeeded, no warning expected.
+        echo "  · F-10: WAL succeeded under chmod 0500 (host kernel may not enforce)"
+    fi
+else
+    echo "  · F-10: DB dir not found, skipping chmod check"
+fi
+
+pass_stage
+
 echo
 echo "════════════════════════════════════════════════════════════"
 echo "All stages passed."

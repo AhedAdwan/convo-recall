@@ -16,7 +16,11 @@
 
 set -uo pipefail
 
-HOOK_SCRIPT=/work/convo-recall/src/convo_recall/hooks/conversation-memory.sh
+# Repo root resolved from this script's location — was hardcoded to
+# /work/convo-recall in v1; current claude-sandbox uses /workspace.
+# Override with REPO_ROOT env var if needed.
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+HOOK_SCRIPT="${REPO_ROOT}/src/convo_recall/hooks/conversation-memory.sh"
 LOG_DIR=/tmp/convo-recall-hooks
 mkdir -p "$LOG_DIR"
 rm -f "$LOG_DIR"/*.log
