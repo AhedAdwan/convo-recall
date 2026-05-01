@@ -4,6 +4,46 @@
 # Run via: docker exec claude-sandbox bash /work/convo-recall/tests/sandbox-test.sh
 set -euo pipefail
 
+# ── DESTRUCTIVE-SCRIPT GUARD ─────────────────────────────────────────────────
+# This script wipes convo-recall state to test from a clean slate. Refuse to
+# run unless we're inside a sandbox: either a Docker container (has /.dockerenv)
+# or an explicit CONVO_RECALL_SANDBOX=1 override. Without this guard, a typo
+# like `bash tests/sandbox-test.sh` on the live host destroys real state.
+if [[ ! -f /.dockerenv && "${CONVO_RECALL_SANDBOX:-}" != "1" ]]; then
+    cat <<'WARN' >&2
+
+🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥
+☠️  DESTRUCTIVE SCRIPT — NOT INSIDE A SANDBOX  ☠️
+🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥
+
+This script wipes convo-recall state to test from a clean slate. It WILL:
+  📁 Delete the conversation DB at \$CONVO_RECALL_DB
+  ⚙️  Remove launchd / systemd / cron watchers
+  🪝 Strip convo-recall hook entries from claude / codex / gemini settings
+  💥 Kill any running embed sidecar
+
+If you are NOT inside the claude-sandbox Docker container, you WILL lose
+state on THIS host. There is NO undo.
+
+To run anyway (e.g. you have a one-off VM you don't care about):
+    CONVO_RECALL_SANDBOX=1 bash $0
+WARN
+    if [[ -t 0 ]]; then
+        printf '\n⚠️  Type "YES" (uppercase) to proceed anyway, anything else to abort: ' >&2
+        read -r _sandbox_guard_response
+        if [[ "$_sandbox_guard_response" != "YES" ]]; then
+            echo "" >&2
+            echo "✅ Aborted. Nothing changed." >&2
+            exit 0
+        fi
+    else
+        echo "" >&2
+        echo "✗ Refusing in non-interactive shell. Set CONVO_RECALL_SANDBOX=1 to override." >&2
+        exit 1
+    fi
+fi
+
+
 PKG=/work/convo-recall
 FIXTURES=$PKG/tests/fixtures
 PROJECTS=~/.claude/projects
