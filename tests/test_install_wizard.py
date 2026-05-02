@@ -187,20 +187,26 @@ def test_wizard_prompts_for_ingest_hooks():
 
 def test_wizard_renumbered_steps_show_5_total():
     """All five step headers appear in order so the renumber is visible
-    and old `Step N/4` strings don't leak through."""
+    and old `Step N/4` strings don't leak through. Step 3 (embed sidecar)
+    auto-skips without a [Y/n] when [embeddings] extra isn't installed
+    (CI default), so we expect either [Y/n] OR the next label."""
     wizard = _spawn(["install", "--scheduler", "polling", "--dry-run"])
     try:
         wizard.expect("Step 1/5: indexing watchers")
-        # Each step prints AFTER the previous prompt is answered.
         for label in (
             "Step 2/5: response-completion ingest hooks",
             "Step 3/5: hybrid vector",
             "Step 4/5: pre-prompt search hooks",
             "Step 5/5: initial ingest",
         ):
-            wizard.expect(r"\[Y/n\]")
-            wizard.sendline("y")
-            wizard.expect(label)
+            while True:
+                idx = wizard.expect([r"\[Y/n\]", label, pexpect.EOF], timeout=15)
+                if idx == 0:
+                    wizard.sendline("y")
+                elif idx == 1:
+                    break
+                else:
+                    pytest.fail(f"wizard ended before reaching {label!r}")
         while True:
             idx = wizard.expect([r"\[Y/n\]", pexpect.EOF], timeout=15)
             if idx == 0:
