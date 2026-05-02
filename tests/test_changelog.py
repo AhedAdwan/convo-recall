@@ -19,56 +19,47 @@ def test_changelog_has_unreleased_entry_or_v030():
 
 
 def test_changelog_mentions_linux_port():
-    """The newest CHANGELOG entry must surface the cross-platform port —
-    one of {Linux, systemd, cross-platform} should appear before the
-    next versioned heading."""
+    """The CHANGELOG must surface the cross-platform port —
+    one of {Linux, systemd, cross-platform} should appear in the first
+    non-empty entry (Unreleased after a fresh release is empty; the
+    release-boundary entry like [0.3.0] carries the content)."""
     text = _read()
-    # Find the top entry (Unreleased or 0.3.0) and slice up to the next `## [`.
-    head_markers = ("## [Unreleased]", "## [0.3.0]")
-    start = -1
-    for marker in head_markers:
-        idx = text.find(marker)
-        if idx != -1:
-            start = idx + len(marker)
-            break
-    assert start != -1, "could not locate top changelog entry"
-
-    # Slice until next `## [` heading.
-    rest = text[start:]
-    next_heading = rest.find("\n## [")
-    if next_heading != -1:
-        section = rest[:next_heading]
-    else:
-        section = rest
-
     keywords = ("Linux", "systemd", "cross-platform")
-    assert any(k in section for k in keywords), (
-        f"top changelog entry must mention one of {keywords}; "
-        f"section was:\n{section}"
+    for marker in ("## [Unreleased]", "## [0.3.0]"):
+        idx = text.find(marker)
+        if idx == -1:
+            continue
+        rest = text[idx + len(marker):]
+        next_heading = rest.find("\n## [")
+        section = rest[:next_heading] if next_heading != -1 else rest
+        if any(k in section for k in keywords):
+            return  # passes — first section with the keywords
+    raise AssertionError(
+        f"no top entry mentions any of {keywords}"
     )
 
 
 def test_changelog_has_project_id_entry():
-    """Post-v4: CHANGELOG announces stable project_id under Unreleased."""
+    """Post-v4: CHANGELOG announces stable project_id under [0.3.0]."""
     text = _read()
-    after = text.split("## [Unreleased]", 1)[1]
-    unreleased = after.split("\n## [", 1)[0]
-    assert "project_id" in unreleased, "Unreleased block must mention project_id"
-    assert "display_name" in unreleased, "Unreleased block must mention display_name"
-    assert "v4" in unreleased.lower() or "_MIGRATION_PROJECT_ID" in unreleased, \
-        "Unreleased block must reference the v4 migration"
+    after = text.split("## [0.3.0]", 1)[1]
+    section = after.split("\n## [", 1)[0]
+    assert "project_id" in section, "[0.3.0] block must mention project_id"
+    assert "display_name" in section, "[0.3.0] block must mention display_name"
+    assert "v4" in section.lower() or "_MIGRATION_PROJECT_ID" in section, \
+        "[0.3.0] block must reference the v4 migration"
 
 
 def test_changelog_documents_ingest_hook():
-    """Phase 1 hook-driven ingest: Unreleased must announce the new hook,
+    """Phase 1 hook-driven ingest: [0.3.0] must announce the new hook,
     the Codex caveat, and the opt-out env var."""
     text = _read()
-    after = text.split("## [Unreleased]", 1)[1]
-    unreleased = after.split("\n## [", 1)[0]
-    assert "Response-completion ingest hooks" in unreleased, \
-        "Unreleased block missing the ingest-hook announcement"
-    assert "Codex" in unreleased, "Unreleased block should mention the Codex caveat"
-    assert "CONVO_RECALL_INGEST_HOOK" in unreleased, \
-        "Unreleased block should document the opt-out env var"
-    assert "--kind" in unreleased, \
-        "Unreleased block should mention the new --kind CLI flag"
+    after = text.split("## [0.3.0]", 1)[1]
+    section = after.split("\n## [", 1)[0]
+    assert "Response-completion ingest hooks" in section, \
+        "[0.3.0] block missing the ingest-hook announcement"
+    assert "Codex" in section, "[0.3.0] block should mention the Codex caveat"
+    assert "CONVO_RECALL_INGEST_HOOK" in section, \
+        "[0.3.0] block should document the opt-out env var"
+    assert "--kind" in section, \
+        "[0.3.0] block should mention the new --kind CLI flag"

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-05-02
+
 ### Added
 - **Response-completion ingest hooks** — convo-recall now installs a sibling hook (`conversation-ingest.sh`) on each agent CLI's response-end event (`Stop` for Claude/Codex, `AfterAgent` for Gemini). When your agent finishes a turn, ingest fires within ~50ms (background-detached, lock-file dedup'd to a 5-second window). Closes the long-standing Linux gap where systemd `.path` units silently missed appends inside existing project subdirs (`PathChanged=` is non-recursive — see TD-003).
 - `recall install-hooks --kind {memory,ingest,both}` flag (default: `both`); same flag on `recall uninstall-hooks`.
