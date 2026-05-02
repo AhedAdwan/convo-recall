@@ -1436,6 +1436,13 @@ def test_stats_friendly_message_when_chain_active(db, tmp_path, monkeypatch, cap
     fake_sock.touch()
     monkeypatch.setattr(ingest, "EMBED_SOCK", fake_sock)
 
+    # CI doesn't install the `[embeddings]` extra, so `sentence_transformers`
+    # isn't importable. Inject a stub so the `extra_installed = True` branch
+    # fires — same as on a developer machine with the extra installed.
+    import sys, types
+    if "sentence_transformers" not in sys.modules:
+        sys.modules["sentence_transformers"] = types.ModuleType("sentence_transformers")
+
     # Simulate an active backfill chain.
     from convo_recall import _progress
     monkeypatch.setattr(_progress, "_progress_path", lambda: tmp_path / "progress.json")
@@ -1466,6 +1473,12 @@ def test_stats_guidance_when_no_chain_running(db, tmp_path, monkeypatch, capsys)
     fake_sock = tmp_path / "embed.sock"
     fake_sock.touch()
     monkeypatch.setattr(ingest, "EMBED_SOCK", fake_sock)
+
+    # CI lacks `[embeddings]` extra; stub sentence_transformers so the
+    # extra_installed branch fires (matches dev-machine behavior).
+    import sys, types
+    if "sentence_transformers" not in sys.modules:
+        sys.modules["sentence_transformers"] = types.ModuleType("sentence_transformers")
 
     # No chain active — make sure we're not reading a stale progress file.
     from convo_recall import _progress
