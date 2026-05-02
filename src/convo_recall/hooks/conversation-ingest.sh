@@ -56,8 +56,27 @@ fi
 
 touch "$LOCK" 2>/dev/null || true
 
-# Spawn detached + backgrounded. We never block the agent on ingest.
+# Locate recall. PATH-based lookup is the happy path, but:
+#   - Some agent CLIs invoke hooks under a minimal env (no shell rc, no
+#     pipx ~/.local/bin in PATH) — `command -v` returns nothing
+#   - Container deployments (docker exec without -l) inherit a PATH that
+#     omits user bin dirs entirely
+# Fall back to the canonical pipx and /usr/local install paths so the
+# hook works regardless of how the parent agent process was launched.
 recall_bin=$(command -v recall 2>/dev/null || true)
+if [ -z "$recall_bin" ]; then
+    for candidate in \
+        "${HOME}/.local/bin/recall" \
+        "/root/.local/bin/recall" \
+        "/usr/local/bin/recall" \
+        "/opt/homebrew/bin/recall"; do
+        if [ -x "$candidate" ]; then
+            recall_bin="$candidate"
+            break
+        fi
+    done
+fi
+
 if [ -n "$recall_bin" ]; then
     ( "$recall_bin" ingest > /dev/null 2>&1 < /dev/null ) & disown 2>/dev/null || true
 fi

@@ -424,12 +424,29 @@ echo "$expanded_out" | grep -q "more]" \
   && { echo "$expanded_out"; fail "--expand 1 should bypass truncation for the only turn shown"; }
 ok "tail truncates with --width 50; --expand 1 bypasses truncation"
 
-# 13g — --ascii swaps Unicode glyphs for ASCII fallbacks
-ascii_out=$("$RECALL" tail 3 --session "$tail_session" --ascii 2>&1)
-echo "$ascii_out" | grep -q "│" \
-  && { echo "$ascii_out"; fail "--ascii output still contains Unicode pipe"; }
+# 13g — --ascii swaps Unicode box-drawing glyphs for ASCII fallbacks.
+# By design (per commit a2b8bb1) tail uses TWO column-bar glyphs:
+#   - `pipe`      = `|` ASCII / `│` Unicode  → assistant rows
+#   - `pipe_user` = `#` ASCII / `┃` Unicode  → user rows (heavier so YOUR
+#                                              messages pop visually)
+# We use --width 200 + tail 50 to catch BOTH user AND assistant rows even
+# after sections 11/16 inject user-only appends with future timestamps.
+# Negative check uses Python to look for the specific box-drawing glyphs
+# the implementation emits (bash grep with byte-level regex would false-match
+# leading bytes of unrelated UTF-8 chars like em dash in message content).
+ascii_out=$("$RECALL" tail 50 --session "$tail_session" --ascii --width 200 2>&1)
+unicode_glyphs=$(printf '%s' "$ascii_out" | "$PY" -c "
+import sys
+target = set('│┃─━┌┐└┘┤├┬┴┼·')
+text = sys.stdin.read()
+hits = sorted({ch for ch in text if ch in target})
+print(' '.join(f'U+{ord(c):04X}' for c in hits))
+")
+[[ -z "$unicode_glyphs" ]] || { echo "$ascii_out"; fail "--ascii output still contains Unicode box-drawing chars: $unicode_glyphs"; }
 echo "$ascii_out" | grep -q " | " \
-  || { echo "$ascii_out"; fail "--ascii output missing ASCII pipe"; }
+  || { echo "$ascii_out"; fail "--ascii output missing | separator (assistant pipe glyph)"; }
+echo "$ascii_out" | grep -q " # " \
+  || { echo "$ascii_out"; fail "--ascii output missing # separator (user pipe_user glyph)"; }
 
 # 13h — --all-projects picks the latest session globally (no project filter)
 all_out=$("$RECALL" tail 1 --all-projects 2>&1) \
@@ -583,60 +600,67 @@ import convo_recall.ingest as i
 print(i.open_db(readonly=True).execute('SELECT COUNT(*) FROM messages').fetchone()[0])
 ")
 
-# Append a new line to an existing claude session JSONL — the case the
-# systemd .path watcher misses because PathChanged is non-recursive.
-existing=$(find /root/.claude/projects -maxdepth 2 -name '*.jsonl' 2>/dev/null | head -1) || true
-if [[ -z "$existing" ]]; then
-    # Sandbox without claude sessions yet — create one to exercise the path.
-    mkdir -p /root/.claude/projects/-e2e-hook-test
-    existing=/root/.claude/projects/-e2e-hook-test/sess.jsonl
-    cat > "$existing" <<EOF
-{"uuid":"e2e1","type":"user","timestamp":"2026-05-02T00:00:00Z","message":{"role":"user","content":"e2e ingest hook seed"}}
-EOF
-fi
-echo "{\"uuid\":\"e2e-$(date +%s)\",\"type\":\"user\",\"timestamp\":\"2026-05-02T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"e2e hook test $(date +%s)\"}}" >> "$existing"
+# Use a DEDICATED test subdir + JSONL so we don't pollute fixture files
+# (which would persist across runs and contaminate section 13's tail_session
+# selector). The subdir is removed at the end of the section.
+#
+# This still exercises the systemd .path non-recursive scenario: we create
+# the subdir before any watcher would have seen the SUBSEQUENT append. To
+# make this even closer to the production bug (subdir already exists + we
+# append inside it), we touch the subdir + an initial seed line, sync,
+# THEN do the append-to-existing-JSONL probe.
+HOOK_TEST_DIR=/root/.claude/projects/-e2e-hook-test-$$
+mkdir -p "$HOOK_TEST_DIR"
+existing=$HOOK_TEST_DIR/sess-$(date +%s).jsonl
+echo "{\"uuid\":\"e2e-seed-$$\",\"type\":\"user\",\"timestamp\":\"2026-05-02T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"e2e hook test seed $$\"}}" > "$existing"
+sync
+sleep 1   # let any watcher see the new file's initial state
+# Now the append: this is the case systemd .path silently misses
+echo "{\"uuid\":\"e2e-probe-$(date +%s)\",\"type\":\"user\",\"timestamp\":\"2026-05-02T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"e2e hook probe $(date +%s)\"}}" >> "$existing"
 sync
 
-# Fire the ingest hook with a synthetic Claude Stop payload.
+# Fire 1 — establish the lock + spawn ingest.
 echo '{"hook_event_name":"Stop","stop_hook_active":true}' | bash "$INGEST_HOOK" > /dev/null
-# Background ingest needs a moment to land.
-sleep 3
+[[ -f "$LOCK" ]] || fail "lock file missing at $LOCK after first fire"
+ok "lock file created"
+lock_mtime_first=$(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK")
 
+# 16b — back-to-back hook fires within the 5s window must be deduped.
+# Run BEFORE the long sleep so we're still inside the dedup window.
+echo '{"hook_event_name":"Stop"}' | bash "$INGEST_HOOK" > /dev/null
+lock_mtime_after_dedup=$(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK")
+[[ "$lock_mtime_first" -eq "$lock_mtime_after_dedup" ]] || \
+    fail "second hook within 5s should be no-op (mtime $lock_mtime_first → $lock_mtime_after_dedup)"
+ok "5s lock dedup blocked the second hook fire"
+
+# 16c — backdate lock by 6s, re-fire, assert it DOES refresh.
+touch -d "6 seconds ago" "$LOCK" 2>/dev/null || \
+    "$PY" -c "import os, time; os.utime('$LOCK', (time.time()-6, time.time()-6))"
+lock_mtime_pre_expiry=$(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK")
+echo '{"hook_event_name":"Stop"}' | bash "$INGEST_HOOK" > /dev/null
+lock_mtime_post_expiry=$(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK")
+[[ "$lock_mtime_post_expiry" -gt "$lock_mtime_pre_expiry" ]] || \
+    fail "after lock expired, hook should have refreshed it (mtime $lock_mtime_pre_expiry → $lock_mtime_post_expiry)"
+ok "6s-old lock → fresh ingest fires"
+
+# 16a — wait for any of the spawned ingest processes to land + verify the
+# DB grew. Cold ingest spawn is ~1-2s (Python startup + import
+# convo_recall + DB connect + scan); 8s is comfortable.
+sleep 8
 after=$("$PY" -c "
 import os, sys; sys.path.insert(0, '${REPO_ROOT}/src')
 os.environ['CONVO_RECALL_DB']='$CONVO_RECALL_DB'
 import convo_recall.ingest as i
 print(i.open_db(readonly=True).execute('SELECT COUNT(*) FROM messages').fetchone()[0])
 ")
-
 [[ "$after" -gt "$before" ]] || \
     fail "ingest hook didn't increase message count ($before → $after)"
 ok "ingest hook fired recall ingest on Stop payload (+$((after-before)) row)"
 
-[[ -f "$LOCK" ]] || fail "lock file missing at $LOCK"
-ok "lock file created"
-
-# Re-fire immediately — second call within 5s should be a no-op.
-lock_mtime_before=$(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK")
-echo '{"hook_event_name":"Stop"}' | bash "$INGEST_HOOK" > /dev/null
-sleep 1
-lock_mtime_after=$(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK")
-[[ "$lock_mtime_before" -eq "$lock_mtime_after" ]] || \
-    fail "second hook within 5s should be no-op (mtime $lock_mtime_before → $lock_mtime_after)"
-ok "5s lock dedup blocked the second hook fire"
-
-# Backdate lock by 6s, re-fire, assert it DOES fire again.
-touch -d "6 seconds ago" "$LOCK" 2>/dev/null || \
-    "$PY" -c "import os, time; os.utime('$LOCK', (time.time()-6, time.time()-6))"
-lock_mtime_before=$(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK")
-echo '{"hook_event_name":"Stop"}' | bash "$INGEST_HOOK" > /dev/null
-sleep 1
-new_mtime=$(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK")
-[[ "$new_mtime" -gt "$lock_mtime_before" ]] || \
-    fail "after lock expired, second hook should have refreshed it (mtime $lock_mtime_before → $new_mtime)"
-ok "6s-old lock → fresh ingest fires"
-
 rm -rf "$HOOK_RUNTIME_DIR"
+# Clean up the dedicated test subdir + JSONL so future e2e runs (and the
+# production agent CLIs) don't see leftover probe data.
+rm -rf "$HOOK_TEST_DIR"
 
 # ── 17. summary ──────────────────────────────────────────────────────────────
 sec "17/17 summary"

@@ -992,9 +992,10 @@ def test_uninstall_hooks_removes_only_convo_recall_block(tmp_path, monkeypatch):
     cfg = json.loads(settings_path.read_text())
     assert len(cfg["hooks"]["UserPromptSubmit"]) == 2, "both hooks should be present"
 
-    # Restrict to memory kind so the default-both walk doesn't try to remove
-    # the (non-existent) ingest hook block from the same fake settings file.
-    removed = _install.uninstall_hooks(agents=["claude"], kinds=("memory",))
+    # uninstall_hooks() default kinds = ("memory", "ingest"). The ingest pass
+    # walks the same fake settings (monkeypatch ignores kind) but finds no
+    # match for the ingest script signature → no-op. Total still 1.
+    removed = _install.uninstall_hooks(agents=["claude"])
     assert removed == 1
     cfg = json.loads(settings_path.read_text())
     upr = cfg["hooks"]["UserPromptSubmit"]
