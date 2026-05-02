@@ -83,14 +83,14 @@ ok()    { green "  ✅ $current — $*"; }
 sec()   { current="$1"; echo; echo "═══ $1 ═══"; }
 
 # ── Shared fresh-state bootstrap ───────────────────────────────────────────────
-sec "0/15 bootstrap"
+sec "0/16 bootstrap"
 mkdir -p "$(dirname "$CONVO_RECALL_CONFIG")"
 echo '{"agents": ["claude", "gemini", "codex"]}' > "$CONVO_RECALL_CONFIG"
 rm -f "$CONVO_RECALL_DB" "$CONVO_RECALL_DB-wal" "$CONVO_RECALL_DB-shm"
 ok "fresh DB + 3-agent config"
 
 # ── 1. sidecar health ─────────────────────────────────────────────────────────
-sec "1/15 sidecar health"
+sec "1/16 sidecar health"
 healthz=$(curl --silent --unix-socket "$CONVO_RECALL_SOCK" http://localhost/healthz)
 echo "$healthz" \
   | "$PY" -c 'import json,sys; d=json.load(sys.stdin); assert d.get("dim")==1024 and "model" in d, d' \
@@ -98,7 +98,7 @@ echo "$healthz" \
 ok "sidecar reports model + dim=1024"
 
 # ── 2. agent detection ────────────────────────────────────────────────────────
-sec "2/15 detect_agents()"
+sec "2/16 detect_agents()"
 detect_out=$("$PY" -c "
 import sys; sys.path.insert(0, '${REPO_ROOT}/src')
 import convo_recall.ingest as i
@@ -111,7 +111,7 @@ echo "$detect_out" | grep -qE '^codex\s+[1-9]'  || fail "codex not detected"
 ok "all three agents detected with file_count > 0"
 
 # ── 3. config round-trip ──────────────────────────────────────────────────────
-sec "3/15 config save/load round-trip"
+sec "3/16 config save/load round-trip"
 "$PY" -c "
 import os, sys
 sys.path.insert(0, '${REPO_ROOT}/src')
@@ -127,7 +127,7 @@ rm -f /tmp/cr-roundtrip.json
 ok "save_config + load_config preserve {'agents': [...]} exactly"
 
 # ── 4. fresh ingest of all three agents ───────────────────────────────────────
-sec "4/15 fresh 3-agent ingest"
+sec "4/16 fresh 3-agent ingest"
 ingest_log=$(mktemp)
 "$RECALL" ingest > "$ingest_log" 2>&1 || { cat "$ingest_log"; fail "exit nonzero"; }
 grep -q "Traceback (most recent call last)" "$ingest_log" \
@@ -144,7 +144,7 @@ print(con.execute('SELECT COUNT(*) FROM messages').fetchone()[0])
 ok "$total_inserted messages from 3 agents, no tracebacks"
 
 # ── 5. idempotent re-ingest ───────────────────────────────────────────────────
-sec "5/15 idempotent re-ingest"
+sec "5/16 idempotent re-ingest"
 before=$total_inserted
 "$RECALL" ingest > /dev/null 2>&1
 after=$("$PY" -c "
@@ -159,14 +159,14 @@ print(con.execute('SELECT COUNT(*) FROM messages').fetchone()[0])
 ok "second ingest added 0 rows ($after total unchanged)"
 
 # ── 6. --agent X scoped ingest ────────────────────────────────────────────────
-sec "6/15 recall ingest --agent codex"
+sec "6/16 recall ingest --agent codex"
 out=$("$RECALL" ingest --agent codex 2>&1)
 # Should be 0 new (already ingested) but should not error
 echo "$out" | grep -q "Traceback" && fail "traceback in --agent codex ingest"
 ok "per-agent ingest accepted, no new rows expected"
 
 # ── 7. legacy-schema migration ────────────────────────────────────────────────
-sec "7/15 migration on legacy schema (no agent column)"
+sec "7/16 migration on legacy schema (no agent column)"
 LEGACY_DB=/tmp/cr-legacy-test.db
 rm -f "$LEGACY_DB"*
 "$PY" -c "
@@ -205,7 +205,7 @@ rm -f "$LEGACY_DB"*
 ok "ALTER TABLE + FTS rebuild + agent backfill all worked"
 
 # ── 8a. search --all-projects with all 3 tags ────────────────────────────────
-sec "8a/15 search --all-projects shows all 3 tags"
+sec "8a/16 search --all-projects shows all 3 tags"
 all_log=$(mktemp)
 "$RECALL" search "the" --all-projects -n 50 -c 0 > "$all_log" 2>&1
 for agent in claude gemini codex; do
@@ -214,7 +214,7 @@ done
 ok "all 3 tags present"
 
 # ── 8b. --agent X exclusivity ────────────────────────────────────────────────
-sec "8b/15 --agent X is exclusive"
+sec "8b/16 --agent X is exclusive"
 for agent in claude gemini codex; do
   out=$(mktemp)
   "$RECALL" search "the" --agent "$agent" --all-projects -n 50 -c 0 > "$out" 2>&1 || true
@@ -229,54 +229,80 @@ done
 ok "no agent tag leakage with --agent X"
 
 # ── 8c. --project filter ──────────────────────────────────────────────────────
-sec "8c/15 --project X filter (without --all-projects)"
-# Note: convo-recall CLI currently has surprising behavior where --all-projects
-# silently nullifies an explicit --project X. So we test --project alone here.
-# (See E2E_FINDING_001 in TECH_DEBT — argparse logic bug in cli.py.)
-proj_out=$("$RECALL" search "the" --project app-codex -n 10 -c 0 2>&1)
-# Strip mode header lines, then count any result line that isn't [app-codex]
-non_codex=$(echo "$proj_out" | grep -E "^\[" \
+sec "8c/16 --project X filter (display_name resolution post-v4)"
+# Discover an existing display_name from the projects table — names are
+# now derived from cwd basenames or marker walks, not from path-flatten slugs.
+discovered_display=$("$PY" -c "
+import os, sys; sys.path.insert(0, '${REPO_ROOT}/src')
+os.environ['CONVO_RECALL_DB']='$CONVO_RECALL_DB'
+import convo_recall.ingest as i
+con = i.open_db(readonly=True)
+row = con.execute('SELECT display_name FROM projects ORDER BY first_seen LIMIT 1').fetchone()
+print(row['display_name'] if row else '')
+" 2>/dev/null)
+[[ -n "$discovered_display" ]] || fail "no projects rows present — ingest did not populate the table"
+proj_out=$("$RECALL" search "the" --project "$discovered_display" -n 10 -c 0 2>&1)
+# Result lines are now prefixed by [display_name]; verify the filter restricted output.
+non_match=$(echo "$proj_out" | grep -E "^\[" \
             | grep -vE "^\[(hybrid|fts)" \
-            | grep -cvE "^\[app-codex\]" || true)
-if [[ "$non_codex" -gt 0 ]]; then
-  echo "$proj_out"; fail "--project app-codex returned $non_codex non-codex result lines"
+            | grep -cvE "^\[${discovered_display}\]" || true)
+if [[ "$non_match" -gt 0 ]]; then
+  echo "$proj_out"; fail "--project $discovered_display returned $non_match non-matching result lines"
 fi
-ok "project filter restricted to app-codex"
+ok "project filter restricted to $discovered_display"
+
+# Verify --json output carries project_id + display_name
+json_out=$("$RECALL" search "the" --project "$discovered_display" --json -n 1 -c 0 2>&1 || true)
+echo "$json_out" | "$PY" -c "
+import json, sys
+p = json.loads(sys.stdin.read())
+results = p.get('results') or []
+if results:
+    r = results[0]
+    assert 'project_id' in r and 'display_name' in r, f'missing project_id/display_name: {r.keys()}'
+    assert r['display_name'] == '$discovered_display'
+" || fail "--json result missing project_id/display_name"
+ok "JSON output includes project_id + display_name"
 
 # ── 8d. --context N before/after ──────────────────────────────────────────────
-sec "8d/15 --context 1 shows before/after lines"
+sec "8d/16 --context 1 shows before/after lines"
 ctx_out=$("$RECALL" search "the" --all-projects -n 1 -c 1 2>&1)
 echo "$ctx_out" | grep -qE "↑|↓" || { echo "$ctx_out"; fail "--context 1 produced no ↑/↓ lines"; }
 ok "context lines printed"
 
 # ── 8e. --recent decay ────────────────────────────────────────────────────────
-sec "8e/15 --recent flag accepted"
+sec "8e/16 --recent flag accepted"
 "$RECALL" search "the" --all-projects --recent -n 3 -c 0 > /tmp/recent.log 2>&1 \
   || { cat /tmp/recent.log; fail "--recent crashed"; }
 grep -q "\[hybrid+recent search\]" /tmp/recent.log \
   || fail "expected '[hybrid+recent search]' header missing"
 ok "--recent runs and reports recent-mode header"
 
-# ── 8f. cwd auto-scope ────────────────────────────────────────────────────────
-sec "8f/15 cwd auto-scope (slug_from_cwd)"
-mkdir -p /Users/ahed_isir/Projects/app-codex
-cd /Users/ahed_isir/Projects/app-codex
-auto=$("$RECALL" search "the" -n 3 -c 0 2>&1 || true)
-cd /
-# Either matched (cwd lookup found project rows) or NoResults (project_slug differs)
-echo "$auto" | grep -qE "(\[app-codex\]|No messages found for)" \
-  || { echo "$auto"; fail "cwd auto-scope path silently broken"; }
-ok "cwd-derived project filter active when no --all-projects"
+# ── 8f. cwd auto-scope (post-v4: --cwd flag + display_name resolution) ──────
+sec "8f/16 cwd auto-scope via --cwd flag (post-v4)"
+# Build a temp dir with a .git marker → display_name = basename of the dir.
+auto_dir=$(mktemp -d -t cr-cwd-test.XXXXXX)
+mkdir -p "$auto_dir/.git"
+auto_display=$(basename "$auto_dir")
+
+# Pass --cwd explicitly so the test is deterministic regardless of process cwd.
+# Expected: search either returns no rows (display_name has no sessions) OR
+# resolves to the right display_name and reports "No messages found for project='$auto_display'".
+auto=$("$RECALL" search "the" --cwd "$auto_dir" -n 3 -c 0 2>&1 || true)
+echo "$auto" | grep -qE "(No messages found for|\[$auto_display\])" \
+  || { echo "$auto"; fail "--cwd flag did not resolve to display_name $auto_display"; }
+rm -rf "$auto_dir"
+ok "--cwd flag drives display_name resolution"
 
 # ── 8g. no-results query (via nonexistent project filter) ────────────────────
-sec "8g/15 no-results path via nonexistent --project"
+sec "8g/16 no-results path via nonexistent --project"
 "$RECALL" search "anything" --project no_such_project_zwxq 2>&1 \
   | grep -q "No messages found" \
   || fail "expected 'No messages found' for nonexistent project"
 ok "no-results path"
 
 # ── 9. per-agent stats + embed coverage ───────────────────────────────────────
-sec "9/15 stats + embed coverage"
+sec "9/16 stats + embed coverage"
 stats_log=$(mktemp)
 "$RECALL" stats > "$stats_log"
 embed_pct=$(grep "^Embedded" "$stats_log" | grep -oE "[0-9]+%" | head -1 | tr -d '%')
@@ -288,7 +314,7 @@ done
 ok "embed=$embed_pct%, all 3 agents counted"
 
 # ── 10. backfill commands are no-ops when populated ───────────────────────────
-sec "10/15 backfills are idempotent no-ops"
+sec "10/16 backfills are idempotent no-ops"
 for cmd in embed-backfill backfill-clean tool-error-backfill; do
   out=$("$RECALL" $cmd 2>&1 || true)
   echo "$out" | grep -q "Traceback" && { echo "$out"; fail "traceback in $cmd"; }
@@ -296,7 +322,7 @@ done
 ok "embed-backfill, backfill-clean, tool-error-backfill all clean"
 
 # ── 11. watch loop picks up appended content ─────────────────────────────────
-sec "11/15 watch loop picks up new content"
+sec "11/16 watch loop picks up new content"
 "$RECALL" watch --interval 3 --verbose > /tmp/watch.log 2>&1 &
 WATCH_PID=$!
 trap 'kill $WATCH_PID 2>/dev/null || true' EXIT
@@ -313,7 +339,7 @@ trap - EXIT
 ok "watch loop ingested appended content within 8s"
 
 # ── 12. FTS-only fallback when sidecar gone ──────────────────────────────────
-sec "12/15 FTS-only fallback when sidecar is missing"
+sec "12/16 FTS-only fallback when sidecar is missing"
 SAVED_SOCK="$CONVO_RECALL_SOCK"
 export CONVO_RECALL_SOCK=/tmp/no-such-socket-here.sock
 fts_only_out=$("$RECALL" search "the" --all-projects -n 3 -c 0 2>&1)
@@ -325,7 +351,7 @@ export CONVO_RECALL_SOCK="$SAVED_SOCK"
 ok "search degrades to FTS-only when sidecar absent"
 
 # ── 13. recall tail ───────────────────────────────────────────────────────────
-sec "13/15 recall tail (reverse numbering, ago deltas, agent labels)"
+sec "13/16 recall tail (reverse numbering, ago deltas, agent labels)"
 
 # Pick a session_id known to have at least one user + one assistant message.
 # The fresh ingest in section 4 imported real fixtures from all three agents,
@@ -414,7 +440,7 @@ echo "$all_out" | grep -q "^session " \
 ok "tail: header / reverse-# / agent label / ago delta / JSON / ascii / --all-projects"
 
 # ── 14. safety gates: every destructive command default-denies ─────────────────
-sec "14/15 safety gates default-deny without --confirm"
+sec "14/16 safety gates default-deny without --confirm"
 
 # 14a — `recall uninstall --purge-data` with no TTY and no --confirm MUST
 #       leave the DB intact and print DRY-RUN.
@@ -485,10 +511,64 @@ rc=$?
 [[ $rc -eq 0 ]]   || fail "chunk-backfill --confirm crashed (rc=$rc)"
 ok "14f --confirm bypasses the prompt (no hang on stdin)"
 
-# ── 15. summary ──────────────────────────────────────────────────────────────
-sec "15/15 summary"
+# 14g — `recall forget --project X --confirm` requires EXACT display_name match.
+# A non-existent display_name must exit non-zero and delete nothing.
+forget_before=$("$PY" -c "
+import os, sys; sys.path.insert(0, '${REPO_ROOT}/src')
+os.environ['CONVO_RECALL_DB']='$CONVO_RECALL_DB'
+import convo_recall.ingest as i
+con = i.open_db()
+print(con.execute('SELECT COUNT(*) FROM messages').fetchone()[0])
+")
+set +e
+"$RECALL" forget --project nonexistent_project_xyz --confirm </dev/null > /dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -ne 0 ]] || fail "forget --project nonexistent --confirm should exit non-zero"
+forget_after=$("$PY" -c "
+import os, sys; sys.path.insert(0, '${REPO_ROOT}/src')
+os.environ['CONVO_RECALL_DB']='$CONVO_RECALL_DB'
+import convo_recall.ingest as i
+con = i.open_db()
+print(con.execute('SELECT COUNT(*) FROM messages').fetchone()[0])
+")
+[[ "$forget_before" -eq "$forget_after" ]] \
+  || fail "forget --project nonexistent deleted rows ($forget_before → $forget_after)"
+ok "14g forget --project nonexistent did NOT delete rows (exact-only enforced)"
+
+# ── 15. projects table + project_id integrity (post-v4) ─────────────────────
+sec "15/16 projects table + project_id integrity"
+"$PY" -c "
+import os, sys; sys.path.insert(0, '${REPO_ROOT}/src')
+os.environ['CONVO_RECALL_DB']='$CONVO_RECALL_DB'
+import convo_recall.ingest as i
+con = i.open_db(readonly=True)
+orphan = con.execute('SELECT COUNT(*) FROM messages m WHERE NOT EXISTS '
+                     '(SELECT 1 FROM projects p WHERE p.project_id = m.project_id)'
+).fetchone()[0]
+assert orphan == 0, f'{orphan} orphan messages reference unknown project_ids'
+" || fail "orphan messages.project_id without projects row"
+ok "every messages.project_id has a projects-table row"
+
+"$PY" -c "
+import os, re, sys; sys.path.insert(0, '${REPO_ROOT}/src')
+os.environ['CONVO_RECALL_DB']='$CONVO_RECALL_DB'
+import convo_recall.ingest as i
+con = i.open_db(readonly=True)
+rows = con.execute('SELECT project_id FROM projects').fetchall()
+bad = [r['project_id'] for r in rows
+       if not (re.fullmatch(r'[0-9a-f]{12}', r['project_id'])
+               or r['project_id'].startswith('gemini-hash:')
+               or r['project_id'].startswith('legacy:')
+               or r['project_id'] == 'codex_unknown')]
+assert not bad, f'malformed project_id values: {bad[:5]}'
+" || fail "malformed project_id in projects table"
+ok "every projects.project_id is 12-hex or recognized synthetic prefix"
+
+# ── 16. summary ──────────────────────────────────────────────────────────────
+sec "16/16 summary"
 "$RECALL" stats
 green ""
 green "=========================================="
-green "  ALL 15 SECTIONS PASSED — convo-recall E2E"
+green "  ALL 16 SECTIONS PASSED — convo-recall E2E"
 green "=========================================="

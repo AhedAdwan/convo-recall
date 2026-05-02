@@ -43,3 +43,14 @@ def test_readme_has_ci_badge():
     assert "actions/workflows/test.yml/badge.svg" in text, (
         "README is missing the CI status badge"
     )
+
+
+def test_readme_has_project_identity_section():
+    """Post-v4: README documents project_id + display_name + cross-machine limitation."""
+    text = _read()
+    assert "Project identity" in text, \
+        "README missing a `Project identity` subsection"
+    assert "project_id" in text, "README should mention project_id"
+    assert "display_name" in text, "README should mention display_name"
+    assert "cross-machine" in text.lower() or "Cross-machine" in text, \
+        "README should document the cross-machine identity limitation"

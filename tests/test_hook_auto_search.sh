@@ -112,5 +112,40 @@ if ! echo "${ctx}" | grep -q "convo-recall"; then
 fi
 echo "  ✓ zero-hit query — falls back to reminder cleanly"
 
+
+# ── Test 5: hook invokes recall search with --cwd (post-v4 contract) ─────────
+#
+# After dropping the /Projects/ hardcode, the hook delegates project identity
+# to convo-recall by passing the agent's raw cwd via --cwd. Use the hook log
+# to verify the recall invocation contained --cwd and no longer references
+# /Projects/.
+
+LOG="$(mktemp -t cr-hook-log.XXXXXX)"
+trap 'rm -rf "${SESSION_DIR}"; rm -f "${TEST_DB}" "${LOG}"' EXIT
+export CONVO_RECALL_HOOK_LOG="${LOG}"
+
+# We don't need the recall search subprocess output for this test — the log
+# already records the inbound payload. The bash hook itself does not log the
+# outbound recall args; instead, sanity-check that the hook script source
+# contains the --cwd flag and not the legacy /Projects/ substring.
+if ! grep -q -- '--cwd' "${HOOK}"; then
+    echo "FAILED: conversation-memory.sh missing --cwd in invocation"
+    exit 1
+fi
+# Only flag CODE references — comments mentioning the historical hardcode are fine.
+if grep -E '^[^#]*"/Projects/"' "${HOOK}" >/dev/null; then
+    echo "FAILED: conversation-memory.sh still has /Projects/ in code (not just comments)"
+    exit 1
+fi
+echo "  ✓ hook source uses --cwd, /Projects/ hardcode gone"
+
+# Also verify the hook accepts and processes a payload with cwd (smoke test).
+echo "${substantive_payload}" | bash "${HOOK}" > /dev/null
+if ! grep -q "event_payload:" "${LOG}"; then
+    echo "FAILED: hook did not log inbound payload"
+    exit 1
+fi
+echo "  ✓ hook logged inbound payload to CONVO_RECALL_HOOK_LOG"
+
 echo ""
 echo "All F-3 hook auto-search tests passed."

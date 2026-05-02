@@ -91,16 +91,13 @@ def test_expand_code_tokens():
     assert "extract" in result
 
 
-def test_slug_from_path(tmp_path):
-    monkeypatch_projects = tmp_path
+def test_legacy_claude_slug(tmp_path):
+    """Smoke test for the migration-only path-to-slug helper."""
     jsonl = tmp_path / "apps_foo" / "session.jsonl"
     jsonl.parent.mkdir(parents=True)
     jsonl.touch()
-
-    import convo_recall.ingest as _i
-    slug = _i._slug_from_path.__wrapped__(jsonl) if hasattr(_i._slug_from_path, "__wrapped__") else None
-    # Just check the public function doesn't crash on a plausible path
-    assert True  # slug derivation tested via ingest_file above
+    # _legacy_claude_slug is migration-internal but exposed for debugging
+    assert ingest._legacy_claude_slug(jsonl) == "apps_foo"
 
 
 def test_stats_runs(db):
@@ -133,6 +130,8 @@ def test_agent_migration_preserves_existing_rows(tmp_path, monkeypatch):
     import apsw
     seed = apsw.Connection(str(db_file))
     seed.execute("PRAGMA journal_mode=WAL")
+    # Original pre-v2 shape with project_slug (intentional — this test
+    # exercises the v2 + v3 + v4 migration chain on a legacy DB).
     seed.execute("""
         CREATE TABLE sessions (session_id TEXT PRIMARY KEY, project_slug TEXT NOT NULL,
                                title TEXT, first_seen TEXT NOT NULL, last_updated TEXT NOT NULL);
@@ -254,10 +253,16 @@ def test_search_shows_agent_tag_only_when_mixed(db, tmp_path, monkeypatch, capsy
         "agent tag should be hidden for single-claude result sets (UX regression fix)"
 
     # Mixed result set: insert a synthetic gemini row → tag appears for both.
+    # The gemini row reuses the same project_id as the claude session so
+    # both surface under `--project proj_foo`.
+    pid_row = db.execute(
+        "SELECT DISTINCT project_id FROM messages LIMIT 1"
+    ).fetchone()
+    pid = pid_row["project_id"]
     db.execute(
-        "INSERT INTO messages(uuid, session_id, project_slug, role, content, "
+        "INSERT INTO messages(uuid, session_id, project_id, role, content, "
         "timestamp, model, agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        ("g1", "g-1", "proj_foo", "user", "tagged gemini body",
+        ("g1", "g-1", pid, "user", "tagged gemini body",
          "2026-01-01T00:00:00Z", None, "gemini"),
     )
     capsys.readouterr()
@@ -277,9 +282,13 @@ def test_claude_parser_preserves_existing_behavior(db, tmp_path, monkeypatch):
          "message": {"role": "user", "content": "claude hello"}},
     ])
     ingest.ingest_file(db, session, do_embed=False)
-    row = db.execute("SELECT agent, project_slug, content FROM messages").fetchone()
+    row = db.execute(
+        "SELECT m.agent AS agent, m.project_id AS project_id, "
+        "m.content AS content, p.display_name AS display_name "
+        "FROM messages m LEFT JOIN projects p ON p.project_id = m.project_id"
+    ).fetchone()
     assert row["agent"] == "claude"
-    assert row["project_slug"] == "apps_foo"
+    assert row["display_name"] == "apps_foo"
     assert "claude hello" in row["content"]
 
 
@@ -304,11 +313,14 @@ def test_gemini_parser_basic(db, tmp_path, monkeypatch):
     n = ingest.ingest_gemini_file(db, sess, do_embed=False)
     assert n == 2
     rows = db.execute(
-        "SELECT role, content, agent, project_slug, session_id "
-        "FROM messages ORDER BY rowid"
+        "SELECT m.role AS role, m.content AS content, m.agent AS agent, "
+        "m.project_id AS project_id, m.session_id AS session_id, "
+        "p.display_name AS display_name "
+        "FROM messages m LEFT JOIN projects p ON p.project_id = m.project_id "
+        "ORDER BY m.rowid"
     ).fetchall()
     assert len(rows) == 2
-    assert all(r["agent"] == "gemini" and r["project_slug"] == "myproj"
+    assert all(r["agent"] == "gemini" and r["display_name"] == "myproj"
                and r["session_id"] == "g-001" for r in rows)
     assert rows[0]["role"] == "user" and "gemini hi" in rows[0]["content"]
     assert rows[1]["role"] == "assistant" and "gemini reply" in rows[1]["content"]
@@ -370,62 +382,35 @@ def test_codex_parser_basic(db, tmp_path, monkeypatch):
     n = ingest.ingest_codex_file(db, sess, do_embed=False)
     assert n == 2
     rows = db.execute(
-        "SELECT role, content, agent, project_slug, session_id "
-        "FROM messages ORDER BY rowid"
+        "SELECT m.role AS role, m.content AS content, m.agent AS agent, "
+        "m.project_id AS project_id, m.session_id AS session_id, "
+        "p.display_name AS display_name "
+        "FROM messages m LEFT JOIN projects p ON p.project_id = m.project_id "
+        "ORDER BY m.rowid"
     ).fetchall()
     assert len(rows) == 2
     assert all(r["agent"] == "codex" for r in rows)
     assert all(r["session_id"] == "c-abc" for r in rows)
-    assert all(r["project_slug"] == "mcp_Foo" for r in rows)
+    assert all(r["display_name"] == "Foo" for r in rows)
+    # /Users/x/Projects/mcp/Foo → display_name = basename "Foo"
     assert "codex hi" in rows[0]["content"]
     assert "codex reply" in rows[1]["content"]
 
 
-def test_codex_slug_from_cwd():
-    assert ingest._codex_slug_from_cwd("/Users/x/Projects/mcp/Foo") == "mcp_Foo"
-    assert ingest._codex_slug_from_cwd("/Users/x/Projects/apps/Avatar/web") == "apps_Avatar_web"
-    assert ingest._codex_slug_from_cwd("/Users/x/Projects/foo") == "foo"
-    # Non-Projects path falls back to last 2 components
-    assert ingest._codex_slug_from_cwd("/some/random/path") == "random_path"
+# NOTE: post-v4 the legacy slug helpers (_codex_slug_from_cwd,
+# _gemini_slug_from_path, slug_from_cwd, _slug_from_path) were removed in
+# favor of project_id = sha1(realpath(cwd))[:12] + display_name from a
+# marker walk. The 4 obsolete tests that exercised those helpers were
+# replaced by tests/test_project_id.py.
 
 
-def test_codex_slug_from_cwd_canonicalizes_hyphens_to_underscores():
-    """Regression: pre-fix `/work/projects/app-codex` was stored as `app-codex`
-    while `slug_from_cwd()` (used by recall search/tail) derived `app_codex`,
-    creating a mismatch. Now both produce `app_codex`."""
-    assert ingest._codex_slug_from_cwd("/work/projects/app-codex") == "app_codex"
-    assert ingest._codex_slug_from_cwd("/work/projects/app-gemini") == "app_gemini"
-    assert ingest._codex_slug_from_cwd("/Users/x/Projects/some-multi-hyphen-name") \
-        == "some_multi_hyphen_name"
-    # Hyphens in subpath components also get collapsed.
-    assert ingest._codex_slug_from_cwd("/Users/x/Projects/app-codex/sub-dir") \
-        == "app_codex_sub_dir"
-
-
-def test_codex_slug_matches_slug_from_cwd_for_hyphenated_paths(monkeypatch, tmp_path):
-    """The two functions MUST produce the same slug for the same path —
-    otherwise ingest stores under one slug and search/tail looks for another.
-    This is the invariant the canonicalization fix enforces."""
-    p = tmp_path / "projects" / "app-codex"
-    p.mkdir(parents=True)
-    monkeypatch.chdir(p)
-    cwd_slug = ingest.slug_from_cwd()
-    ingest_slug = ingest._slug_from_cwd(str(p))
-    assert cwd_slug == ingest_slug, (
-        f"slug derivations diverged: search-side='{cwd_slug}', "
-        f"ingest-side='{ingest_slug}' — would re-introduce the hyphen mismatch"
-    )
-
-
-def test_gemini_slug_from_path_canonicalizes_hyphens(tmp_path):
-    """Same regression applies to gemini's path-based slug fallback used when
-    a session header lacks `cwd` — without the fix, gemini stored `app-gemini`
-    while search looked for `app_gemini`."""
-    from pathlib import Path
-    p = Path("/root/.gemini/tmp/app-gemini/chats/session-abc.jsonl")
-    assert ingest._gemini_slug_from_path(p) == "app_gemini"
-    p2 = Path("/root/.gemini/tmp/some-name-with-many-hyphens/chats/session-x.jsonl")
-    assert ingest._gemini_slug_from_path(p2) == "some_name_with_many_hyphens"
+def test_legacy_slug_helpers_are_removed():
+    """The four divergent slug functions must NOT be importable post-v4."""
+    assert not hasattr(ingest, "_slug_from_path")
+    assert not hasattr(ingest, "_gemini_slug_from_path")
+    assert not hasattr(ingest, "_slug_from_cwd")
+    assert not hasattr(ingest, "_codex_slug_from_cwd")
+    assert not hasattr(ingest, "slug_from_cwd")
 
 
 def test_search_agent_filter(db, tmp_path, monkeypatch, capsys):
@@ -438,7 +423,7 @@ def test_search_agent_filter(db, tmp_path, monkeypatch, capsys):
     ingest.ingest_file(db, s_claude, do_embed=False, agent="claude")
     # Manual gemini-shaped row
     db.execute(
-        "INSERT INTO messages(uuid, session_id, project_slug, role, content, "
+        "INSERT INTO messages(uuid, session_id, project_id, role, content, "
         "timestamp, model, agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         ("ug", "g-1", "p_gemini", "assistant", "needle in gemini",
          "2026-01-01T00:00:00Z", None, "gemini"),
@@ -592,16 +577,21 @@ def test_gemini_slug_from_header_cwd(db, tmp_path, monkeypatch):
                       "type": "user", "content": [{"text": "hello"}]}) + "\n"
     )
     ingest.ingest_gemini_file(db, sess, do_embed=False)
-    slug = db.execute(
-        "SELECT project_slug FROM sessions WHERE agent='gemini'"
+    pid = db.execute(
+        "SELECT project_id FROM sessions WHERE agent='gemini'"
     ).fetchone()[0]
-    assert slug == "apps_noema", \
-        f"expected apps_noema slug from cwd, got {slug!r} (header cwd ignored?)"
+    # post-v4: project_id = sha1(realpath(cwd))[:12]; display_name = basename
+    # of nearest marker ancestor (none here) → basename of cwd → "noema"
+    assert pid == ingest._project_id("/Users/x/Projects/apps/noema")
+    proj = db.execute(
+        "SELECT display_name FROM projects WHERE project_id = ?", (pid,)
+    ).fetchone()
+    assert proj["display_name"] == "noema"
 
 
 def test_gemini_slug_from_alias_map(db, tmp_path, monkeypatch):
-    """P1 #7: when the header has no cwd, fall back to the user-managed
-    alias map at ~/.local/share/convo-recall/gemini-aliases.json."""
+    """post-v4: when the header has no cwd, the gemini-aliases.json map (now
+    interpreted as hash_dir → real_cwd) is consulted to recover a real cwd."""
     sha = "deadbeef0000111122223333444455556666777788889999aaaabbbbccccdddd"
     sess_dir = tmp_path / sha / "chats"
     sess_dir.mkdir(parents=True)
@@ -612,16 +602,17 @@ def test_gemini_slug_from_alias_map(db, tmp_path, monkeypatch):
         + json.dumps({"id": "m1", "timestamp": "2026-04-01T00:00:01Z",
                       "type": "user", "content": [{"text": "hi"}]}) + "\n"
     )
+    real_cwd = tmp_path / "MyProject"
+    real_cwd.mkdir()
     aliases = tmp_path / "gemini-aliases.json"
-    aliases.write_text(json.dumps({sha: "apps_my_project"}))
+    aliases.write_text(json.dumps({sha: str(real_cwd)}))
     monkeypatch.setattr(ingest, "_GEMINI_ALIAS_PATH", aliases)
 
     ingest.ingest_gemini_file(db, sess, do_embed=False)
-    slug = db.execute(
-        "SELECT project_slug FROM sessions WHERE agent='gemini'"
+    pid = db.execute(
+        "SELECT project_id FROM sessions WHERE agent='gemini'"
     ).fetchone()[0]
-    assert slug == "apps_my_project", \
-        f"expected alias-mapped slug, got {slug!r} (alias file not consulted?)"
+    assert pid == ingest._project_id(str(real_cwd))
 
 
 def test_backfill_redact_purges_existing_secrets(db):
@@ -630,7 +621,7 @@ def test_backfill_redact_purges_existing_secrets(db):
     a direct content scan should find the secret token."""
     leaked = "OPENAI_API_KEY=sk-abc123def456ghi789jkl012mno345pqr678stu901"
     db.execute(
-        "INSERT INTO messages(uuid, session_id, project_slug, role, content, "
+        "INSERT INTO messages(uuid, session_id, project_id, role, content, "
         "timestamp, model, agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         ("leaked-1", "s", "p", "user", leaked, "2026-01-01T00:00:00Z", None, "claude"),
     )
@@ -661,15 +652,24 @@ def test_backfill_redact_purges_existing_secrets(db):
 
 
 def _seed_messages(db, rows):
-    """rows is a list of (uuid, session_id, project_slug, role, content, timestamp, agent)."""
+    """rows is a list of (uuid, session_id, project_id, role, content, timestamp, agent).
+
+    project_id values double as display_name for the seeded projects row,
+    so tests can pass `project="p1"` to forget/search and have the resolver
+    find the right rows.
+    """
+    seen_projects = set()
     for r in rows:
+        if r[2] not in seen_projects:
+            ingest._upsert_project(db, r[2], r[2], None)
+            seen_projects.add(r[2])
         db.execute(
-            "INSERT INTO messages(uuid, session_id, project_slug, role, content, "
+            "INSERT INTO messages(uuid, session_id, project_id, role, content, "
             "timestamp, model, agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (r[0], r[1], r[2], r[3], r[4], r[5], None, r[6]),
         )
         db.execute(
-            "INSERT OR IGNORE INTO sessions(session_id, project_slug, title, "
+            "INSERT OR IGNORE INTO sessions(session_id, project_id, title, "
             "first_seen, last_updated, agent) VALUES (?, ?, ?, ?, ?, ?)",
             (r[1], r[2], None, r[5], r[5], r[6]),
         )
@@ -800,7 +800,7 @@ def test_recall_cliff_with_skewed_agent_distribution(db, tmp_path, monkeypatch):
     # 20 codex messages also containing "test" — synthetic tagged rows
     for n in range(20):
         db.execute(
-            "INSERT INTO messages(uuid, session_id, project_slug, role, content, "
+            "INSERT INTO messages(uuid, session_id, project_id, role, content, "
             "timestamp, model, agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (f"x-{n}", "codex-1", "p_codex", "user",
              f"codex message {n} test", "2026-02-01T00:00:00Z", None, "codex"),
@@ -1096,12 +1096,12 @@ def test_two_connections_have_independent_vec_state(tmp_path, monkeypatch):
 
         # Each DB sees only its own rows
         con_a.execute(
-            "INSERT INTO messages(uuid, session_id, project_slug, role, content, "
+            "INSERT INTO messages(uuid, session_id, project_id, role, content, "
             "timestamp, model, agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             ("a-1", "s1", "p1", "user", "row in db a", "2026-01-01T00:00:00Z", None, "claude"),
         )
         con_b.execute(
-            "INSERT INTO messages(uuid, session_id, project_slug, role, content, "
+            "INSERT INTO messages(uuid, session_id, project_id, role, content, "
             "timestamp, model, agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             ("b-1", "s2", "p2", "user", "row in db b", "2026-01-01T00:00:00Z", None, "claude"),
         )
@@ -1240,70 +1240,31 @@ def test_search_no_results_for_unknown_agent(db, tmp_path, monkeypatch, capsys):
     assert "No messages found" in out
 
 
-# ── P0: project slug normalization (Item 1 of feedback plan) ─────────────────
+# ── post-v4: project_id resolution + display_name LIKE fallback ─────────────
 
 
-def test_slug_from_cwd_collapses_hyphens_to_underscores(monkeypatch):
-    """Real-world bug: cwd `/Projects/app-claude` ingested under slug
-    `app_claude` (Claude flattens hyphens at ingest), but search auto-detect
-    used `app-claude` and returned 0. Both sides must agree."""
-    fake_parts = ("/", "Users", "x", "Projects", "app-claude")
-    monkeypatch.setattr(ingest.Path, "cwd", classmethod(lambda cls: ingest.Path("/Users/x/Projects/app-claude")))
-    assert ingest.slug_from_cwd() == "app_claude"
-
-
-def test_slug_from_cwd_collapses_multiple_hyphens(monkeypatch):
-    monkeypatch.setattr(ingest.Path, "cwd", classmethod(lambda cls: ingest.Path("/Users/x/Projects/foo-bar/baz-qux")))
-    assert ingest.slug_from_cwd() == "foo_bar_baz_qux"
-
-
-def test_slug_from_cwd_keeps_underscores(monkeypatch):
-    monkeypatch.setattr(ingest.Path, "cwd", classmethod(lambda cls: ingest.Path("/Users/x/Projects/already_underscored")))
-    assert ingest.slug_from_cwd() == "already_underscored"
-
-
-def test_slug_from_cwd_outside_projects_returns_none(monkeypatch):
-    monkeypatch.setattr(ingest.Path, "cwd", classmethod(lambda cls: ingest.Path("/etc/something")))
-    assert ingest.slug_from_cwd() is None
-
-
-def test_search_did_you_mean_hint_when_zero_results(db, tmp_path, monkeypatch, capsys):
-    """Search for a hyphenated slug when the DB has the underscored form
-    surfaces a 'did you mean: <other>' hint."""
+def test_search_did_you_mean_when_no_match(db, tmp_path, monkeypatch, capsys):
+    """Search for a project that has zero exact AND zero LIKE matches → no hint.
+    Search for one that has a LIKE match → suggestion via display_name."""
     monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
-    # Manually construct a session under the underscored slug — we ingest
-    # via a JSONL whose flat-path-derived slug naturally produces an underscore.
-    sess = tmp_path / "-Users-x-Projects-app-claude" / "s.jsonl"
-    _write_session(sess, [
-        {"uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
-         "message": {"role": "user", "content": "moodmix sprint"}},
-    ])
-    ingest.ingest_file(db, sess, do_embed=False)
-    rows = db.execute("SELECT DISTINCT project_slug FROM messages").fetchall()
-    underscored = rows[0]["project_slug"]
-    assert underscored == "app_claude", f"expected app_claude, got {underscored}"
+    # Seed a session under display_name "app-claude" via _upsert_project.
+    ingest._upsert_project(db, "id-app-claude", "app-claude", None)
+    ingest._upsert_session(db, "claude", "id-app-claude", "s-1", None,
+                            "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
+    ingest._persist_message(db, "claude", "id-app-claude", "s-1", "u1",
+                             "user", "moodmix sprint",
+                             "2026-01-01T00:00:00Z", do_embed=False)
 
     capsys.readouterr()
-    # Search using the hyphenated form — the form a user at /Projects/app-claude
-    # would get from cwd auto-detect (before the slug_from_cwd fix).
-    ingest.search(db, "moodmix", project="app-claude", limit=10, context=0)
+    # `--project app` matches "app-claude" via LIKE → resolves; finds rows.
+    ingest.search(db, "moodmix", project="app", limit=10, context=0)
+    out = capsys.readouterr().out
+    assert "No messages found" not in out
+
+    # `--project totally-bogus` → no exact, no LIKE → "No results" with no hint
+    ingest.search(db, "moodmix", project="totally-bogus", limit=10, context=0)
     out = capsys.readouterr().out
     assert "No messages found" in out
-    assert "Did you mean" in out
-    assert "app_claude" in out
-
-
-def test_search_no_did_you_mean_hint_when_results_found(db, tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
-    sess = tmp_path / "-Users-x-Projects-app-claude" / "s.jsonl"
-    _write_session(sess, [
-        {"uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
-         "message": {"role": "user", "content": "moodmix"}},
-    ])
-    ingest.ingest_file(db, sess, do_embed=False)
-    capsys.readouterr()
-    ingest.search(db, "moodmix", project="app_claude", limit=10, context=0)
-    out = capsys.readouterr().out
     assert "Did you mean" not in out
 
 
@@ -1371,26 +1332,27 @@ def test_search_json_includes_required_fields(db, tmp_path, monkeypatch, capsys)
     payload = json.loads(out)
     assert payload["results"], "expected at least one result"
     r = payload["results"][0]
-    for field in ("session_id", "project_slug", "agent", "role", "timestamp", "snippet"):
+    for field in ("session_id", "project_id", "agent", "role", "timestamp", "snippet"):
         assert field in r, f"missing required field {field!r} in result {r}"
 
 
 def test_search_json_did_you_mean_in_payload(db, tmp_path, monkeypatch, capsys):
-    """Zero-results in JSON mode includes did_you_mean array when applicable."""
+    """Zero-results in JSON mode includes did_you_mean when display_name LIKE matches."""
     monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
-    sess = tmp_path / "-Users-x-Projects-app-claude" / "s.jsonl"
-    _write_session(sess, [
-        {"uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",
-         "message": {"role": "user", "content": "moodmix"}},
-    ])
-    ingest.ingest_file(db, sess, do_embed=False)
+    ingest._upsert_project(db, "id1", "myproject", None)
+    ingest._upsert_session(db, "claude", "id1", "s-1", None,
+                            "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
+    ingest._persist_message(db, "claude", "id1", "s-1", "u1",
+                             "user", "moodmix",
+                             "2026-01-01T00:00:00Z", do_embed=False)
     capsys.readouterr()
-    ingest.search(db, "moodmix", project="app-claude", limit=10, context=0, json_=True)
+    # `--project totally-bogus` → no LIKE match either → no did_you_mean.
+    ingest.search(db, "moodmix", project="totally-bogus",
+                   limit=10, context=0, json_=True)
     out = capsys.readouterr().out.strip()
     payload = json.loads(out)
     assert payload["results"] == []
-    assert "did_you_mean" in payload
-    assert "app_claude" in payload["did_you_mean"]
+    assert "did_you_mean" not in payload
 
 
 # ── F-5: search snippet highlights matched query tokens with [brackets] ──────
@@ -1666,7 +1628,7 @@ def test_open_db_readonly_flag_returns_readonly_connection(tmp_path, monkeypatch
     monkeypatch.setattr(ingest, "_vc", None)
     # Seed with a write connection first.
     seed = ingest.open_db()
-    seed.execute("INSERT INTO sessions(session_id, project_slug, title, "
+    seed.execute("INSERT INTO sessions(session_id, project_id, title, "
                  "first_seen, last_updated, agent) VALUES (?,?,?,?,?,?)",
                  ("s1", "p", None, "2026-01-01", "2026-01-01", "claude"))
     seed.close()
@@ -1679,7 +1641,7 @@ def test_open_db_readonly_flag_returns_readonly_connection(tmp_path, monkeypatch
     # Writes must fail.
     import pytest as _pytest
     with _pytest.raises(apsw.ReadOnlyError):
-        con.execute("INSERT INTO sessions(session_id, project_slug, title, "
+        con.execute("INSERT INTO sessions(session_id, project_id, title, "
                     "first_seen, last_updated, agent) VALUES (?,?,?,?,?,?)",
                     ("s2", "p", None, "2026-01-01", "2026-01-01", "claude"))
     con.close()
@@ -1709,7 +1671,7 @@ def test_open_db_falls_back_to_readonly_on_wal_cantopen(tmp_path, monkeypatch, c
     monkeypatch.setattr(ingest, "DB_PATH", db_file)
     monkeypatch.setattr(ingest, "_vc", None)
     seed = ingest.open_db()
-    seed.execute("INSERT INTO sessions(session_id, project_slug, title, "
+    seed.execute("INSERT INTO sessions(session_id, project_id, title, "
                  "first_seen, last_updated, agent) VALUES (?,?,?,?,?,?)",
                  ("s1", "p", None, "2026-01-01", "2026-01-01", "claude"))
     seed.close()

@@ -26,12 +26,17 @@ def db(tmp_path, monkeypatch):
 def _seed(con, *, agent="claude", project_slug="proj_a",
           session_id="s-1", first_seen="2026-04-01T00:00:00Z",
           last_updated="2026-04-01T00:00:00Z"):
+    # post-v4: `project_slug` is treated as both project_id and display_name
+    # so existing tests that pass project_slug="proj_a" continue to work
+    # (the resolver finds the projects row by display_name='proj_a').
+    ingest._upsert_project(con, project_slug, project_slug, None)
     ingest._upsert_session(con, agent, project_slug, session_id, None,
                            first_seen, last_updated)
 
 
 def _msg(con, *, uuid, session_id, role, text, ts, project_slug="proj_a",
          agent="claude"):
+    ingest._upsert_project(con, project_slug, project_slug, None)
     ingest._persist_message(con, agent, project_slug, session_id, uuid,
                             role, text, ts, do_embed=False)
 
@@ -356,56 +361,40 @@ def test_tail_json_no_session_includes_error(db, capsys):
     assert "error" in payload
 
 
-# ── "Did you mean" hint when slug differs only by hyphen/underscore ──────────
+# ── "Did you mean" hint — repurposed post-v4 to display_name LIKE matches ───
+#
+# Pre-v4 the hint showed hyphen/underscore variants of the same slug. Post-v4
+# slug variants don't exist; the hint instead surfaces display_name LIKE
+# matches when --project X returns 0 exact rows but ≥1 fuzzy candidates.
 
-def test_tail_suggests_hyphen_variant_when_underscored_form_misses(db, capsys):
-    """Real bug from /work/projects/app-gemini in the sandbox: cwd-detection
-    derives slug 'app_gemini' but gemini ingest stored 'app-gemini'. Tail
-    should now hint 'Did you mean: app-gemini?' (matches search's behavior)."""
-    # Seed a session/message under the hyphenated slug.
-    ingest._upsert_session(db, "gemini", "app-gemini", "s-g", None,
-                           "2026-04-30T00:00:00Z", "2026-04-30T00:00:00Z")
-    ingest._persist_message(db, "gemini", "app-gemini", "s-g", "u1",
-                            "user", "hi from gemini",
-                            "2026-04-30T00:00:01Z", do_embed=False)
+def test_tail_like_fallback_resolves_when_exact_misses(db, capsys):
+    """`--project foo` against display_name='foo-app' resolves via LIKE."""
+    _seed(db, project_slug="foo-app", session_id="s-1")
+    _msg(db, uuid="u1", session_id="s-1", role="user",
+         text="hi", ts="2026-04-30T00:00:01Z", project_slug="foo-app")
 
-    rc = ingest.tail(db, n=10, project="app_gemini")  # underscored — wrong
+    rc = ingest.tail(db, n=10, project="foo")  # partial → LIKE → foo-app
     err = capsys.readouterr().err
-    assert rc == 1
-    assert "No sessions found" in err
-    assert "Did you mean" in err
-    assert "app-gemini" in err
+    out = capsys.readouterr().out
+    # Auto-fallback succeeded; rc=0 and "hi" appears in output
+    assert rc == 0
+    # No "No sessions found" because LIKE resolved
+    assert "No sessions found" not in err
 
 
-def test_tail_suggests_underscore_variant_when_hyphen_form_misses(db, capsys):
-    """Symmetric case: user passes hyphen form but only underscored exists."""
-    ingest._upsert_session(db, "claude", "app_claude", "s-c", None,
-                           "2026-04-30T00:00:00Z", "2026-04-30T00:00:00Z")
-    ingest._persist_message(db, "claude", "app_claude", "s-c", "u1",
-                            "user", "hi", "2026-04-30T00:00:01Z",
-                            do_embed=False)
+def test_tail_did_you_mean_when_no_exact_no_like(db, capsys):
+    """When neither exact nor LIKE match anything, no did_you_mean key."""
+    _seed(db, project_slug="foo-app", session_id="s-1")
+    _msg(db, uuid="u1", session_id="s-1", role="user",
+         text="hi", ts="2026-04-30T00:00:01Z", project_slug="foo-app")
 
-    rc = ingest.tail(db, n=10, project="app-claude")
-    err = capsys.readouterr().err
-    assert rc == 1
-    assert "Did you mean: app_claude" in err
-
-
-def test_tail_json_did_you_mean_in_payload(db, capsys):
-    """JSON callers should see the suggestion under `did_you_mean`."""
-    ingest._upsert_session(db, "gemini", "app-gemini", "s-g", None,
-                           "2026-04-30T00:00:00Z", "2026-04-30T00:00:00Z")
-    ingest._persist_message(db, "gemini", "app-gemini", "s-g", "u1",
-                            "user", "hi", "2026-04-30T00:00:01Z",
-                            do_embed=False)
-
-    rc = ingest.tail(db, n=10, project="app_gemini", json_=True)
+    rc = ingest.tail(db, n=10, project="totally-different", json_=True)
     out = capsys.readouterr().out.strip()
     payload = json.loads(out)
     assert rc == 1
     assert payload["messages"] == []
-    assert "did_you_mean" in payload
-    assert "app-gemini" in payload["did_you_mean"]
+    # No fuzzy match for "totally-different" — no did_you_mean key.
+    assert "did_you_mean" not in payload
 
 
 def test_tail_no_suggestion_when_truly_unknown_project(db, capsys):

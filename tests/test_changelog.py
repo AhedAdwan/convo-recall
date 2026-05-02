@@ -46,3 +46,14 @@ def test_changelog_mentions_linux_port():
         f"top changelog entry must mention one of {keywords}; "
         f"section was:\n{section}"
     )
+
+
+def test_changelog_has_project_id_entry():
+    """Post-v4: CHANGELOG announces stable project_id under Unreleased."""
+    text = _read()
+    after = text.split("## [Unreleased]", 1)[1]
+    unreleased = after.split("\n## [", 1)[0]
+    assert "project_id" in unreleased, "Unreleased block must mention project_id"
+    assert "display_name" in unreleased, "Unreleased block must mention display_name"
+    assert "v4" in unreleased.lower() or "_MIGRATION_PROJECT_ID" in unreleased, \
+        "Unreleased block must reference the v4 migration"

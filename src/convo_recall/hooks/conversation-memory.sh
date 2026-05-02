@@ -97,20 +97,12 @@ if _should_skip(prompt):
     }))
     sys.exit(0)
 
-# Derive a slug for the current project, matching convo-recall's convention.
-# Collapse BOTH slashes and hyphens to underscores — Claude's flattened
-# session storage encodes path separators as hyphens, so the ingest side
-# treats `/` and `-` identically. The search/hook side has to match.
-slug = ""
-if "/Projects/" in cwd:
-    tail = cwd.split("/Projects/", 1)[1]
-    slug = tail.replace("/", "_").replace("-", "_").lower()
-
 # ── Auto-search — actually run the search and inject results as context ──────
 #
-# The agent's #1 finding was "the hook is a reminder, not an integration."
-# This block changes that: for substantive prompts, we run `recall search`
-# against the user's prompt and prepend the top hits to the reminder.
+# Project identity is delegated entirely to convo_recall via the --cwd flag.
+# The hook no longer derives a slug locally; instead it passes the agent's
+# raw cwd and lets `recall search --cwd` resolve the display_name → project_id
+# (single source of truth — eliminates the old `/Projects/` substring hack).
 #
 # Hard-cap latency at ~3s (subprocess timeout) so a slow embedding sidecar
 # doesn't stall every keystroke. On any failure, fall back to the static
@@ -123,14 +115,11 @@ _RECALL_SEARCH_LIMIT = 3
 _SNIPPET_CHAR_CAP = 200
 
 prior_block = ""
+results: list = []
 recall_bin = shutil.which("recall")
 if recall_bin:
     args = [recall_bin, "search", prompt, "-n", str(_RECALL_SEARCH_LIMIT),
-            "--context", "0", "--json"]
-    if slug:
-        args.extend(["--project", slug])
-    else:
-        args.append("--all-projects")
+            "--context", "0", "--json", "--cwd", cwd]
     try:
         res = subprocess.run(
             args, capture_output=True, text=True,
@@ -140,7 +129,7 @@ if recall_bin:
             payload = json.loads(res.stdout)
             results = payload.get("results", [])
             # If project-scoped came back empty, retry once with --all-projects.
-            if not results and slug:
+            if not results:
                 fallback_args = [recall_bin, "search", prompt,
                                  "-n", str(_RECALL_SEARCH_LIMIT),
                                  "--context", "0", "--json", "--all-projects"]
@@ -157,7 +146,7 @@ if recall_bin:
                     snip = (r.get("snippet") or "").replace("\n", " ")
                     if len(snip) > _SNIPPET_CHAR_CAP:
                         snip = snip[:_SNIPPET_CHAR_CAP] + "…"
-                    proj = r.get("project_slug", "")
+                    proj = r.get("display_name") or r.get("project_slug") or ""
                     role = r.get("role", "")
                     ts = (r.get("timestamp") or "")[:10]
                     agent_tag = r.get("agent", "")
@@ -170,10 +159,16 @@ if recall_bin:
         # slow / missing recall binary.
         prior_block = ""
 
-if slug:
-    project_line = f'Search current project: recall search "<query>" --project {slug}\n'
-else:
-    project_line = ""
+# Derive the project hint line from the resolved display_name in the search
+# result (if any). Falls back silently when no results came back.
+project_line = ""
+if results:
+    display = results[0].get("display_name") or results[0].get("project_slug")
+    if display:
+        project_line = (
+            f'Search current project: recall search "<query>" '
+            f'--project {display}\n'
+        )
 
 # ── Custom instructions — global + per-project ad-hoc guidance ───────────────
 #

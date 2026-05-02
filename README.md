@@ -2,6 +2,12 @@
 
 [![Tests](https://github.com/AhedAdwan/convo-recall/actions/workflows/test.yml/badge.svg)](https://github.com/AhedAdwan/convo-recall/actions/workflows/test.yml)
 
+> **You've been using a coding-agent CLI for a year. Hundreds of conversations — decisions made, approaches that failed, the exact fix for that recurring bug, the prompt that finally worked. You think all that knowledge and wisdom is gone.**
+>
+> **It's not. It's all on disk. convo-recall makes it visible again.**
+>
+> _It doesn't tell you what to do with it — that's still up to you and your agent. It just gets your memory back._
+
 > **AI agents are stateless by design. convo-recall makes them stateful by infrastructure.**
 
 _Inspired by Andrej Karpathy's [LLM Wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f). Where Karpathy's wiki has the LLM synthesize external sources into curated markdown, convo-recall captures verbatim agent session transcripts in SQLite — same instinct (agents need persistent state across sessions), different object. The two are complementary, not competing._
@@ -235,16 +241,29 @@ recall doctor --scan-secrets    # count credential-shaped tokens in indexed cont
 
 ## Project scope
 
-Search auto-scopes to your current project when you're inside a Claude Code project directory. The slug is derived from the path after your projects root, with both slashes AND hyphens collapsed to underscores:
+### Project identity
+
+Every project is identified by **two stable values**:
+
+- **`project_id`** — `sha1(realpath(cwd))[:12]`. Hyphen-vs-slash safe, collision-free, deterministic from the directory. Two symlinked paths that resolve to the same target collapse to one id.
+- **`display_name`** — basename of the nearest ancestor containing a project-root marker (`.git`, `package.json`, `Cargo.toml`, `pyproject.toml`, `go.mod`, …). Falls back to the basename of `realpath(cwd)` when no marker is found upstream.
+
+Both live in a normalized `projects` table (`project_id PK, display_name, cwd_realpath, first_seen, last_updated`). Search and tail accept the **display_name** via `--project X` and resolve to the right `project_id` internally — exact match first, with a LIKE fallback that warns when more than one project matches.
 
 ```
-~/Projects/apps/my-app  →  apps_my_app
-~/Projects/libs/convo-recall  →  libs_convo_recall
+/Users/x/Projects/apps/my-app                   →  display_name "my-app"
+/Users/x/Projects/libs/convo-recall (with .git) →  display_name "convo-recall"
 ```
 
-Hyphen collapsing is required because Claude's session storage flattens path separators using hyphens, so distinct hyphens in original names become indistinguishable from path separators at ingest time. Both `app-claude` and `app_claude` map to the same slug `app_claude`.
+`recall search foo` auto-scopes to the current cwd. Override with `--project <name>` (display_name) or search everywhere with `--all-projects`. Hooks pass `--cwd PATH` explicitly so they don't depend on `os.getcwd()` being correct.
 
-Override with `--project <slug>` or search everything with `--all-projects`. If a search returns zero results for a project, `recall` prints a `Did you mean: <slug>?` hint when a near-miss slug exists in the DB.
+### Cross-machine identity (limitation)
+
+There is **no cross-machine project identity**. The same repo at `~/work/repo` on machine A and `/srv/repo` on machine B has the same `display_name` but a *different* `project_id` (because the realpaths differ). If you sync your DB across machines whose paths differ, the same logical project will appear twice in the index. Search across both with `recall search foo --project repo` (matches by display_name).
+
+### Forget is exact-only
+
+`recall forget --project X` requires an **exact** `display_name` match — no LIKE fallback. If the name is ambiguous you must spell it out fully. Search and tail use exact-then-LIKE (with a multi-match warning) for ergonomic auto-scope.
 
 **Search snippet highlighting:** matched query tokens in result snippets are wrapped in `[brackets]` (SQLite FTS5's `snippet()` highlighter). For example, searching `"claude codex"` will return snippets with `[claude]` and `[codex]` bracketed. Tokens that aren't in your query are unbracketed — this isn't redaction or asymmetry, it's just where the match landed.
 

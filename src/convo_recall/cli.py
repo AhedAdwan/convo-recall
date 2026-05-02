@@ -1,6 +1,7 @@
 """recall — CLI entry point for convo-recall."""
 
 import argparse
+import os
 import sys
 
 from . import __version__, ingest, install as _install
@@ -181,6 +182,9 @@ def main() -> None:
                              "Unicode (│, ·, ↳, …) for terminals that don't render box chars")
     p_tail.add_argument("--json", action="store_true",
                         help="Emit machine-readable JSON instead of formatted text")
+    p_tail.add_argument("--cwd", default=None, metavar="PATH",
+                        help="Override cwd for project auto-scope "
+                             "(used by hooks where os.getcwd() may be wrong).")
 
     p_search = sub.add_parser("search", help="Hybrid search (FTS5 + vector if available)")
     p_search.add_argument("query")
@@ -199,6 +203,9 @@ def main() -> None:
                           help="Filter to messages from a single agent (claude / gemini / codex)")
     p_search.add_argument("--json", action="store_true",
                           help="Emit machine-readable JSON instead of human-formatted text")
+    p_search.add_argument("--cwd", default=None, metavar="PATH",
+                          help="Override cwd for project auto-scope "
+                               "(used by hooks where os.getcwd() may be wrong).")
 
     args = parser.parse_args()
 
@@ -304,7 +311,8 @@ def main() -> None:
             elif args.all_projects:
                 project = None
             else:
-                project = ingest.slug_from_cwd()
+                cwd = args.cwd or os.getcwd()
+                project = ingest._display_name(cwd)
             ingest.search(con, args.query, args.n,
                           recent=args.recent,
                           project=project,
@@ -317,7 +325,8 @@ def main() -> None:
             elif args.all_projects:
                 project = None
             else:
-                project = ingest.slug_from_cwd()
+                cwd = args.cwd or os.getcwd()
+                project = ingest._display_name(cwd)
             roles_arg = (args.roles or "").strip().lower()
             if roles_arg == "all":
                 roles = ("user", "assistant", "tool_error")

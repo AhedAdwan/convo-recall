@@ -43,3 +43,18 @@ def test_install_help_lists_scheduler_choices():
     r = _run("install", "--help")
     assert r.returncode == 0
     assert "--scheduler {auto,launchd,systemd,cron,polling}" in r.stdout
+
+
+# ── post-v4: --cwd flag + display_name auto-scope ───────────────────────────
+
+def test_search_help_shows_cwd_flag():
+    r = _run("search", "--help")
+    assert r.returncode == 0
+    assert "--cwd" in r.stdout
+    assert "PATH" in r.stdout
+
+
+def test_tail_help_shows_cwd_flag():
+    r = _run("tail", "--help")
+    assert r.returncode == 0
+    assert "--cwd" in r.stdout

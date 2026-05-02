@@ -8,6 +8,7 @@ via environment variables:
   CONVO_RECALL_SOCK     — path to embed UDS socket (default ~/.midcortex/engram/embed.sock)
 """
 
+import hashlib
 import http.client
 import json
 import math
@@ -316,6 +317,7 @@ def open_db(readonly: bool = False) -> apsw.Connection:
     _ensure_migrations_table(con)
     _migrate_add_agent_column(con)
     _migrate_fts_porter(con)
+    _migrate_project_id(con)
     if _vec_ok(con):
         _init_vec_tables(con)
     return con
@@ -336,7 +338,7 @@ def _init_schema(con: apsw.Connection) -> None:
     con.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             session_id   TEXT PRIMARY KEY,
-            project_slug TEXT NOT NULL,
+            project_id   TEXT NOT NULL,
             title        TEXT,
             first_seen   TEXT NOT NULL,
             last_updated TEXT NOT NULL,
@@ -346,7 +348,7 @@ def _init_schema(con: apsw.Connection) -> None:
         CREATE TABLE IF NOT EXISTS messages (
             uuid         TEXT PRIMARY KEY,
             session_id   TEXT NOT NULL,
-            project_slug TEXT NOT NULL,
+            project_id   TEXT NOT NULL,
             role         TEXT NOT NULL,
             content      TEXT NOT NULL,
             timestamp    TEXT,
@@ -357,7 +359,7 @@ def _init_schema(con: apsw.Connection) -> None:
         CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
             content,
             session_id   UNINDEXED,
-            project_slug UNINDEXED,
+            project_id   UNINDEXED,
             role         UNINDEXED,
             agent        UNINDEXED,
             content='messages',
@@ -366,24 +368,54 @@ def _init_schema(con: apsw.Connection) -> None:
         );
 
         CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-            INSERT INTO messages_fts(rowid, content, session_id, project_slug, role, agent)
-            VALUES (new.rowid, new.content, new.session_id, new.project_slug, new.role, new.agent);
+            INSERT INTO messages_fts(rowid, content, session_id, project_id, role, agent)
+            VALUES (new.rowid, new.content, new.session_id, new.project_id, new.role, new.agent);
         END;
 
         CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-            INSERT INTO messages_fts(messages_fts, rowid, content, session_id, project_slug, role, agent)
-            VALUES ('delete', old.rowid, old.content, old.session_id, old.project_slug, old.role, old.agent);
+            INSERT INTO messages_fts(messages_fts, rowid, content, session_id, project_id, role, agent)
+            VALUES ('delete', old.rowid, old.content, old.session_id, old.project_id, old.role, old.agent);
         END;
 
         CREATE TABLE IF NOT EXISTS ingested_files (
             file_path      TEXT PRIMARY KEY,
             session_id     TEXT NOT NULL,
-            project_slug   TEXT NOT NULL,
+            project_id     TEXT NOT NULL,
             lines_ingested INTEGER NOT NULL DEFAULT 0,
             last_modified  REAL NOT NULL,
             agent          TEXT NOT NULL DEFAULT 'claude'
         );
+
+        CREATE TABLE IF NOT EXISTS projects (
+            project_id    TEXT PRIMARY KEY,
+            display_name  TEXT NOT NULL,
+            cwd_realpath  TEXT,
+            first_seen    TEXT NOT NULL,
+            last_updated  TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_projects_display_name
+            ON projects(display_name);
     """)
+
+
+def _upsert_project(con: apsw.Connection, project_id: str,
+                    display_name: str, cwd_realpath: str | None) -> None:
+    """Insert (project_id, display_name, cwd_realpath) or refresh on conflict.
+
+    Preserves first_seen on update; bumps last_updated and overwrites
+    display_name + cwd_realpath with the latest observed values.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    con.execute(
+        "INSERT INTO projects(project_id, display_name, cwd_realpath, "
+        "first_seen, last_updated) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(project_id) DO UPDATE SET "
+        "display_name = excluded.display_name, "
+        "cwd_realpath = COALESCE(excluded.cwd_realpath, projects.cwd_realpath), "
+        "last_updated = excluded.last_updated",
+        (project_id, display_name, cwd_realpath, now, now),
+    )
 
 
 def _has_column(con: apsw.Connection, table: str, column: str) -> bool:
@@ -416,6 +448,7 @@ def _record_migration(con: apsw.Connection, version: int) -> None:
 # Schema versions. New migrations append here.
 _MIGRATION_AGENT_COLUMN = 2  # v2: add agent column to sessions/messages/ingested_files
 _MIGRATION_FTS_PORTER = 3    # v3: rebuild FTS with porter+unicode61 + agent column
+_MIGRATION_PROJECT_ID = 4    # v4: rename project_slug → project_id; populate projects table
 
 
 def _migrate_add_agent_column(con: apsw.Connection) -> None:
@@ -504,6 +537,247 @@ def _migrate_fts_porter(con: apsw.Connection) -> None:
         raise
     _record_migration(con, _MIGRATION_FTS_PORTER)
     print("[migrate] Done.", file=sys.stderr)
+
+
+# ── v4: project_slug → project_id + projects table ───────────────────────────
+
+def _legacy_project_id(old_slug: str) -> str:
+    """Synthesize project_id for legacy slugs whose real cwd cannot be recovered."""
+    return hashlib.sha1(("legacy:" + old_slug).encode("utf-8")).hexdigest()[:12]
+
+
+def _gemini_hash_project_id(hash_dir: str) -> str:
+    """Synthesize project_id for Gemini hash-only sessions."""
+    return hashlib.sha1(("gemini-hash:" + hash_dir).encode("utf-8")).hexdigest()[:12]
+
+
+def _scan_claude_cwd(slug: str) -> str | None:
+    """Scan Claude jsonl files for any session matching `slug`, return cwd field.
+
+    Claude stores its session dir as `cwd.replace('/', '-')` — lossy. We can't
+    reverse the encoding without scanning record bodies. Read up to ~200 lines
+    of each candidate file looking for a `cwd` key.
+    """
+    if not PROJECTS_DIR.exists():
+        return None
+    for project_dir in PROJECTS_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+        # _legacy_claude_slug collapses hyphens to underscores; reverse-test
+        # by comparing the slug derivation. Cheap because we're not iterating
+        # all files yet — just dirs.
+        try:
+            test_slug = _legacy_claude_slug(project_dir / "x.jsonl")
+        except Exception:
+            continue
+        if test_slug != slug:
+            continue
+        for sess in list(project_dir.glob("*.jsonl"))[:5]:
+            try:
+                with open(sess) as fh:
+                    for i, line in enumerate(fh):
+                        if i > 200:
+                            break
+                        try:
+                            d = json.loads(line)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        if isinstance(d, dict) and d.get("cwd"):
+                            return d["cwd"]
+            except OSError:
+                continue
+    return None
+
+
+def _scan_codex_cwd(slug: str) -> str | None:
+    """Scan Codex rollouts whose session_meta payload.cwd derives `slug`."""
+    if not CODEX_SESSIONS.exists():
+        return None
+    # Cheap: stop at the first matching cwd. Walk newest first to bias to recent.
+    files = sorted(CODEX_SESSIONS.glob("*/*/*/rollout-*.jsonl"), reverse=True)
+    for f in files[:200]:  # cap scan budget
+        try:
+            with open(f) as fh:
+                first = json.loads(fh.readline())
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        cwd = (first.get("payload") or {}).get("cwd")
+        if not cwd:
+            continue
+        if _legacy_codex_slug(cwd) == slug:
+            return cwd
+    return None
+
+
+def _scan_gemini_cwd(slug: str) -> tuple[str | None, str | None]:
+    """For Gemini, attempt to recover real cwd via ~/.gemini/projects.json.
+
+    Returns (cwd, hash_dir_or_None). hash_dir is set when slug looks like a
+    SHA-hash dir name and we can't resolve to a real path.
+    """
+    aliases = _load_gemini_aliases()
+    # aliases is {hash_dir → real_cwd}
+    for hash_dir, cwd in aliases.items():
+        if _legacy_codex_slug(cwd) == slug:
+            return cwd, hash_dir
+    # No alias hit — slug might already be a hash_dir name
+    return None, slug
+
+
+def _migrate_project_id(con: apsw.Connection) -> None:
+    """v4 migration: project_slug → project_id; populate projects table; rebuild FTS.
+
+    Idempotent: gated on _MIGRATION_PROJECT_ID. Snapshots DB to .pre-project-id.<ts>.bak
+    before any DDL. On a FRESH DB whose tables are already at the post-v4 shape
+    (project_id columns), records the migration and only ensures the projects
+    table is in sync — no rename, no FTS rebuild.
+    """
+    import shutil
+
+    if _migration_applied(con, _MIGRATION_PROJECT_ID):
+        return
+
+    fresh_shape = _has_column(con, "messages", "project_id")
+    if fresh_shape:
+        # Fresh DB born at v4: nothing to rename, nothing to backfill,
+        # FTS already correct. Just record the migration.
+        _record_migration(con, _MIGRATION_PROJECT_ID)
+        return
+
+    # Legacy DB — snapshot first
+    if DB_PATH.exists() and str(DB_PATH) not in (":memory:",):
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        bak = DB_PATH.with_suffix(DB_PATH.suffix + f".pre-project-id.{ts}.bak")
+        try:
+            shutil.copy2(str(DB_PATH), str(bak))
+            print(f"[migrate] Snapshot saved: {bak}", file=sys.stderr)
+        except OSError as e:
+            print(f"[migrate] WARNING: snapshot failed ({e}); continuing.", file=sys.stderr)
+
+    print("[migrate] Renaming project_slug → project_id and populating projects table…",
+          file=sys.stderr)
+
+    # Build slug → (project_id, display_name, cwd_real) map per agent.
+    # Legacy slugs are agent-scoped: same slug under claude vs gemini may
+    # have different real cwds. Group by (agent, project_slug).
+    slug_pairs = con.execute(
+        "SELECT DISTINCT agent, project_slug FROM sessions"
+    ).fetchall()
+
+    # Each row may be _Row or tuple
+    def _row(r, key, idx):
+        try:
+            return r[key]
+        except (KeyError, TypeError):
+            return r[idx]
+
+    mapping: dict[tuple[str, str], tuple[str, str, str | None]] = {}
+    for row in slug_pairs:
+        agent = _row(row, "agent", 0)
+        slug = _row(row, "project_slug", 1)
+        cwd: str | None = None
+        gemini_hash: str | None = None
+        if agent == "claude":
+            cwd = _scan_claude_cwd(slug)
+        elif agent == "codex":
+            cwd = _scan_codex_cwd(slug)
+        elif agent == "gemini":
+            cwd, gemini_hash = _scan_gemini_cwd(slug)
+
+        if cwd:
+            pid = _project_id(cwd)
+            display = _display_name(cwd)
+            cwd_real = os.path.realpath(cwd)
+        elif agent == "gemini" and gemini_hash:
+            pid = _gemini_hash_project_id(gemini_hash)
+            display = gemini_hash
+            cwd_real = None
+        else:
+            pid = _legacy_project_id(slug)
+            display = slug
+            cwd_real = None
+        mapping[(agent, slug)] = (pid, display, cwd_real)
+
+    try:
+        con.execute("BEGIN IMMEDIATE")
+
+        # Populate projects table from the mapping
+        now = datetime.now(timezone.utc).isoformat()
+        for (_agent, _slug), (pid, display, cwd_real) in mapping.items():
+            con.execute(
+                "INSERT INTO projects(project_id, display_name, cwd_realpath, "
+                "first_seen, last_updated) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(project_id) DO UPDATE SET "
+                "display_name = excluded.display_name, "
+                "cwd_realpath = COALESCE(excluded.cwd_realpath, projects.cwd_realpath), "
+                "last_updated = excluded.last_updated",
+                (pid, display, cwd_real, now, now),
+            )
+
+        # Rename columns. SQLite ≥3.25 supports ALTER TABLE … RENAME COLUMN;
+        # apsw bundles ≥3.45.
+        for table in ("sessions", "messages", "ingested_files"):
+            if _has_column(con, table, "project_slug"):
+                con.execute(
+                    f"ALTER TABLE {table} RENAME COLUMN project_slug TO project_id"
+                )
+
+        # Backfill project_id values per (agent, old_slug)
+        for (agent, slug), (pid, _display, _cwd) in mapping.items():
+            con.execute(
+                "UPDATE sessions SET project_id = ? "
+                "WHERE agent = ? AND project_id = ?",
+                (pid, agent, slug),
+            )
+            con.execute(
+                "UPDATE messages SET project_id = ? "
+                "WHERE agent = ? AND project_id = ?",
+                (pid, agent, slug),
+            )
+            con.execute(
+                "UPDATE ingested_files SET project_id = ? "
+                "WHERE agent = ? AND project_id = ?",
+                (pid, agent, slug),
+            )
+
+        # Rebuild FTS: drop old (with project_slug column), recreate with project_id
+        print("[migrate] Rebuilding FTS index (project_id rename)…", file=sys.stderr)
+        con.execute("""
+            DROP TRIGGER IF EXISTS messages_ai;
+            DROP TRIGGER IF EXISTS messages_ad;
+            DROP TABLE IF EXISTS messages_fts;
+
+            CREATE VIRTUAL TABLE messages_fts USING fts5(
+                content,
+                session_id   UNINDEXED,
+                project_id   UNINDEXED,
+                role         UNINDEXED,
+                agent        UNINDEXED,
+                content='messages',
+                content_rowid='rowid',
+                tokenize='porter unicode61'
+            );
+
+            CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content, session_id, project_id, role, agent)
+                VALUES (new.rowid, new.content, new.session_id, new.project_id, new.role, new.agent);
+            END;
+
+            CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content, session_id, project_id, role, agent)
+                VALUES ('delete', old.rowid, old.content, old.session_id, old.project_id, old.role, old.agent);
+            END;
+
+            INSERT INTO messages_fts(messages_fts) VALUES('rebuild');
+        """)
+        con.execute("COMMIT")
+    except Exception:
+        try: con.execute("ROLLBACK")
+        except Exception: pass
+        raise
+
+    _record_migration(con, _MIGRATION_PROJECT_ID)
+    print("[migrate] project_id migration complete.", file=sys.stderr)
 
 
 def _init_vec_tables(vc) -> None:
@@ -613,7 +887,14 @@ def _decay(timestamp: str | None, half_life_days: int = DECAY_HALF_LIFE_DAYS) ->
 
 # ── Path helpers ──────────────────────────────────────────────────────────────
 
-def _slug_from_path(jsonl_path: Path) -> str:
+def _legacy_claude_slug(jsonl_path: Path) -> str:
+    """Lossy slug from Claude's flattened storage dir; legacy fallback only.
+
+    Used by (a) the v4 migration to match an existing legacy slug to its
+    source dir, and (b) the Claude ingest as a last-resort display_name when
+    no cwd field is present in any record. New rows always carry a real
+    project_id derived from cwd via _project_id().
+    """
     if jsonl_path.parent.name == "subagents":
         project_dir_name = jsonl_path.parent.parent.parent.name
     else:
@@ -660,26 +941,40 @@ def _extract_text(content) -> str:
     return ""
 
 
-def slug_from_cwd() -> str | None:
-    """Derive project slug from cwd, matching ingestion convention.
+_ROOT_MARKERS = (
+    ".git", "package.json", "Cargo.toml", "pyproject.toml",
+    "go.mod", "pom.xml", "build.gradle", "build.gradle.kts",
+    "deno.json", ".projectile",
+)
 
-    Claude's flattened session storage (`~/.claude/projects/<flat-dir>/`)
-    encodes path separators as hyphens, so distinct hyphens in original
-    names are indistinguishable from path separators at ingest time —
-    `_slug_from_path` splits on `-` and joins with `_`, turning
-    `app-claude` into `app_claude`. This function must apply the same
-    collapse so a search from `/Projects/app-claude` resolves to the
-    same slug rows were ingested under.
+
+def _project_id(cwd) -> str:
+    """Stable 12-hex id from realpath(cwd). Same dir → same id forever.
+
+    Built from os.path.realpath so symlinked paths that resolve to the same
+    target collapse to one id. Hyphen-vs-slash safe because the input is
+    a real path, not the lossy hyphen-encoded directory name Claude uses.
     """
-    parts = Path.cwd().parts
-    try:
-        idx = next(i for i, p in enumerate(parts) if p.lower() == "projects")
-        relevant = parts[idx + 1:]
-        if not relevant:
-            return None
-        return "_".join(relevant).replace("-", "_")
-    except StopIteration:
-        return None
+    real = os.path.realpath(str(cwd))
+    return hashlib.sha1(real.encode("utf-8")).hexdigest()[:12]
+
+
+def _display_name(cwd) -> str:
+    """basename of nearest ancestor containing a project-root marker.
+
+    Walks up from realpath(cwd) looking for any of _ROOT_MARKERS (.git,
+    package.json, Cargo.toml, pyproject.toml, go.mod, …). Returns the
+    basename of that ancestor. Falls back to basename of realpath(cwd)
+    when no marker is found upstream.
+    """
+    real = Path(os.path.realpath(str(cwd)))
+    for ancestor in (real, *real.parents):
+        try:
+            if any((ancestor / m).exists() for m in _ROOT_MARKERS):
+                return ancestor.name or "/"
+        except (OSError, PermissionError):
+            continue
+    return real.name or "/"
 
 
 # ── Agent detection + per-agent file iteration ───────────────────────────────
@@ -783,8 +1078,36 @@ def ingest_file(con: apsw.Connection, jsonl_path: Path,
         return 0
 
     lines_already = row["lines_ingested"] if row else 0
-    project_slug = _slug_from_path(jsonl_path)
     session_id = _session_id_from_path(jsonl_path)
+
+    # Pre-scan for cwd: Claude records carry a cwd field on user/attachment
+    # rows. First-found wins. Falls back to the lossy slug encoding.
+    recovered_cwd: str | None = None
+    try:
+        with open(jsonl_path, "r", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i > 200:
+                    break
+                try:
+                    d = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(d, dict) and d.get("cwd"):
+                    recovered_cwd = d["cwd"]
+                    break
+    except OSError:
+        pass
+
+    if recovered_cwd:
+        project_id = _project_id(recovered_cwd)
+        display_name = _display_name(recovered_cwd)
+        cwd_real = os.path.realpath(recovered_cwd)
+    else:
+        legacy = _legacy_claude_slug(jsonl_path)
+        project_id = _legacy_project_id(legacy)
+        display_name = legacy
+        cwd_real = None
+    _upsert_project(con, project_id, display_name, cwd_real)
 
     inserted = 0
     malformed = 0
@@ -831,7 +1154,7 @@ def ingest_file(con: apsw.Connection, jsonl_path: Path,
             model = msg.get("model") if role == "assistant" else None
 
             inserted += _persist_message(
-                con, agent, project_slug, session_id, uuid, role, text,
+                con, agent, project_id, session_id, uuid, role, text,
                 timestamp, do_embed, model=model,
             )
 
@@ -855,13 +1178,13 @@ def ingest_file(con: apsw.Connection, jsonl_path: Path,
                         if not tr_text:
                             continue
                         inserted += _persist_message(
-                            con, agent, project_slug, session_id, tr_uuid,
+                            con, agent, project_id, session_id, tr_uuid,
                             "tool_error", tr_text, timestamp, do_embed,
                         )
 
     now = datetime.now(timezone.utc).isoformat()
-    _upsert_session(con, agent, project_slug, session_id, title, now, now)
-    _upsert_ingested_file(con, agent, file_key, session_id, project_slug,
+    _upsert_session(con, agent, project_id, session_id, title, now, now)
+    _upsert_ingested_file(con, agent, file_key, session_id, project_id,
                            lines_read, stat.st_mtime)
     if malformed:
         print(f"[warn] {malformed} malformed JSONL record(s) skipped in "
@@ -869,40 +1192,40 @@ def ingest_file(con: apsw.Connection, jsonl_path: Path,
     return inserted
 
 
-def _upsert_session(con: apsw.Connection, agent: str, project_slug: str,
+def _upsert_session(con: apsw.Connection, agent: str, project_id: str,
                     session_id: str, title: str | None,
                     first_seen: str, now: str) -> None:
     """Insert or refresh a sessions row. Title is only set if provided."""
     con.execute(
-        """INSERT INTO sessions (session_id, project_slug, title, first_seen,
+        """INSERT INTO sessions (session_id, project_id, title, first_seen,
                                  last_updated, agent)
            VALUES (?, ?, ?, ?, ?, ?)
            ON CONFLICT(session_id) DO UPDATE SET
                title = COALESCE(excluded.title, sessions.title),
                last_updated = excluded.last_updated,
                agent = excluded.agent""",
-        (session_id, project_slug, title, first_seen, now, agent),
+        (session_id, project_id, title, first_seen, now, agent),
     )
 
 
 def _upsert_ingested_file(con: apsw.Connection, agent: str, file_key: str,
-                          session_id: str, project_slug: str,
+                          session_id: str, project_id: str,
                           lines_read: int, mtime: float) -> None:
     """Insert or refresh an ingested_files row."""
     con.execute(
         """INSERT INTO ingested_files
-               (file_path, session_id, project_slug, lines_ingested,
+               (file_path, session_id, project_id, lines_ingested,
                 last_modified, agent)
            VALUES (?, ?, ?, ?, ?, ?)
            ON CONFLICT(file_path) DO UPDATE SET
                lines_ingested = excluded.lines_ingested,
                last_modified  = excluded.last_modified,
                agent          = excluded.agent""",
-        (file_key, session_id, project_slug, lines_read, mtime, agent),
+        (file_key, session_id, project_id, lines_read, mtime, agent),
     )
 
 
-def _persist_message(con: apsw.Connection, agent: str, project_slug: str,
+def _persist_message(con: apsw.Connection, agent: str, project_id: str,
                      session_id: str, uuid: str, role: str, text: str,
                      timestamp: str | None, do_embed: bool,
                      model: str | None = None) -> int:
@@ -913,9 +1236,9 @@ def _persist_message(con: apsw.Connection, agent: str, project_slug: str,
         # One round-trip instead of INSERT + SELECT after.
         ret = con.execute(
             """INSERT OR IGNORE INTO messages
-               (uuid, session_id, project_slug, role, content, timestamp, model, agent)
+               (uuid, session_id, project_id, role, content, timestamp, model, agent)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING rowid""",
-            (uuid, session_id, project_slug, role, text, timestamp, model, agent),
+            (uuid, session_id, project_id, role, text, timestamp, model, agent),
         ).fetchall()
         if not ret:
             return 0
@@ -931,14 +1254,11 @@ def _persist_message(con: apsw.Connection, agent: str, project_slug: str,
         return 0
 
 
-def _gemini_slug_from_path(jsonl_path: Path) -> str:
-    """~/.gemini/tmp/{project}/chats/session-*.jsonl → {project}.
+def _legacy_gemini_slug(jsonl_path: Path) -> str:
+    """Lossy slug from a Gemini session path; legacy fallback only.
 
-    Hyphens are collapsed to underscores to match the canonical slug form
-    used by `slug_from_cwd()` (cwd auto-detection in `recall search/tail`)
-    and by Claude's flattened-path ingest. Without this, a gemini session
-    in `~/.gemini/tmp/app-gemini/chats/` was stored as `app-gemini` while
-    `recall tail` from `/work/projects/app-gemini` looked for `app_gemini`.
+    Used by the v4 migration to match an existing Gemini legacy slug to its
+    source dir. New rows derive project_id from the session header's cwd.
     """
     return jsonl_path.parent.parent.name.replace("-", "_")
 
@@ -968,13 +1288,22 @@ def ingest_gemini_file(con: apsw.Connection, jsonl_path: Path,
         return 0
     lines_already = row["lines_ingested"] if row else 0
 
-    # Three-layer slug resolution:
-    #   1. cwd from session header (set when we see it during the read loop)
-    #   2. alias map at ~/.local/share/convo-recall/gemini-aliases.json
-    #   3. last resort: the SHA-hash dir name unchanged
-    hash_dir = _gemini_slug_from_path(jsonl_path)
+    # Three-layer project_id resolution (in priority order):
+    #   1. cwd from session header → _project_id(cwd)
+    #   2. ~/.gemini/projects.json reverse-lookup of hash_dir → real cwd
+    #   3. SHA-hash dir name → synthetic gemini-hash:<hash> id
+    hash_dir = jsonl_path.parent.parent.name
+    project_id: str | None = None
+    display_name: str | None = None
+    cwd_real: str | None = None
+
     aliases = _load_gemini_aliases()
-    project_slug = aliases.get(hash_dir, hash_dir)
+    aliased_cwd = aliases.get(hash_dir)
+    if aliased_cwd:
+        project_id = _project_id(aliased_cwd)
+        display_name = _display_name(aliased_cwd)
+        cwd_real = os.path.realpath(aliased_cwd)
+
     session_id = jsonl_path.stem  # fallback if no header
     first_seen = None
     inserted = 0
@@ -999,24 +1328,38 @@ def ingest_gemini_file(con: apsw.Connection, jsonl_path: Path,
                 first_seen = rec.get("startTime") or first_seen
                 cwd = rec.get("cwd") or rec.get("projectDir")
                 if cwd:
-                    project_slug = _slug_from_cwd(cwd)
+                    project_id = _project_id(cwd)
+                    display_name = _display_name(cwd)
+                    cwd_real = os.path.realpath(cwd)
                 continue
             rtype = rec.get("type")
             if rtype not in ("user", "gemini"):
                 continue
+            # Defer message inserts until we've decided project_id (after header).
+            if project_id is None:
+                project_id = _gemini_hash_project_id(hash_dir)
+                display_name = hash_dir
+                cwd_real = None
             role = "user" if rtype == "user" else "assistant"
             text = _clean_content(_extract_text(rec.get("content", "")))
             if not text:
                 continue
             uuid = rec.get("id") or f"{session_id}:{lineno}"
             timestamp = rec.get("timestamp")
-            inserted += _persist_message(con, "gemini", project_slug, session_id,
+            inserted += _persist_message(con, "gemini", project_id, session_id,
                                           uuid, role, text, timestamp, do_embed)
 
+    # If no records produced project_id (empty file or skipped-only), fall back.
+    if project_id is None:
+        project_id = _gemini_hash_project_id(hash_dir)
+        display_name = hash_dir
+        cwd_real = None
+
+    _upsert_project(con, project_id, display_name, cwd_real)
     now = datetime.now(timezone.utc).isoformat()
-    _upsert_session(con, "gemini", project_slug, session_id, None,
+    _upsert_session(con, "gemini", project_id, session_id, None,
                     first_seen or now, now)
-    _upsert_ingested_file(con, "gemini", file_key, session_id, project_slug,
+    _upsert_ingested_file(con, "gemini", file_key, session_id, project_id,
                           lines_read, stat.st_mtime)
     if malformed:
         print(f"[warn] {malformed} malformed JSONL record(s) skipped in "
@@ -1024,19 +1367,12 @@ def ingest_gemini_file(con: apsw.Connection, jsonl_path: Path,
     return inserted
 
 
-def _slug_from_cwd(cwd: str) -> str:
-    """Convert a session's cwd to a project slug.
+def _legacy_codex_slug(cwd: str) -> str:
+    """Lossy slug from a cwd; legacy fallback only.
 
-    `/Users/x/Projects/mcp/Foo` → `mcp_Foo` (matches Claude's slug convention
-    for paths under `Projects/`).
-    `/some/random/path` → `random_path` (best-effort fallback).
-
-    Hyphens are collapsed to underscores so codex/gemini ingest produces the
-    same canonical slugs that `slug_from_cwd()` derives from the user's cwd.
-    Pre-fix, `/work/projects/app-codex` was stored as `app-codex` by codex
-    ingest but searched-for as `app_codex` by `recall tail`, leading to
-    "no sessions found" with a "Did you mean: app-codex?" hint that should
-    never have been needed in the first place.
+    Used by the v4 migration to match codex/gemini legacy slugs to their
+    source files. New codex rows derive project_id from session_meta.payload.cwd
+    via _project_id().
     """
     parts = Path(cwd).parts
     try:
@@ -1048,10 +1384,6 @@ def _slug_from_cwd(cwd: str) -> str:
         relevant = parts[-2:] if len(parts) >= 2 else parts
         slug = "_".join(p for p in relevant if p and p != "/")
     return slug.replace("-", "_")
-
-
-# Codex-specific alias kept for call-site stability (search by name).
-_codex_slug_from_cwd = _slug_from_cwd
 
 
 _GEMINI_ALIAS_PATH = Path(os.environ.get(
@@ -1108,11 +1440,19 @@ def ingest_codex_file(con: apsw.Connection, jsonl_path: Path,
     lines_already = row["lines_ingested"] if row else 0
 
     session_id = jsonl_path.stem  # fallback if session_meta missing
-    project_slug = "codex_unknown"
+    project_id = _legacy_project_id("codex_unknown")
+    display_name = "codex_unknown"
+    cwd_real = None
     first_seen = None
     inserted = 0
     malformed = 0
     lines_read = 0
+
+    def _set_project_from_cwd(cwd: str) -> None:
+        nonlocal project_id, display_name, cwd_real
+        project_id = _project_id(cwd)
+        display_name = _display_name(cwd)
+        cwd_real = os.path.realpath(cwd)
 
     with open(jsonl_path, "r", errors="replace") as f:
         for lineno, raw in enumerate(f):
@@ -1128,7 +1468,7 @@ def ingest_codex_file(con: apsw.Connection, jsonl_path: Path,
                             session_id = payload.get("id", session_id)
                             cwd = payload.get("cwd")
                             if cwd:
-                                project_slug = _codex_slug_from_cwd(cwd)
+                                _set_project_from_cwd(cwd)
                             first_seen = payload.get("timestamp") or rec.get("timestamp")
                     except (json.JSONDecodeError, ValueError):
                         pass
@@ -1144,7 +1484,7 @@ def ingest_codex_file(con: apsw.Connection, jsonl_path: Path,
                 session_id = payload.get("id", session_id)
                 cwd = payload.get("cwd")
                 if cwd:
-                    project_slug = _codex_slug_from_cwd(cwd)
+                    _set_project_from_cwd(cwd)
                 first_seen = payload.get("timestamp") or rec.get("timestamp")
                 continue
             if ttype != "response_item":
@@ -1164,13 +1504,14 @@ def ingest_codex_file(con: apsw.Connection, jsonl_path: Path,
                 continue
             timestamp = rec.get("timestamp")
             uuid = payload.get("id") or f"{session_id}:{lineno}"
-            inserted += _persist_message(con, "codex", project_slug, session_id,
+            inserted += _persist_message(con, "codex", project_id, session_id,
                                           uuid, role, text, timestamp, do_embed)
 
+    _upsert_project(con, project_id, display_name, cwd_real)
     now = datetime.now(timezone.utc).isoformat()
-    _upsert_session(con, "codex", project_slug, session_id, None,
+    _upsert_session(con, "codex", project_id, session_id, None,
                     first_seen or now, now)
-    _upsert_ingested_file(con, "codex", file_key, session_id, project_slug,
+    _upsert_ingested_file(con, "codex", file_key, session_id, project_id,
                           lines_read, stat.st_mtime)
     if malformed:
         print(f"[warn] {malformed} malformed JSONL record(s) skipped in "
@@ -1225,8 +1566,8 @@ def _dispatch_ingest(con: apsw.Connection, agents: list[str], *,
             files += 1
             total += n
             if verbose:
-                slug = (_slug_from_path(jsonl_path) if agent_name == "claude"
-                        else _gemini_slug_from_path(jsonl_path) if agent_name == "gemini"
+                slug = (_legacy_claude_slug(jsonl_path) if agent_name == "claude"
+                        else _legacy_gemini_slug(jsonl_path) if agent_name == "gemini"
                         else jsonl_path.parent.name)
                 print(f"  +{n:4d} msgs  [{agent_name}] {slug}/{jsonl_path.name[:8]}…")
         # Tick on every file so the bar advances at human-perceptible
@@ -1421,21 +1762,61 @@ _TAIL_GLYPHS = {
 }
 
 
+def _resolve_project_ids(con: apsw.Connection, project: str,
+                          exact_only: bool = False) -> tuple[list[str], list[str]]:
+    """Resolve a display_name → list of project_ids.
+
+    Strategy:
+      1. Exact match on display_name (case-insensitive, NOCASE).
+      2. If 0 hits AND not exact_only, fall back to LIKE %project%.
+         Print a stderr warning when LIKE matched >1 project.
+
+    Returns (project_ids, matched_display_names). Both empty when no match.
+    """
+    rows = con.execute(
+        "SELECT project_id, display_name FROM projects "
+        "WHERE display_name = ? COLLATE NOCASE",
+        (project,),
+    ).fetchall()
+    if rows:
+        return ([r["project_id"] for r in rows],
+                [r["display_name"] for r in rows])
+    if exact_only:
+        return ([], [])
+    rows = con.execute(
+        "SELECT project_id, display_name FROM projects "
+        "WHERE display_name LIKE ? COLLATE NOCASE",
+        (f"%{project}%",),
+    ).fetchall()
+    if not rows:
+        return ([], [])
+    if len(rows) > 1:
+        names = ", ".join(r["display_name"] for r in rows)
+        print(f"[warn] '{project}' matched {len(rows)} projects: {names}",
+              file=sys.stderr)
+    return ([r["project_id"] for r in rows],
+            [r["display_name"] for r in rows])
+
+
 def _resolve_tail_session(con: apsw.Connection, project: str | None,
                           agent: str | None) -> tuple[str, str] | None:
     """Pick the latest session matching project/agent filters.
 
-    Returns (session_id, project_slug) or None if no session matches.
+    Returns (session_id, project_id) or None if no session matches.
     """
     where = []
     params: list = []
     if project:
-        where.append("project_slug = ?")
-        params.append(project)
+        pids, _ = _resolve_project_ids(con, project)
+        if not pids:
+            return None
+        placeholders = ",".join("?" * len(pids))
+        where.append(f"project_id IN ({placeholders})")
+        params.extend(pids)
     if agent:
         where.append("agent = ?")
         params.append(agent)
-    sql = "SELECT session_id, project_slug FROM sessions"
+    sql = "SELECT session_id, project_id FROM sessions"
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY last_updated DESC LIMIT 1"
@@ -1558,20 +1939,19 @@ def tail(con: apsw.Connection, n: int = _DEFAULT_TAIL_N,
     if session is None:
         picked = _resolve_tail_session(con, project, agent)
         if picked is None:
-            # "Did you mean" — match `recall search`'s behavior. cwd-detection
-            # collapses hyphens to underscores (claude/codex convention), but
-            # gemini sometimes stores the literal hyphenated dir name. Surface
-            # the variant so the user can re-run with the right --project.
+            # "Did you mean" — surface display_names that fuzzily match the
+            # passed --project. Slug variants (hyphen↔underscore) no longer
+            # exist post-v4; we suggest LIKE matches from projects.display_name.
             suggestions: list[str] = []
             if project:
-                near = con.execute(
-                    "SELECT DISTINCT project_slug FROM messages "
-                    "WHERE REPLACE(project_slug, '_', '-') = REPLACE(?, '_', '-') "
-                    "  AND project_slug != ? "
-                    "ORDER BY project_slug",
-                    (project, project),
+                like = con.execute(
+                    "SELECT display_name FROM projects "
+                    "WHERE display_name LIKE ? COLLATE NOCASE "
+                    "  AND display_name != ? COLLATE NOCASE "
+                    "ORDER BY display_name",
+                    (f"%{project}%", project),
                 ).fetchall()
-                suggestions = [r[0] for r in near[:3]]
+                suggestions = [r["display_name"] for r in like[:3]]
             label = ", ".join(filter(None, [
                 f"project='{project}'" if project else None,
                 f"agent='{agent}'" if agent else None,
@@ -1595,16 +1975,25 @@ def tail(con: apsw.Connection, n: int = _DEFAULT_TAIL_N,
                     print(f"Did you mean: {', '.join(suggestions)}?",
                           file=sys.stderr)
             return 1
-        session, resolved_project = picked
+        session, picked_pid = picked
+        # Translate picked project_id → display_name for header rendering.
+        dn = con.execute(
+            "SELECT display_name FROM projects WHERE project_id = ?",
+            (picked_pid,),
+        ).fetchone()
+        resolved_project = dn["display_name"] if dn else picked_pid
     elif resolved_project is None:
-        # Explicit --session bypassed the picker — recover the project_slug
-        # from the sessions table so the header still shows it.
+        # Explicit --session bypassed the picker — recover the project's
+        # display_name from the sessions+projects join so the header still
+        # shows it.
         row = con.execute(
-            "SELECT project_slug FROM sessions WHERE session_id = ?",
+            "SELECT p.display_name FROM sessions s "
+            "LEFT JOIN projects p ON p.project_id = s.project_id "
+            "WHERE s.session_id = ?",
             (session,),
         ).fetchone()
-        if row is not None:
-            resolved_project = row[0]
+        if row is not None and row["display_name"] is not None:
+            resolved_project = row["display_name"]
 
     placeholders = ",".join(["?"] * len(roles))
     rows = con.execute(
@@ -1618,9 +2007,23 @@ def tail(con: apsw.Connection, n: int = _DEFAULT_TAIL_N,
 
     if json_:
         import json as _json
+        # Resolve display_name + project_id for the JSON envelope (item 14).
+        sess_meta = con.execute(
+            "SELECT s.project_id, p.display_name FROM sessions s "
+            "LEFT JOIN projects p ON p.project_id = s.project_id "
+            "WHERE s.session_id = ?",
+            (session,),
+        ).fetchone()
+        sess_pid = sess_meta["project_id"] if sess_meta else None
+        sess_display = (sess_meta["display_name"] if sess_meta and
+                        sess_meta["display_name"] else resolved_project)
         out = {
             "session_id": session,
             "project": resolved_project,
+            "project_id": sess_pid,
+            "display_name": sess_display,
+            # DEPRECATED alias for one release — equals display_name.
+            "project_slug": sess_display,
             "agent": agent,
             "n": n,
             "messages": [
@@ -1743,34 +2146,44 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
     # Pre-compute the rowid set for the (project, agent) filter so we can
     # narrow both FTS and vec result sets down before scoring.
     filter_rowids: set[int] | None = None
+    resolved_project_ids: list[str] = []
     if project or agent:
         clauses = []
         params: list = []
         if project:
-            clauses.append("project_slug = ?")
-            params.append(project)
+            resolved_project_ids, _ = _resolve_project_ids(con, project)
+            if not resolved_project_ids:
+                # No exact and no LIKE match → no rows; "did you mean" suggests
+                # display_name LIKE matches.
+                filter_rowids = set()
+            else:
+                placeholders = ",".join("?" * len(resolved_project_ids))
+                clauses.append(f"project_id IN ({placeholders})")
+                params.extend(resolved_project_ids)
         if agent:
             clauses.append("agent = ?")
             params.append(agent)
-        where = " AND ".join(clauses)
-        rows = con.execute(
-            f"SELECT rowid FROM messages WHERE {where}", params
-        ).fetchall()
-        filter_rowids = {r[0] for r in rows}
+        if filter_rowids is None and clauses:
+            where = " AND ".join(clauses)
+            rows = con.execute(
+                f"SELECT rowid FROM messages WHERE {where}", params
+            ).fetchall()
+            filter_rowids = {r[0] for r in rows}
+        elif filter_rowids is None:
+            filter_rowids = None  # no filter at all (shouldn't reach)
         if not filter_rowids:
-            # "Did you mean" hint: surface near-miss slugs that differ only
-            # by hyphen/underscore swaps. Most common cause is a hyphenated
-            # repo dir whose ingest-time slug used underscores.
+            # "Did you mean" hint: surface display_names that fuzzily match
+            # the passed --project. Slug variants no longer exist post-v4.
             suggestions = []
             if project:
-                near = con.execute(
-                    "SELECT DISTINCT project_slug FROM messages "
-                    "WHERE REPLACE(project_slug, '_', '-') = REPLACE(?, '_', '-') "
-                    "  AND project_slug != ? "
-                    "ORDER BY project_slug",
-                    (project, project),
+                like = con.execute(
+                    "SELECT display_name FROM projects "
+                    "WHERE display_name LIKE ? COLLATE NOCASE "
+                    "  AND display_name != ? COLLATE NOCASE "
+                    "ORDER BY display_name",
+                    (f"%{project}%", project),
                 ).fetchall()
-                suggestions = [r[0] for r in near[:3]]
+                suggestions = [r["display_name"] for r in like[:3]]
             if json_:
                 import json as _json
                 payload: dict = {
@@ -1801,8 +2214,10 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
                       SUM(CASE WHEN v.rowid IS NOT NULL THEN 1 ELSE 0 END) AS embedded
                FROM messages m
                LEFT JOIN message_vecs v ON v.rowid = m.rowid
-               WHERE m.project_slug = ?""",
-            (project,),
+               WHERE m.project_id IN ({})""".format(
+                   ",".join("?" * len(resolved_project_ids))
+               ),
+            tuple(resolved_project_ids),
         ).fetchone()
         total, embedded = cov[0], cov[1] or 0
         if total > 0 and (embedded / total) < 0.95:
@@ -1886,7 +2301,7 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
         else:
             placeholders = ",".join("?" * len(scored))
             rows = con.execute(
-                f"""SELECT rowid, session_id, project_slug, role, timestamp, agent,
+                f"""SELECT rowid, session_id, project_id, role, timestamp, agent,
                            SUBSTR(content, 1, 300) AS excerpt
                     FROM messages WHERE rowid IN ({placeholders})""",
                 scored,
@@ -1899,7 +2314,7 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
         if filter_rowids is not None:
             placeholders = ",".join("?" * filter_size)
             rows = con.execute(
-                f"""SELECT m.rowid, m.session_id, m.project_slug, m.role,
+                f"""SELECT m.rowid, m.session_id, m.project_id, m.role,
                            m.timestamp, m.agent,
                            snippet(messages_fts, 0, '[', ']', '…', 20) AS excerpt
                     FROM messages_fts
@@ -1911,7 +2326,7 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
             ).fetchall()
         else:
             rows = con.execute(
-                """SELECT m.rowid, m.session_id, m.project_slug, m.role,
+                """SELECT m.rowid, m.session_id, m.project_id, m.role,
                           m.timestamp, m.agent,
                           snippet(messages_fts, 0, '[', ']', '…', 20) AS excerpt
                    FROM messages_fts
@@ -1940,13 +2355,32 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
             else "hybrid" if use_vec
             else "fts")
 
+    # Build a project_id → display_name lookup for output formatting (item 14).
+    pid_set = {r["project_id"] for r in rows}
+    if pid_set:
+        placeholders = ",".join("?" * len(pid_set))
+        pid_to_name = {
+            r["project_id"]: r["display_name"]
+            for r in con.execute(
+                f"SELECT project_id, display_name FROM projects "
+                f"WHERE project_id IN ({placeholders})",
+                tuple(pid_set),
+            ).fetchall()
+        }
+    else:
+        pid_to_name = {}
+
     if json_:
         import json as _json
         results = []
         for r in rows:
+            display = pid_to_name.get(r["project_id"], r["project_id"])
             results.append({
                 "session_id": r["session_id"],
-                "project_slug": r["project_slug"],
+                "project_id": r["project_id"],
+                "display_name": display,
+                # DEPRECATED alias for one release — equals display_name.
+                "project_slug": display,
                 "agent": r["agent"],
                 "role": r["role"],
                 "timestamp": r["timestamp"],
@@ -1972,7 +2406,8 @@ def search(con: apsw.Connection, query: str, limit: int = 10,
         ts = (r["timestamp"] or "")[:10]
         role_label = "[⚠ error]" if r["role"] == "tool_error" else f"[{r['role']}]"
         agent_tag = f"[{r['agent']}] " if show_agent else ""
-        print(f"[{r['project_slug']}] {agent_tag}{role_label} {ts}")
+        display = pid_to_name.get(r["project_id"], r["project_id"])
+        print(f"[{display}] {agent_tag}{role_label} {ts}")
         if context > 0:
             before, after = _fetch_context(con, r["session_id"], r["timestamp"], context)
             for c in before:
@@ -2224,6 +2659,19 @@ def doctor(con: apsw.Connection, scan_secrets: bool = False) -> None:
     elif msg_count > 0 and coverage_pct < 95:
         print(f"  → low coverage; run `recall embed-backfill` to heal")
 
+    # Project-id integrity: every messages.project_id must have a row in
+    # `projects`. Surfaces drift from the v4 migration or partial ingest.
+    distinct_projects = con.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+    print(f"\nProjects         : {distinct_projects} (display_name index)")
+    orphan_msgs = con.execute(
+        "SELECT COUNT(*) FROM messages m WHERE NOT EXISTS "
+        "(SELECT 1 FROM projects p WHERE p.project_id = m.project_id)"
+    ).fetchone()[0]
+    if orphan_msgs:
+        print(f"⚠ {orphan_msgs:,} messages reference a project_id with no "
+              f"projects-table row.")
+        print("  → re-ingest will recreate the missing rows; otherwise file an issue.")
+
     stale = _scan_stale_bak_files(DB_PATH.parent)
     if stale:
         print(f"\nStale `.bak` files in {DB_PATH.parent} "
@@ -2303,7 +2751,27 @@ def tool_error_backfill(con: apsw.Connection) -> None:
         for pattern in ("*.jsonl", "*/subagents/*.jsonl"):
             for jsonl_path in project_dir.glob(pattern):
                 session_id = _session_id_from_path(jsonl_path)
-                project_slug = _slug_from_path(jsonl_path)
+                # Recover project_id by scanning the file for cwd; fall back to
+                # legacy slug if no cwd field is present.
+                recovered_cwd: str | None = None
+                try:
+                    with open(jsonl_path, "r", errors="replace") as fh:
+                        for i, line in enumerate(fh):
+                            if i > 200:
+                                break
+                            try:
+                                d = json.loads(line)
+                            except (json.JSONDecodeError, ValueError):
+                                continue
+                            if isinstance(d, dict) and d.get("cwd"):
+                                recovered_cwd = d["cwd"]
+                                break
+                except OSError:
+                    pass
+                if recovered_cwd:
+                    project_id = _project_id(recovered_cwd)
+                else:
+                    project_id = _legacy_project_id(_legacy_claude_slug(jsonl_path))
                 try:
                     with open(jsonl_path, "r", errors="replace") as f:
                         for lineno, raw in enumerate(f):
@@ -2341,10 +2809,10 @@ def tool_error_backfill(con: apsw.Connection) -> None:
                                 try:
                                     ret = con.execute(
                                         """INSERT OR IGNORE INTO messages
-                                           (uuid, session_id, project_slug, role,
+                                           (uuid, session_id, project_id, role,
                                             content, timestamp, model, agent)
                                            VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING rowid""",
-                                        (tr_uuid, session_id, project_slug, "tool_error",
+                                        (tr_uuid, session_id, project_id, "tool_error",
                                          tr_text, timestamp, None, "claude"),
                                     ).fetchall()
                                     if ret:
@@ -2392,7 +2860,23 @@ def forget(con: apsw.Connection, *,
     elif uuid is not None:
         where_clauses.append("uuid = ?"); params.append(uuid)
     elif project is not None:
-        where_clauses.append("project_slug = ?"); params.append(project)
+        # Destructive op — exact display_name match only, NO LIKE fallback.
+        pids, names = _resolve_project_ids(con, project, exact_only=True)
+        if len(pids) == 0:
+            raise ValueError(
+                f"forget --project requires exact display_name match; "
+                f"got 0 matches for {project!r}. "
+                f"List candidates with: recall stats"
+            )
+        if len(pids) > 1:
+            raise ValueError(
+                f"forget --project requires exact display_name match; "
+                f"got {len(pids)} matches for {project!r}: {', '.join(names)}. "
+                f"Be more specific."
+            )
+        placeholders = ",".join("?" * len(pids))
+        where_clauses.append(f"project_id IN ({placeholders})")
+        params.extend(pids)
     elif agent is not None:
         where_clauses.append("agent = ?"); params.append(agent)
     elif before is not None:
@@ -2411,9 +2895,13 @@ def forget(con: apsw.Connection, *,
         )
 
     matches = con.execute(
-        f"SELECT rowid, uuid, session_id, project_slug, agent, role, "
-        f"       SUBSTR(content, 1, 120) AS excerpt "
-        f"FROM messages WHERE {where} ORDER BY rowid LIMIT ?",
+        f"SELECT m.rowid AS rowid, m.uuid AS uuid, m.session_id AS session_id, "
+        f"       m.project_id AS project_id, p.display_name AS display_name, "
+        f"       m.agent AS agent, m.role AS role, "
+        f"       SUBSTR(m.content, 1, 120) AS excerpt "
+        f"FROM messages m LEFT JOIN projects p ON p.project_id = m.project_id "
+        f"WHERE m.rowid IN (SELECT rowid FROM messages WHERE {where}) "
+        f"ORDER BY m.rowid LIMIT ?",
         (*params, 3),
     ).fetchall()
     total = con.execute(
@@ -2422,7 +2910,8 @@ def forget(con: apsw.Connection, *,
 
     print(f"forget [{scope}]: {total:,} message(s) match.")
     for r in matches:
-        print(f"  · [{r['agent']}] [{r['project_slug']}] {r['role']}: {r['excerpt']}")
+        display = r["display_name"] or r["project_id"]
+        print(f"  · [{r['agent']}] [{display}] {r['role']}: {r['excerpt']}")
     if total > len(matches):
         print(f"  · … and {total - len(matches):,} more")
 
@@ -2539,7 +3028,7 @@ def stats(con: apsw.Connection) -> None:
     msg_count = con.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
     session_count = con.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
     project_count = con.execute(
-        "SELECT COUNT(DISTINCT project_slug) FROM sessions"
+        "SELECT COUNT(*) FROM projects"
     ).fetchone()[0]
     role_counts = con.execute(
         "SELECT role, COUNT(*) FROM messages GROUP BY role ORDER BY 2 DESC"

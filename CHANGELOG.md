@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Stable `project_id`** — every project gets a `sha1(realpath(cwd))[:12]` id and a separate human-readable `display_name`, normalized in a new `projects` table. Replaces the four divergent slug-derivation paths (`slug_from_cwd` / `_slug_from_cwd` / `_slug_from_path` / `_gemini_slug_from_path`) and the hardcoded `/Projects/` substring check that broke on Linux paths.
+- `recall search --cwd PATH` and `recall tail --cwd PATH` — explicit cwd override for hooks and other callers that can't rely on `os.getcwd()`.
+
+### Changed
+- `recall forget --project X` now requires an **exact** `display_name` match (was: substring). Search and tail accept exact-first with a LIKE fallback that warns on multi-match.
+- `recall search --json` and `recall tail --json` output now includes `project_id` and `display_name`. The legacy `project_slug` field remains as a deprecated alias (= display_name) for one release.
+- The pre-prompt hook (`conversation-memory.sh`) no longer hard-codes `/Projects/` in path parsing; it passes `--cwd "$cwd"` to `recall search` and lets recall resolve the project.
+- `recall doctor` adds an orphan-message integrity check + a `Projects` count line.
+
+### Removed
+- Helpers `slug_from_cwd`, `_slug_from_cwd`, `_slug_from_path`, `_gemini_slug_from_path`, and the `_codex_slug_from_cwd` alias. Use `_project_id(cwd)` and `_display_name(cwd)` instead. Migration-internal renamed equivalents (`_legacy_claude_slug`, `_legacy_codex_slug`, `_legacy_gemini_slug`) remain for the v4 backfill path only.
+- The `/Projects/` substring hardcode in `conversation-memory.sh`.
+
+### Notes for upgraders
+- Migration `_MIGRATION_PROJECT_ID = 4` runs on first open after upgrade. Snapshot saved to `<db>.pre-project-id.<ts>.bak` next to the DB. FTS index is rebuilt — expect 10–30s pause on a 60K-row DB. After verifying, delete the `.bak` manually or wait for `recall doctor` to flag it (>30 days).
+- **Cross-machine project identity: out of scope.** A repo at `/a/repo` on machine A and `/b/repo` on machine B will appear as two projects (same display_name, different project_id) if you sync DBs across machines. Workaround: `recall search foo --project repo` matches by display_name across both.
+- The JSON `project_slug` field is **deprecated** and will be removed in the release after this one. Migrate consumers to `display_name`.
+
+### Added
 - **Cross-platform install.** `recall install` now works on Linux as well as macOS. The `_require_macos()` gate is gone.
 - **Scheduler abstraction** with four implementations: `LaunchdScheduler` (macOS), `SystemdUserScheduler` (Linux native, file-event driven `.service` + `.path` units), `CronScheduler` (Linux fallback, `@reboot` lines tagged `# convo-recall:*`), `PollingScheduler` (universal `Popen` fallback).
 - `--scheduler {auto,launchd,systemd,cron,polling}` flag to override auto-detection.
