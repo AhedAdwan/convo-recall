@@ -522,7 +522,10 @@ ok "14e sandbox-script guard block present in all 5 destructive scripts"
 
 # 14f — --confirm bypasses the prompt. If argparse plumbing for --confirm
 # regresses, the command hangs on stdin read; the timeout catches that.
-timeout 30 "$RECALL" chunk-backfill --confirm </dev/null > /dev/null 2>&1
+# 180s budget covers DBs up to ~1000 messages on CPU-only sidecar; smaller
+# than that runs in well under 30s. Bumped from 30s after a real run with
+# 344 msgs needed ~68s of legitimate re-embedding work.
+timeout 180 "$RECALL" chunk-backfill --confirm </dev/null > /dev/null 2>&1
 rc=$?
 [[ $rc -ne 124 ]] || fail "chunk-backfill --confirm hung — argparse plumbing for --confirm regressed"
 [[ $rc -eq 0 ]]   || fail "chunk-backfill --confirm crashed (rc=$rc)"
