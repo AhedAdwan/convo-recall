@@ -354,6 +354,33 @@ Notes:
 - Set `CONVO_RECALL_HOOK_LOG=/some/path.log` to log every hook firing for debugging.
 - Tested e2e in the claude-sandbox container: see `tests/sandbox-hooks-e2e.sh`. The test wires the hook into all three CLIs, runs each headless (`claude -p`, `codex exec`, `gemini -p --yolo --skip-trust`), and verifies the model actually receives the hint by asking it to echo the word "convo-recall" back.
 
+### Continuous ingest (response-completion hooks)
+
+The schedulers (launchd / systemd / cron / polling) handle ingest by watching session directories for new files. On macOS launchd's `WatchPaths` is genuinely recursive, so file appends inside existing project subdirs trigger ingest cleanly. **On Linux** systemd `.path` units (`PathChanged=` / `PathModified=`) are non-recursive by design — a write to `~/.claude/projects/<flat-cwd>/<sid>.jsonl` does NOT fire the parent-dir watcher, so live appends in long-running sessions are silently missed until a new project dir appears.
+
+To close that gap, convo-recall installs a **second hook** alongside the search hook: `conversation-ingest.sh` fires on each CLI's response-completion event and spawns `recall ingest` detached + backgrounded.
+
+| CLI | Event | Per-turn? |
+|---|---|---|
+| Claude Code | `Stop` | ✅ yes (mature, 21+ events) |
+| Gemini CLI | `AfterAgent` | ✅ yes (default-on since v0.26.0) |
+| Codex CLI | `Stop` | ⚠ session-end only — Codex hook system limitation |
+
+**Codex caveats:** Codex hooks are experimental and gated behind `[features] codex_hooks = true` in `~/.codex/config.toml`. `recall install` writes the flag automatically when safely mergeable; skips with a warning when the file is invalid TOML or when running on Windows (Codex hooks are unsupported there).
+
+**Throttling:** the ingest hook uses a 5-second lock file at `${XDG_RUNTIME_DIR:-/tmp}/convo-recall/ingest.lock`. If another ingest fired within the last 5 seconds, the hook is a no-op — safe under chatty per-turn firings.
+
+```bash
+recall install-hooks --kind ingest          # wire only the ingest hook
+recall install-hooks --kind memory          # wire only the search hook
+recall install-hooks                        # both (default)
+recall doctor                               # shows per-agent wired/NOT-wired state
+```
+
+**Opt out** without uninstalling: `CONVO_RECALL_INGEST_HOOK=off`.
+
+The hook is **additive** to existing schedulers — they all stay installed. Ingest now fires from the soonest of {scheduler tick, response completion}.
+
 ---
 
 ## Privacy

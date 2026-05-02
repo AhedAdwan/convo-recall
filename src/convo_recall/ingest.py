@@ -2672,6 +2672,42 @@ def doctor(con: apsw.Connection, scan_secrets: bool = False) -> None:
               f"projects-table row.")
         print("  → re-ingest will recreate the missing rows; otherwise file an issue.")
 
+    # Ingest hook installation status — surfaces missing-hook state for users
+    # who upgraded but didn't re-run `recall install`.
+    print("\nIngest hook (response-completion driven):")
+    try:
+        from .install._hooks import _hook_target, _find_hook_script
+        ingest_script = _find_hook_script("ingest")
+        not_wired_count = 0
+        for agent in ("claude", "codex", "gemini"):
+            try:
+                settings_path, event, label = _hook_target(agent, "ingest")
+            except ValueError:
+                continue
+            wired = False
+            if settings_path.exists():
+                try:
+                    data = json.loads(settings_path.read_text())
+                    groups = (data.get("hooks") or {}).get(event) or []
+                    for g in groups:
+                        for h in g.get("hooks", []):
+                            if h.get("command") == str(ingest_script):
+                                wired = True
+                                break
+                        if wired:
+                            break
+                except (OSError, json.JSONDecodeError):
+                    pass
+            marker = "✅" if wired else "·"
+            state = "wired" if wired else "NOT wired"
+            print(f"  {marker} {label:<7} {event:<14} {state}  ({settings_path})")
+            if not wired:
+                not_wired_count += 1
+        if not_wired_count:
+            print("  → re-run `recall install-hooks --kind ingest` to wire missing hooks")
+    except (RuntimeError, ImportError):
+        print("  (could not locate conversation-ingest.sh)")
+
     stale = _scan_stale_bak_files(DB_PATH.parent)
     if stale:
         print(f"\nStale `.bak` files in {DB_PATH.parent} "

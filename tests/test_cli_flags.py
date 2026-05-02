@@ -58,3 +58,27 @@ def test_tail_help_shows_cwd_flag():
     r = _run("tail", "--help")
     assert r.returncode == 0
     assert "--cwd" in r.stdout
+
+
+# ── H06: install-hooks --kind flag ──────────────────────────────────────────
+
+
+def test_install_hooks_kind_flag_accepts_memory_ingest_both():
+    """--kind accepts memory, ingest, both — argparse lists all three choices."""
+    r = _run("install-hooks", "--help")
+    assert r.returncode == 0
+    assert "--kind {memory,ingest,both}" in r.stdout
+
+
+def test_install_hooks_rejects_unknown_kind():
+    r = _run("install-hooks", "--kind", "bogus", "--dry-run")
+    assert r.returncode != 0
+    err = r.stderr.lower()
+    for name in ("memory", "ingest", "both"):
+        assert name in err, f"missing {name} in argparse error: {r.stderr}"
+
+
+def test_uninstall_hooks_help_shows_kind_flag():
+    r = _run("uninstall-hooks", "--help")
+    assert r.returncode == 0
+    assert "--kind" in r.stdout

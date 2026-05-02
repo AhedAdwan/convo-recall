@@ -907,7 +907,7 @@ def test_install_hooks_wires_each_cli_correctly(tmp_path, monkeypatch):
     (home / ".gemini" / "settings.json").write_text(json.dumps({"existing": "config"}))
     # codex hooks.json doesn't exist yet — install should create it
 
-    def fake_target(agent):
+    def fake_target(agent, kind="memory"):
         if agent == "claude":
             return home / ".claude" / "settings.json", "UserPromptSubmit", "claude"
         if agent == "codex":
@@ -954,8 +954,9 @@ def test_install_hooks_is_idempotent(tmp_path, monkeypatch):
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)
     (home / ".claude" / "settings.json").write_text("{}")
-    monkeypatch.setattr("convo_recall.install._hooks._hook_target", lambda a:
-        (home / ".claude" / "settings.json", "UserPromptSubmit", "claude"))
+    monkeypatch.setattr("convo_recall.install._hooks._hook_target",
+        lambda a, kind="memory":
+            (home / ".claude" / "settings.json", "UserPromptSubmit", "claude"))
 
     n1 = _install.install_hooks(agents=["claude"], non_interactive=True)
     n2 = _install.install_hooks(agents=["claude"], non_interactive=True)
@@ -983,14 +984,17 @@ def test_uninstall_hooks_removes_only_convo_recall_block(tmp_path, monkeypatch):
             ]
         }
     }))
-    monkeypatch.setattr("convo_recall.install._hooks._hook_target", lambda a:
-        (settings_path, "UserPromptSubmit", "claude"))
+    monkeypatch.setattr("convo_recall.install._hooks._hook_target",
+        lambda a, kind="memory":
+            (settings_path, "UserPromptSubmit", "claude"))
 
     _install.install_hooks(agents=["claude"], non_interactive=True)
     cfg = json.loads(settings_path.read_text())
     assert len(cfg["hooks"]["UserPromptSubmit"]) == 2, "both hooks should be present"
 
-    removed = _install.uninstall_hooks(agents=["claude"])
+    # Restrict to memory kind so the default-both walk doesn't try to remove
+    # the (non-existent) ingest hook block from the same fake settings file.
+    removed = _install.uninstall_hooks(agents=["claude"], kinds=("memory",))
     assert removed == 1
     cfg = json.loads(settings_path.read_text())
     upr = cfg["hooks"]["UserPromptSubmit"]
@@ -1006,8 +1010,9 @@ def test_install_hooks_dry_run_does_not_write(tmp_path, monkeypatch):
     settings_path = home / ".claude" / "settings.json"
     original = json.dumps({"theme": "dark"})
     settings_path.write_text(original)
-    monkeypatch.setattr("convo_recall.install._hooks._hook_target", lambda a:
-        (settings_path, "UserPromptSubmit", "claude"))
+    monkeypatch.setattr("convo_recall.install._hooks._hook_target",
+        lambda a, kind="memory":
+            (settings_path, "UserPromptSubmit", "claude"))
 
     _install.install_hooks(agents=["claude"], dry_run=True, non_interactive=True)
     assert settings_path.read_text() == original, "dry_run should not modify file"
@@ -1541,6 +1546,49 @@ def test_doctor_recommends_install_command_when_extra_missing(db, tmp_path, monk
     assert "Embed extra      : NOT installed" in out
     assert "pipx install" in out
     assert "convo-recall[embeddings]" in out
+
+
+def test_doctor_reports_ingest_hook_state_per_agent(db, tmp_path, monkeypatch, capsys):
+    """doctor() reports per-CLI ingest-hook wired/NOT wired so users who
+    upgraded but didn't re-install see what's missing."""
+    import json
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+
+    # Locate the real ingest hook script so the wired check matches it.
+    from convo_recall.install._hooks import _find_hook_script
+    ingest_script = _find_hook_script("ingest")
+
+    # Wire claude with the matching command; leave codex/gemini unwired.
+    claude_settings = tmp_path / ".claude" / "settings.json"
+    claude_settings.parent.mkdir(parents=True)
+    claude_settings.write_text(json.dumps({
+        "hooks": {
+            "Stop": [{"hooks": [{"type": "command",
+                                  "command": str(ingest_script)}]}]
+        }
+    }))
+    # Codex settings exist but no convo-recall hook.
+    codex_settings = tmp_path / ".codex" / "hooks.json"
+    codex_settings.parent.mkdir(parents=True)
+    codex_settings.write_text(json.dumps({"hooks": {}}))
+    # Gemini settings absent entirely.
+
+    capsys.readouterr()
+    ingest.doctor(db)
+    out = capsys.readouterr().out
+    assert "Ingest hook" in out
+    # Claude: wired
+    assert "claude" in out
+    claude_line = next(l for l in out.splitlines() if "claude" in l and "Stop" in l)
+    assert "wired" in claude_line and "NOT" not in claude_line
+    # Codex / Gemini: NOT wired
+    codex_line = next(l for l in out.splitlines() if "codex" in l and "Stop" in l)
+    assert "NOT wired" in codex_line
+    gemini_line = next(l for l in out.splitlines() if "gemini" in l and "AfterAgent" in l)
+    assert "NOT wired" in gemini_line
+    # Repair hint surfaces when anything is missing.
+    assert "install-hooks --kind ingest" in out
 
 
 # ── F-9: FTS5 query sanitization ─────────────────────────────────────────────

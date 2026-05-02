@@ -1,37 +1,59 @@
-"""Pre-prompt hook wiring — platform-agnostic, orthogonal to scheduler choice.
+"""Pre-prompt + ingest hook wiring — platform-agnostic, orthogonal to scheduler choice.
 
 Edits each CLI's settings file (`~/.claude/settings.json`,
-`~/.codex/hooks.json`, `~/.gemini/settings.json`) to insert a hook
-block pointing at the bundled `conversation-memory.sh`.
+`~/.codex/hooks.json`, `~/.gemini/settings.json`) to insert hook blocks
+pointing at the bundled `conversation-memory.sh` (search hook) and
+`conversation-ingest.sh` (response-completion ingest hook).
 
 Idempotent on re-wire (matches an existing hook by command path) and
-preserves the user's other hooks on uninstall.
+preserves the user's other hooks on uninstall. The same helper functions
+parameterize on `hook_kind: Literal["memory", "ingest"]` — block shape
+only depends on the agent (Gemini differs from Claude/Codex), event name
+depends on kind.
 """
 
 import importlib.resources as _resources
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
+from typing import Literal, Sequence
 
 
-# Maps agent → (settings file path, hook event name, agent label).
-def _hook_target(agent: str) -> tuple[Path, str, str]:
-    """Return (settings_path, event_name, agent_label) for a given agent."""
+HookKind = Literal["memory", "ingest"]
+
+
+def _hook_target(agent: str, kind: HookKind = "memory") -> tuple[Path, str, str]:
+    """Return (settings_path, event_name, agent_label) for (agent, kind).
+
+    `kind="memory"` → search hook fires on UserPromptSubmit / BeforeAgent.
+    `kind="ingest"` → ingest hook fires on Stop / AfterAgent.
+    """
     if agent == "claude":
-        return Path.home() / ".claude" / "settings.json", "UserPromptSubmit", "claude"
+        path = Path.home() / ".claude" / "settings.json"
+        event = "UserPromptSubmit" if kind == "memory" else "Stop"
+        return path, event, "claude"
     if agent == "codex":
-        return Path.home() / ".codex" / "hooks.json", "UserPromptSubmit", "codex"
+        path = Path.home() / ".codex" / "hooks.json"
+        event = "UserPromptSubmit" if kind == "memory" else "Stop"
+        return path, event, "codex"
     if agent == "gemini":
-        return Path.home() / ".gemini" / "settings.json", "BeforeAgent", "gemini"
+        path = Path.home() / ".gemini" / "settings.json"
+        event = "BeforeAgent" if kind == "memory" else "AfterAgent"
+        return path, event, "gemini"
     raise ValueError(f"unknown agent: {agent}")
 
 
 def _hook_block(agent: str, hook_script: Path) -> dict:
-    """Build the hook block to insert under settings.hooks[event]."""
+    """Build the hook block to insert under settings.hooks[event].
+
+    Block shape depends only on the agent (Gemini uses millisecond
+    timeouts and a `name` field). Same shape works for memory and
+    ingest hooks — only the event name differs.
+    """
     if agent == "gemini":
-        # Gemini uses millisecond timeouts and requires a `name` field.
         return {
             "matcher": "*",
             "hooks": [{
@@ -41,7 +63,6 @@ def _hook_block(agent: str, hook_script: Path) -> dict:
                 "timeout": 5000,
             }],
         }
-    # Claude and Codex share the same shape; timeout is in seconds.
     return {
         "hooks": [{
             "type": "command",
@@ -58,22 +79,27 @@ def _hook_block_signature(agent: str, hook_script: Path) -> str:
     return str(hook_script)
 
 
-def _find_hook_script() -> Path:
-    """Locate the bundled `conversation-memory.sh`. Tries the editable-install
-    path first (works in dev), falls back to importlib.resources (works
-    after pipx install)."""
-    here = Path(__file__).resolve().parent.parent / "hooks" / "conversation-memory.sh"
+_HOOK_SCRIPT_NAMES: dict[HookKind, str] = {
+    "memory": "conversation-memory.sh",
+    "ingest": "conversation-ingest.sh",
+}
+
+
+def _find_hook_script(kind: HookKind = "memory") -> Path:
+    """Locate the bundled hook script for the given kind. Tries the
+    editable-install path first (works in dev), falls back to
+    importlib.resources (works after pipx install)."""
+    name = _HOOK_SCRIPT_NAMES[kind]
+    here = Path(__file__).resolve().parent.parent / "hooks" / name
     if here.is_file():
         return here
-    # importlib.resources path for installed wheel
     try:
-        with _resources.path("convo_recall.hooks", "conversation-memory.sh") as p:
+        with _resources.path("convo_recall.hooks", name) as p:
             return Path(p).resolve()
     except (ModuleNotFoundError, FileNotFoundError):
         pass
     raise RuntimeError(
-        "Cannot locate conversation-memory.sh. "
-        "Reinstall convo-recall and try again."
+        f"Cannot locate {name}. Reinstall convo-recall and try again."
     )
 
 
@@ -82,14 +108,85 @@ def _backup_path(p: Path) -> Path:
     return p.with_name(p.name + f".bak.{int(time.time())}")
 
 
+def _ensure_codex_hooks_feature_flag() -> tuple[bool, str]:
+    """Ensure ~/.codex/config.toml has [features] codex_hooks = true.
+
+    Codex hooks are experimental and gated behind this flag. Auto-write
+    when safe (file missing OR present and valid TOML where insertion
+    yields valid TOML); skip-with-warning otherwise so we never corrupt
+    user config.
+
+    Returns (ok, message). ok=False means we couldn't safely write the
+    flag — caller should skip Codex hook installation.
+    """
+    config_path = Path.home() / ".codex" / "config.toml"
+    flag_line = "codex_hooks = true"
+    section = "[features]"
+
+    if not config_path.exists():
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(f"{section}\n{flag_line}\n")
+        try:
+            os.chmod(config_path, 0o600)
+        except OSError:
+            pass
+        return True, f"  ✅ codex: wrote {config_path} with codex_hooks=true"
+
+    try:
+        text = config_path.read_text()
+    except OSError as e:
+        return False, f"  ⚠ codex: config.toml unreadable ({e}); skipping"
+
+    if re.search(r"codex_hooks\s*=\s*true", text):
+        return True, f"  · codex: codex_hooks already enabled in {config_path}"
+
+    try:
+        import tomllib
+    except ImportError:
+        return False, "  ⚠ codex: tomllib unavailable (Python <3.11); skipping"
+
+    try:
+        tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        return False, f"  ⚠ codex: config.toml is invalid TOML ({e}); skipping"
+
+    if section in text:
+        new_text = re.sub(
+            re.escape(section) + r"\s*\n",
+            f"{section}\n{flag_line}\n",
+            text,
+            count=1,
+        )
+    else:
+        new_text = text.rstrip() + f"\n\n{section}\n{flag_line}\n"
+
+    try:
+        tomllib.loads(new_text)
+    except tomllib.TOMLDecodeError as e:
+        return False, f"  ⚠ codex: would corrupt config.toml ({e}); skipping"
+
+    backup = _backup_path(config_path)
+    backup.write_bytes(config_path.read_bytes())
+    config_path.write_text(new_text)
+    try:
+        os.chmod(config_path, 0o600)
+    except OSError:
+        pass
+    return True, (
+        f"  ✅ codex: enabled codex_hooks in {config_path} "
+        f"(backup: {backup.name})"
+    )
+
+
 def _wire_hook(agent: str, hook_script: Path,
-               *, dry_run: bool = False) -> tuple[bool, str]:
-    """Wire the convo-recall pre-prompt hook into one CLI's settings file.
+               *, kind: HookKind = "memory",
+               dry_run: bool = False) -> tuple[bool, str]:
+    """Wire a convo-recall hook (memory or ingest) into one CLI's settings file.
 
     Returns (changed, message). Idempotent: if a hook block with the same
     command path already exists for the right event, no-op.
     """
-    settings_path, event, label = _hook_target(agent)
+    settings_path, event, label = _hook_target(agent, kind)
     existing: dict = {}
     if settings_path.exists():
         try:
@@ -101,26 +198,23 @@ def _wire_hook(agent: str, hook_script: Path,
     sig = _hook_block_signature(agent, hook_script)
 
     hooks_root = existing.setdefault("hooks", {}) if not dry_run else (
-        # Build a copy for diffing; never mutate `existing` in dry-run.
         json.loads(json.dumps(existing.get("hooks", {})))
     )
     event_groups = hooks_root.setdefault(event, [])
 
-    # Idempotency: scan existing groups for a hook command that matches.
     for group in event_groups:
         for entry in group.get("hooks", []):
             if entry.get("command") == sig:
-                return False, f"  · {label}: hook already wired ({settings_path})"
+                return False, f"  · {label}: {kind} hook already wired ({settings_path})"
 
     if dry_run:
         return True, (
-            f"  + {label}: would add convo-recall hook to "
+            f"  + {label}: would add convo-recall {kind} hook to "
             f"{settings_path} → hooks.{event}"
         )
 
     event_groups.append(new_block)
 
-    # Atomic write with mode 0o600 (settings can include API keys).
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     if settings_path.exists():
         backup = _backup_path(settings_path)
@@ -135,10 +229,13 @@ def _wire_hook(agent: str, hook_script: Path,
     except OSError:
         pass
     tmp.replace(settings_path)
-    return True, f"  ✅ {label}: hook wired into {settings_path}{backup_msg}"
+    return True, f"  ✅ {label}: {kind} hook wired into {settings_path}{backup_msg}"
 
 
-_ORPHAN_HOOK_SUFFIX = "convo_recall/hooks/conversation-memory.sh"
+_ORPHAN_HOOK_SUFFIXES = (
+    "convo_recall/hooks/conversation-memory.sh",
+    "convo_recall/hooks/conversation-ingest.sh",
+)
 
 
 def _is_convo_recall_hook(cmd: str | None, current_sig: str) -> bool:
@@ -155,15 +252,17 @@ def _is_convo_recall_hook(cmd: str | None, current_sig: str) -> bool:
         return False
     if cmd == current_sig:
         return True
-    return cmd.endswith(_ORPHAN_HOOK_SUFFIX)
+    return any(cmd.endswith(suffix) for suffix in _ORPHAN_HOOK_SUFFIXES)
 
 
-def _unwire_hook(agent: str, hook_script: Path) -> tuple[bool, str]:
+def _unwire_hook(agent: str, hook_script: Path,
+                 *, kind: HookKind = "memory") -> tuple[bool, str]:
     """Remove the convo-recall hook block from a CLI's settings — matched
-    by current install path AND by suffix `convo_recall/hooks/conversation-memory.sh`
-    so orphans from prior installs at other paths are cleaned too.
-    Leaves user's other hooks untouched."""
-    settings_path, event, label = _hook_target(agent)
+    by current install path AND by suffix
+    `convo_recall/hooks/conversation-{memory,ingest}.sh` so orphans from
+    prior installs at other paths are cleaned too. Leaves user's other
+    hooks untouched."""
+    settings_path, event, label = _hook_target(agent, kind)
     if not settings_path.exists():
         return False, f"  · {label}: no settings file; nothing to remove"
     try:
@@ -190,7 +289,7 @@ def _unwire_hook(agent: str, hook_script: Path) -> tuple[bool, str]:
             new_group["hooks"] = kept_hooks
             new_groups.append(new_group)
     if not removed:
-        return False, f"  · {label}: no convo-recall hook found; nothing to remove"
+        return False, f"  · {label}: no convo-recall {kind} hook found; nothing to remove"
     if new_groups:
         hooks_root[event] = new_groups
     else:
@@ -206,26 +305,25 @@ def _unwire_hook(agent: str, hook_script: Path) -> tuple[bool, str]:
     except OSError:
         pass
     tmp.replace(settings_path)
-    return True, f"  ✅ {label}: hook removed from {settings_path} (backup: {backup.name})"
+    return True, f"  ✅ {label}: {kind} hook removed from {settings_path} (backup: {backup.name})"
 
 
 def install_hooks(agents: list[str] | None = None,
                   *, dry_run: bool = False,
-                  non_interactive: bool = False) -> int:
+                  non_interactive: bool = False,
+                  kinds: Sequence[HookKind] = ("memory",)) -> int:
     """Standalone hook-wiring entry point. Used both by `recall install-hooks`
     and as one stage of the full `recall install` wizard.
 
-    Returns the count of CLIs actually changed. Skips agents with no
-    detectable source dir unless `agents` is passed explicitly.
+    `kinds` selects which hook(s) to wire. Default is `("memory",)` for
+    backward compatibility with existing call sites; pass `("ingest",)`
+    or `("memory", "ingest")` for the new ingest hook.
+
+    Returns the count of (CLI, kind) pairs actually changed. Skips agents
+    with no detectable source dir unless `agents` is passed explicitly.
     """
     import convo_recall.ingest as _ingest
     from . import _ask  # late import: _ask lives in __init__.py
-
-    try:
-        hook_script = _find_hook_script()
-    except RuntimeError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 0
 
     if agents is None:
         detected = _ingest.detect_agents()
@@ -234,50 +332,82 @@ def install_hooks(agents: list[str] | None = None,
             print("No agent source directories detected. Nothing to wire.")
             return 0
 
-    print(f"Pre-prompt hook script: {hook_script}\n")
     if dry_run:
         print("[dry-run] showing what would change:\n")
 
     changed = 0
-    for agent in agents:
-        if agent not in ("claude", "codex", "gemini"):
-            print(f"  ⚠  unknown agent {agent!r}, skipping")
+    for kind in kinds:
+        try:
+            hook_script = _find_hook_script(kind)
+        except RuntimeError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
             continue
-        if not non_interactive and not dry_run:
-            settings_path, event, label = _hook_target(agent)
-            consent = _ask(
-                f"Wire convo-recall hook for {label.title()} ({settings_path})?",
-                default=True,
-                if_yes=f"{label.title()} will see a 'search history first' hint on every prompt.",
-                if_no=f"{label.title()} won't know convo-recall exists. "
-                      f"Re-run `recall install-hooks --agent {label}` later to wire it.",
-                non_interactive=False,
-            )
-            if not consent:
-                print(f"  · {label}: skipped by user")
+        print(f"{kind.title()} hook script: {hook_script}\n")
+
+        for agent in agents:
+            if agent not in ("claude", "codex", "gemini"):
+                print(f"  ⚠  unknown agent {agent!r}, skipping")
                 continue
-        did_change, msg = _wire_hook(agent, hook_script, dry_run=dry_run)
-        print(msg)
-        if did_change and not dry_run:
-            changed += 1
+
+            # Codex ingest needs the codex_hooks feature flag enabled.
+            if kind == "ingest" and agent == "codex":
+                if not dry_run:
+                    ok, msg = _ensure_codex_hooks_feature_flag()
+                    print(msg)
+                    if not ok:
+                        continue
+
+            if not non_interactive and not dry_run:
+                settings_path, event, label = _hook_target(agent, kind)
+                verb = "search" if kind == "memory" else "ingest"
+                consent = _ask(
+                    f"Wire convo-recall {verb} hook for {label.title()} ({settings_path})?",
+                    default=True,
+                    if_yes=(
+                        f"{label.title()} will see a 'search history first' hint on every prompt."
+                        if kind == "memory"
+                        else f"{label.title()} fires `recall ingest` after every agent turn."
+                    ),
+                    if_no=(
+                        f"{label.title()} won't know convo-recall exists. "
+                        f"Re-run `recall install-hooks --agent {label}` later to wire it."
+                        if kind == "memory"
+                        else f"{label.title()} won't auto-ingest on turn end. "
+                             f"Re-run `recall install-hooks --kind ingest --agent {label}` later."
+                    ),
+                    non_interactive=False,
+                )
+                if not consent:
+                    print(f"  · {label}: skipped by user")
+                    continue
+            did_change, msg = _wire_hook(agent, hook_script, kind=kind, dry_run=dry_run)
+            print(msg)
+            if did_change and not dry_run:
+                changed += 1
     return changed
 
 
-def uninstall_hooks(agents: list[str] | None = None) -> int:
-    """Remove convo-recall hook blocks from each CLI's settings file."""
-    try:
-        hook_script = _find_hook_script()
-    except RuntimeError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 0
+def uninstall_hooks(agents: list[str] | None = None,
+                    *, kinds: Sequence[HookKind] = ("memory", "ingest")) -> int:
+    """Remove convo-recall hook blocks from each CLI's settings file.
+
+    By default walks BOTH memory and ingest hooks so a single uninstall
+    cleans up after any prior install path.
+    """
     if agents is None:
         agents = ["claude", "codex", "gemini"]
     removed = 0
-    for agent in agents:
-        if agent not in ("claude", "codex", "gemini"):
+    for kind in kinds:
+        try:
+            hook_script = _find_hook_script(kind)
+        except RuntimeError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
             continue
-        did_remove, msg = _unwire_hook(agent, hook_script)
-        print(msg)
-        if did_remove:
-            removed += 1
+        for agent in agents:
+            if agent not in ("claude", "codex", "gemini"):
+                continue
+            did_remove, msg = _unwire_hook(agent, hook_script, kind=kind)
+            print(msg)
+            if did_remove:
+                removed += 1
     return removed

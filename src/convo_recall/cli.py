@@ -58,6 +58,10 @@ def main() -> None:
     p_install_hooks.add_argument("--agent", action="append",
                                   choices=["claude", "codex", "gemini"],
                                   help="Limit to one CLI; repeatable")
+    p_install_hooks.add_argument("--kind",
+                                  choices=["memory", "ingest", "both"],
+                                  default="both",
+                                  help="Which hook(s) to wire (default: both)")
     p_install_hooks.add_argument("--dry-run", action="store_true",
                                   help="Print what would change without writing")
     p_install_hooks.add_argument("-y", "--non-interactive", action="store_true",
@@ -70,6 +74,10 @@ def main() -> None:
     p_uninstall_hooks.add_argument("--agent", action="append",
                                     choices=["claude", "codex", "gemini"],
                                     help="Limit to one CLI; repeatable")
+    p_uninstall_hooks.add_argument("--kind",
+                                    choices=["memory", "ingest", "both"],
+                                    default="both",
+                                    help="Which hook(s) to remove (default: both)")
 
     p_uninstall = sub.add_parser(
         "uninstall",
@@ -229,15 +237,20 @@ def main() -> None:
         return
 
     if args.cmd == "install-hooks":
+        kind = getattr(args, "kind", "both")
+        kinds = ("memory", "ingest") if kind == "both" else (kind,)
         _install.install_hooks(
             agents=getattr(args, "agent", None),
             dry_run=getattr(args, "dry_run", False),
             non_interactive=getattr(args, "non_interactive", False),
+            kinds=kinds,
         )
         return
 
     if args.cmd == "uninstall-hooks":
-        _install.uninstall_hooks(agents=getattr(args, "agent", None))
+        kind = getattr(args, "kind", "both")
+        kinds = ("memory", "ingest") if kind == "both" else (kind,)
+        _install.uninstall_hooks(agents=getattr(args, "agent", None), kinds=kinds)
         return
 
     if args.cmd == "serve":

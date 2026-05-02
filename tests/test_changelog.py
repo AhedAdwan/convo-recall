@@ -57,3 +57,18 @@ def test_changelog_has_project_id_entry():
     assert "display_name" in unreleased, "Unreleased block must mention display_name"
     assert "v4" in unreleased.lower() or "_MIGRATION_PROJECT_ID" in unreleased, \
         "Unreleased block must reference the v4 migration"
+
+
+def test_changelog_documents_ingest_hook():
+    """Phase 1 hook-driven ingest: Unreleased must announce the new hook,
+    the Codex caveat, and the opt-out env var."""
+    text = _read()
+    after = text.split("## [Unreleased]", 1)[1]
+    unreleased = after.split("\n## [", 1)[0]
+    assert "Response-completion ingest hooks" in unreleased, \
+        "Unreleased block missing the ingest-hook announcement"
+    assert "Codex" in unreleased, "Unreleased block should mention the Codex caveat"
+    assert "CONVO_RECALL_INGEST_HOOK" in unreleased, \
+        "Unreleased block should document the opt-out env var"
+    assert "--kind" in unreleased, \
+        "Unreleased block should mention the new --kind CLI flag"

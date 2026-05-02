@@ -83,14 +83,14 @@ ok()    { green "  ✅ $current — $*"; }
 sec()   { current="$1"; echo; echo "═══ $1 ═══"; }
 
 # ── Shared fresh-state bootstrap ───────────────────────────────────────────────
-sec "0/16 bootstrap"
+sec "0/17 bootstrap"
 mkdir -p "$(dirname "$CONVO_RECALL_CONFIG")"
 echo '{"agents": ["claude", "gemini", "codex"]}' > "$CONVO_RECALL_CONFIG"
 rm -f "$CONVO_RECALL_DB" "$CONVO_RECALL_DB-wal" "$CONVO_RECALL_DB-shm"
 ok "fresh DB + 3-agent config"
 
 # ── 1. sidecar health ─────────────────────────────────────────────────────────
-sec "1/16 sidecar health"
+sec "1/17 sidecar health"
 healthz=$(curl --silent --unix-socket "$CONVO_RECALL_SOCK" http://localhost/healthz)
 echo "$healthz" \
   | "$PY" -c 'import json,sys; d=json.load(sys.stdin); assert d.get("dim")==1024 and "model" in d, d' \
@@ -98,7 +98,7 @@ echo "$healthz" \
 ok "sidecar reports model + dim=1024"
 
 # ── 2. agent detection ────────────────────────────────────────────────────────
-sec "2/16 detect_agents()"
+sec "2/17 detect_agents()"
 detect_out=$("$PY" -c "
 import sys; sys.path.insert(0, '${REPO_ROOT}/src')
 import convo_recall.ingest as i
@@ -111,7 +111,7 @@ echo "$detect_out" | grep -qE '^codex\s+[1-9]'  || fail "codex not detected"
 ok "all three agents detected with file_count > 0"
 
 # ── 3. config round-trip ──────────────────────────────────────────────────────
-sec "3/16 config save/load round-trip"
+sec "3/17 config save/load round-trip"
 "$PY" -c "
 import os, sys
 sys.path.insert(0, '${REPO_ROOT}/src')
@@ -127,7 +127,7 @@ rm -f /tmp/cr-roundtrip.json
 ok "save_config + load_config preserve {'agents': [...]} exactly"
 
 # ── 4. fresh ingest of all three agents ───────────────────────────────────────
-sec "4/16 fresh 3-agent ingest"
+sec "4/17 fresh 3-agent ingest"
 ingest_log=$(mktemp)
 "$RECALL" ingest > "$ingest_log" 2>&1 || { cat "$ingest_log"; fail "exit nonzero"; }
 grep -q "Traceback (most recent call last)" "$ingest_log" \
@@ -144,7 +144,7 @@ print(con.execute('SELECT COUNT(*) FROM messages').fetchone()[0])
 ok "$total_inserted messages from 3 agents, no tracebacks"
 
 # ── 5. idempotent re-ingest ───────────────────────────────────────────────────
-sec "5/16 idempotent re-ingest"
+sec "5/17 idempotent re-ingest"
 before=$total_inserted
 "$RECALL" ingest > /dev/null 2>&1
 after=$("$PY" -c "
@@ -159,14 +159,14 @@ print(con.execute('SELECT COUNT(*) FROM messages').fetchone()[0])
 ok "second ingest added 0 rows ($after total unchanged)"
 
 # ── 6. --agent X scoped ingest ────────────────────────────────────────────────
-sec "6/16 recall ingest --agent codex"
+sec "6/17 recall ingest --agent codex"
 out=$("$RECALL" ingest --agent codex 2>&1)
 # Should be 0 new (already ingested) but should not error
 echo "$out" | grep -q "Traceback" && fail "traceback in --agent codex ingest"
 ok "per-agent ingest accepted, no new rows expected"
 
 # ── 7. legacy-schema migration ────────────────────────────────────────────────
-sec "7/16 migration on legacy schema (no agent column)"
+sec "7/17 migration on legacy schema (no agent column)"
 LEGACY_DB=/tmp/cr-legacy-test.db
 rm -f "$LEGACY_DB"*
 "$PY" -c "
@@ -205,7 +205,7 @@ rm -f "$LEGACY_DB"*
 ok "ALTER TABLE + FTS rebuild + agent backfill all worked"
 
 # ── 8a. search --all-projects with all 3 tags ────────────────────────────────
-sec "8a/16 search --all-projects shows all 3 tags"
+sec "8a/17 search --all-projects shows all 3 tags"
 all_log=$(mktemp)
 "$RECALL" search "the" --all-projects -n 50 -c 0 > "$all_log" 2>&1
 for agent in claude gemini codex; do
@@ -214,7 +214,7 @@ done
 ok "all 3 tags present"
 
 # ── 8b. --agent X exclusivity ────────────────────────────────────────────────
-sec "8b/16 --agent X is exclusive"
+sec "8b/17 --agent X is exclusive"
 for agent in claude gemini codex; do
   out=$(mktemp)
   "$RECALL" search "the" --agent "$agent" --all-projects -n 50 -c 0 > "$out" 2>&1 || true
@@ -229,7 +229,7 @@ done
 ok "no agent tag leakage with --agent X"
 
 # ── 8c. --project filter ──────────────────────────────────────────────────────
-sec "8c/16 --project X filter (display_name resolution post-v4)"
+sec "8c/17 --project X filter (display_name resolution post-v4)"
 # Discover an existing display_name from the projects table — names are
 # now derived from cwd basenames or marker walks, not from path-flatten slugs.
 discovered_display=$("$PY" -c "
@@ -265,13 +265,13 @@ if results:
 ok "JSON output includes project_id + display_name"
 
 # ── 8d. --context N before/after ──────────────────────────────────────────────
-sec "8d/16 --context 1 shows before/after lines"
+sec "8d/17 --context 1 shows before/after lines"
 ctx_out=$("$RECALL" search "the" --all-projects -n 1 -c 1 2>&1)
 echo "$ctx_out" | grep -qE "↑|↓" || { echo "$ctx_out"; fail "--context 1 produced no ↑/↓ lines"; }
 ok "context lines printed"
 
 # ── 8e. --recent decay ────────────────────────────────────────────────────────
-sec "8e/16 --recent flag accepted"
+sec "8e/17 --recent flag accepted"
 "$RECALL" search "the" --all-projects --recent -n 3 -c 0 > /tmp/recent.log 2>&1 \
   || { cat /tmp/recent.log; fail "--recent crashed"; }
 grep -q "\[hybrid+recent search\]" /tmp/recent.log \
@@ -279,7 +279,7 @@ grep -q "\[hybrid+recent search\]" /tmp/recent.log \
 ok "--recent runs and reports recent-mode header"
 
 # ── 8f. cwd auto-scope (post-v4: --cwd flag + display_name resolution) ──────
-sec "8f/16 cwd auto-scope via --cwd flag (post-v4)"
+sec "8f/17 cwd auto-scope via --cwd flag (post-v4)"
 # Build a temp dir with a .git marker → display_name = basename of the dir.
 auto_dir=$(mktemp -d -t cr-cwd-test.XXXXXX)
 mkdir -p "$auto_dir/.git"
@@ -295,14 +295,14 @@ rm -rf "$auto_dir"
 ok "--cwd flag drives display_name resolution"
 
 # ── 8g. no-results query (via nonexistent project filter) ────────────────────
-sec "8g/16 no-results path via nonexistent --project"
+sec "8g/17 no-results path via nonexistent --project"
 "$RECALL" search "anything" --project no_such_project_zwxq 2>&1 \
   | grep -q "No messages found" \
   || fail "expected 'No messages found' for nonexistent project"
 ok "no-results path"
 
 # ── 9. per-agent stats + embed coverage ───────────────────────────────────────
-sec "9/16 stats + embed coverage"
+sec "9/17 stats + embed coverage"
 stats_log=$(mktemp)
 "$RECALL" stats > "$stats_log"
 embed_pct=$(grep "^Embedded" "$stats_log" | grep -oE "[0-9]+%" | head -1 | tr -d '%')
@@ -314,7 +314,7 @@ done
 ok "embed=$embed_pct%, all 3 agents counted"
 
 # ── 10. backfill commands are no-ops when populated ───────────────────────────
-sec "10/16 backfills are idempotent no-ops"
+sec "10/17 backfills are idempotent no-ops"
 for cmd in embed-backfill backfill-clean tool-error-backfill; do
   out=$("$RECALL" $cmd 2>&1 || true)
   echo "$out" | grep -q "Traceback" && { echo "$out"; fail "traceback in $cmd"; }
@@ -322,7 +322,7 @@ done
 ok "embed-backfill, backfill-clean, tool-error-backfill all clean"
 
 # ── 11. watch loop picks up appended content ─────────────────────────────────
-sec "11/16 watch loop picks up new content"
+sec "11/17 watch loop picks up new content"
 "$RECALL" watch --interval 3 --verbose > /tmp/watch.log 2>&1 &
 WATCH_PID=$!
 trap 'kill $WATCH_PID 2>/dev/null || true' EXIT
@@ -339,7 +339,7 @@ trap - EXIT
 ok "watch loop ingested appended content within 8s"
 
 # ── 12. FTS-only fallback when sidecar gone ──────────────────────────────────
-sec "12/16 FTS-only fallback when sidecar is missing"
+sec "12/17 FTS-only fallback when sidecar is missing"
 SAVED_SOCK="$CONVO_RECALL_SOCK"
 export CONVO_RECALL_SOCK=/tmp/no-such-socket-here.sock
 fts_only_out=$("$RECALL" search "the" --all-projects -n 3 -c 0 2>&1)
@@ -351,7 +351,7 @@ export CONVO_RECALL_SOCK="$SAVED_SOCK"
 ok "search degrades to FTS-only when sidecar absent"
 
 # ── 13. recall tail ───────────────────────────────────────────────────────────
-sec "13/16 recall tail (reverse numbering, ago deltas, agent labels)"
+sec "13/17 recall tail (reverse numbering, ago deltas, agent labels)"
 
 # Pick a session_id known to have at least one user + one assistant message.
 # The fresh ingest in section 4 imported real fixtures from all three agents,
@@ -440,7 +440,7 @@ echo "$all_out" | grep -q "^session " \
 ok "tail: header / reverse-# / agent label / ago delta / JSON / ascii / --all-projects"
 
 # ── 14. safety gates: every destructive command default-denies ─────────────────
-sec "14/16 safety gates default-deny without --confirm"
+sec "14/17 safety gates default-deny without --confirm"
 
 # 14a — `recall uninstall --purge-data` with no TTY and no --confirm MUST
 #       leave the DB intact and print DRY-RUN.
@@ -537,7 +537,7 @@ print(con.execute('SELECT COUNT(*) FROM messages').fetchone()[0])
 ok "14g forget --project nonexistent did NOT delete rows (exact-only enforced)"
 
 # ── 15. projects table + project_id integrity (post-v4) ─────────────────────
-sec "15/16 projects table + project_id integrity"
+sec "15/17 projects table + project_id integrity"
 "$PY" -c "
 import os, sys; sys.path.insert(0, '${REPO_ROOT}/src')
 os.environ['CONVO_RECALL_DB']='$CONVO_RECALL_DB'
@@ -565,10 +565,83 @@ assert not bad, f'malformed project_id values: {bad[:5]}'
 " || fail "malformed project_id in projects table"
 ok "every projects.project_id is 12-hex or recognized synthetic prefix"
 
-# ── 16. summary ──────────────────────────────────────────────────────────────
-sec "16/16 summary"
+# ── 16. ingest hook fires recall ingest on simulated agent turn ──────────────
+sec "16/17 ingest hook fires recall ingest on simulated agent turn"
+
+INGEST_HOOK="$REPO_ROOT/src/convo_recall/hooks/conversation-ingest.sh"
+[[ -x "$INGEST_HOOK" ]] || chmod +x "$INGEST_HOOK"
+
+# Use a per-test lock dir so the user's runtime dir is not touched.
+HOOK_RUNTIME_DIR=$(mktemp -d -t cr-e2e-hook.XXXXXX)
+export XDG_RUNTIME_DIR="$HOOK_RUNTIME_DIR"
+LOCK="$HOOK_RUNTIME_DIR/convo-recall/ingest.lock"
+
+before=$("$PY" -c "
+import os, sys; sys.path.insert(0, '${REPO_ROOT}/src')
+os.environ['CONVO_RECALL_DB']='$CONVO_RECALL_DB'
+import convo_recall.ingest as i
+print(i.open_db(readonly=True).execute('SELECT COUNT(*) FROM messages').fetchone()[0])
+")
+
+# Append a new line to an existing claude session JSONL — the case the
+# systemd .path watcher misses because PathChanged is non-recursive.
+existing=$(find /root/.claude/projects -maxdepth 2 -name '*.jsonl' 2>/dev/null | head -1) || true
+if [[ -z "$existing" ]]; then
+    # Sandbox without claude sessions yet — create one to exercise the path.
+    mkdir -p /root/.claude/projects/-e2e-hook-test
+    existing=/root/.claude/projects/-e2e-hook-test/sess.jsonl
+    cat > "$existing" <<EOF
+{"uuid":"e2e1","type":"user","timestamp":"2026-05-02T00:00:00Z","message":{"role":"user","content":"e2e ingest hook seed"}}
+EOF
+fi
+echo "{\"uuid\":\"e2e-$(date +%s)\",\"type\":\"user\",\"timestamp\":\"2026-05-02T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"e2e hook test $(date +%s)\"}}" >> "$existing"
+sync
+
+# Fire the ingest hook with a synthetic Claude Stop payload.
+echo '{"hook_event_name":"Stop","stop_hook_active":true}' | bash "$INGEST_HOOK" > /dev/null
+# Background ingest needs a moment to land.
+sleep 3
+
+after=$("$PY" -c "
+import os, sys; sys.path.insert(0, '${REPO_ROOT}/src')
+os.environ['CONVO_RECALL_DB']='$CONVO_RECALL_DB'
+import convo_recall.ingest as i
+print(i.open_db(readonly=True).execute('SELECT COUNT(*) FROM messages').fetchone()[0])
+")
+
+[[ "$after" -gt "$before" ]] || \
+    fail "ingest hook didn't increase message count ($before → $after)"
+ok "ingest hook fired recall ingest on Stop payload (+$((after-before)) row)"
+
+[[ -f "$LOCK" ]] || fail "lock file missing at $LOCK"
+ok "lock file created"
+
+# Re-fire immediately — second call within 5s should be a no-op.
+lock_mtime_before=$(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK")
+echo '{"hook_event_name":"Stop"}' | bash "$INGEST_HOOK" > /dev/null
+sleep 1
+lock_mtime_after=$(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK")
+[[ "$lock_mtime_before" -eq "$lock_mtime_after" ]] || \
+    fail "second hook within 5s should be no-op (mtime $lock_mtime_before → $lock_mtime_after)"
+ok "5s lock dedup blocked the second hook fire"
+
+# Backdate lock by 6s, re-fire, assert it DOES fire again.
+touch -d "6 seconds ago" "$LOCK" 2>/dev/null || \
+    "$PY" -c "import os, time; os.utime('$LOCK', (time.time()-6, time.time()-6))"
+lock_mtime_before=$(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK")
+echo '{"hook_event_name":"Stop"}' | bash "$INGEST_HOOK" > /dev/null
+sleep 1
+new_mtime=$(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK")
+[[ "$new_mtime" -gt "$lock_mtime_before" ]] || \
+    fail "after lock expired, second hook should have refreshed it (mtime $lock_mtime_before → $new_mtime)"
+ok "6s-old lock → fresh ingest fires"
+
+rm -rf "$HOOK_RUNTIME_DIR"
+
+# ── 17. summary ──────────────────────────────────────────────────────────────
+sec "17/17 summary"
 "$RECALL" stats
 green ""
 green "=========================================="
-green "  ALL 16 SECTIONS PASSED — convo-recall E2E"
+green "  ALL 17 SECTIONS PASSED — convo-recall E2E"
 green "=========================================="

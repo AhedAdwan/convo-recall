@@ -157,3 +157,56 @@ def test_wizard_abort_at_final_confirm():
     finally:
         wizard.close()
     assert wizard.exitstatus == 0
+
+
+# ── H04 — wizard prompts for ingest hooks (Step 2/5) ────────────────────────
+
+
+def test_wizard_prompts_for_ingest_hooks():
+    """Step 2/5 surfaces the response-completion ingest hook prompt with
+    its consequence_yes/no callouts before the embed sidecar step."""
+    wizard = _spawn(["install", "--scheduler", "polling", "--dry-run"])
+    try:
+        # Drain Step 1's [Y/n] first so Step 2's banner prints.
+        wizard.expect(r"\[Y/n\]")
+        wizard.sendline("y")
+        wizard.expect("Step 2/5: response-completion ingest hooks")
+        wizard.expect_exact("Wire response-completion ingest hooks now?")
+        # Consequence-yes line mentions "Stop / AfterAgent".
+        wizard.expect("Stop / AfterAgent")
+        while True:
+            idx = wizard.expect([r"\[Y/n\]", pexpect.EOF], timeout=15)
+            if idx == 0:
+                wizard.sendline("y")
+            else:
+                break
+    finally:
+        wizard.close()
+    assert wizard.exitstatus == 0
+
+
+def test_wizard_renumbered_steps_show_5_total():
+    """All five step headers appear in order so the renumber is visible
+    and old `Step N/4` strings don't leak through."""
+    wizard = _spawn(["install", "--scheduler", "polling", "--dry-run"])
+    try:
+        wizard.expect("Step 1/5: indexing watchers")
+        # Each step prints AFTER the previous prompt is answered.
+        for label in (
+            "Step 2/5: response-completion ingest hooks",
+            "Step 3/5: hybrid vector",
+            "Step 4/5: pre-prompt search hooks",
+            "Step 5/5: initial ingest",
+        ):
+            wizard.expect(r"\[Y/n\]")
+            wizard.sendline("y")
+            wizard.expect(label)
+        while True:
+            idx = wizard.expect([r"\[Y/n\]", pexpect.EOF], timeout=15)
+            if idx == 0:
+                wizard.sendline("y")
+            else:
+                break
+    finally:
+        wizard.close()
+    assert wizard.exitstatus == 0

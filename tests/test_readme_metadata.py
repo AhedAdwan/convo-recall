@@ -54,3 +54,21 @@ def test_readme_has_project_identity_section():
     assert "display_name" in text, "README should mention display_name"
     assert "cross-machine" in text.lower() or "Cross-machine" in text, \
         "README should document the cross-machine identity limitation"
+
+
+def test_readme_documents_continuous_ingest():
+    """Phase 1 hook-driven ingest: README documents the response-completion hook,
+    its three event names, the Codex feature flag, and the opt-out env var."""
+    text = _read()
+    assert "Continuous ingest" in text, \
+        "README missing a 'Continuous ingest' subsection"
+    # All three response-end event names appear.
+    for event in ("Stop", "AfterAgent"):
+        assert event in text, f"README should mention the `{event}` event"
+    # Codex feature flag.
+    assert "codex_hooks" in text, "README should mention the codex_hooks feature flag"
+    # Opt-out env var.
+    assert "CONVO_RECALL_INGEST_HOOK" in text, \
+        "README should document the CONVO_RECALL_INGEST_HOOK opt-out"
+    # Doctor is the verification path.
+    assert "recall doctor" in text, "README should point users at `recall doctor`"

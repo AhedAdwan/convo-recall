@@ -160,7 +160,7 @@ def run(
     config_path = _ingest._CONFIG_PATH
     print("convo-recall setup wizard\n")
     print(f"Selected scheduler: {sched.describe()}")
-    print("This walks through 4 decisions. Each is opt-in; defaults are safe.\n")
+    print("This walks through 5 decisions. Each is opt-in; defaults are safe.\n")
 
     try:
         recall_bin = _find_recall_bin()
@@ -191,7 +191,7 @@ def run(
 
     # ── Q1. Indexing watchers ────────────────────────────────────────────────
     print("\n" + "─" * 70)
-    print(f"Step 1/4: indexing watchers via {sched.describe()} for {', '.join(enabled)}")
+    print(f"Step 1/5: indexing watchers via {sched.describe()} for {', '.join(enabled)}")
     do_watchers = _ask(
         f"Install {sched.describe()} watchers so new sessions index automatically?",
         default=True,
@@ -213,9 +213,28 @@ def run(
             non_interactive=non_interactive,
         )
 
-    # ── Q2. Embed sidecar ────────────────────────────────────────────────────
+    # ── Q1.5 / Step 2. Response-completion ingest hooks ──────────────────────
     print("\n" + "─" * 70)
-    print("Step 2/4: hybrid vector + FTS search")
+    print(f"Step 2/5: response-completion ingest hooks for {', '.join(enabled)}")
+    print("  Each agent CLI fires a hook when its turn ends. We use that to")
+    print("  trigger `recall ingest` immediately — bypassing the OS scheduler's")
+    print("  recursive-watch limitations on Linux. Recommended on every platform.")
+    do_ingest_hooks = _ask(
+        "Wire response-completion ingest hooks now?",
+        default=True,
+        if_yes=("Each detected CLI's settings file gets a Stop / AfterAgent hook "
+                "pointing at conversation-ingest.sh. Ingest fires within ~50ms of "
+                "each agent turn ending. Adds ~30ms hook overhead per turn."),
+        if_no=("Ingest only fires on the scheduler tier you picked. On Linux, "
+               "long sessions in existing project dirs may not auto-ingest until "
+               "you start a new project. Re-run `recall install` or "
+               "`recall install-hooks --kind ingest` later to wire it."),
+        non_interactive=non_interactive,
+    )
+
+    # ── Q2 / Step 3. Embed sidecar ───────────────────────────────────────────
+    print("\n" + "─" * 70)
+    print("Step 3/5: hybrid vector + FTS search")
     if not embeddings_extra_present:
         print("  · Skipping: [embeddings] extra not installed.")
         print("    To enable later: `pipx install 'convo-recall[embeddings]' && recall install`")
@@ -235,9 +254,9 @@ def run(
             non_interactive=non_interactive,
         )
 
-    # ── Q3. Pre-prompt hooks ─────────────────────────────────────────────────
+    # ── Q3 / Step 4. Pre-prompt hooks ────────────────────────────────────────
     print("\n" + "─" * 70)
-    print(f"Step 3/4: pre-prompt hooks for {', '.join(enabled)}")
+    print(f"Step 4/5: pre-prompt search hooks for {', '.join(enabled)}")
     print("  Without these, your AI agents (Claude/Codex/Gemini) won't know")
     print("  convo-recall exists and will keep guessing/web-searching despite")
     print("  the indexed history sitting right there.")
@@ -253,9 +272,9 @@ def run(
         non_interactive=non_interactive,
     )
 
-    # ── Q4. Initial ingest + backfill ────────────────────────────────────────
+    # ── Q4 / Step 5. Initial ingest + backfill ───────────────────────────────
     print("\n" + "─" * 70)
-    print("Step 4/4: initial ingest")
+    print("Step 5/5: initial ingest")
     do_initial_ingest = _ask(
         "Run initial ingest now? (synchronous; may take 10-30 min on a large corpus)",
         default=True,
@@ -283,7 +302,8 @@ def run(
     if do_watchers and isinstance(sched, SystemdUserScheduler):
         print(f"  linger        : {'yes' if do_linger else 'no (watchers die at logout)'}")
     print(f"  embed sidecar : {'yes (downloads ~1.3 GB)' if do_embed_sidecar else 'no'}")
-    print(f"  hooks         : {'yes — ' + ', '.join(enabled) if do_hooks else 'no'}")
+    print(f"  ingest hooks  : {'yes — ' + ', '.join(enabled) if do_ingest_hooks else 'no'}")
+    print(f"  search hooks  : {'yes — ' + ', '.join(enabled) if do_hooks else 'no'}")
     print(f"  initial ingest: {'yes' if do_initial_ingest else 'no'}")
     if do_embed_sidecar:
         print(f"  embed backfill: {'yes' if do_initial_embed_backfill else 'no (self-heal will catch up)'}")
@@ -397,12 +417,17 @@ def run(
             marker = "✅" if r.ok else "⚠ "
             print(f"  {marker} {r.message}")
 
-    # ── 5. Pre-prompt hooks ──────────────────────────────────────────────────
+    # ── 5. Pre-prompt hooks (search + ingest) ────────────────────────────────
     if do_hooks:
         print()
-        with BouncingSpinner(f"Wiring pre-prompt hooks ({', '.join(enabled)})"):
-            # User already consented at the wizard level; suppress per-CLI prompts.
-            install_hooks(agents=enabled, dry_run=False, non_interactive=True)
+        with BouncingSpinner(f"Wiring search hooks ({', '.join(enabled)})"):
+            install_hooks(agents=enabled, dry_run=False, non_interactive=True,
+                          kinds=("memory",))
+    if do_ingest_hooks:
+        print()
+        with BouncingSpinner(f"Wiring ingest hooks ({', '.join(enabled)})"):
+            install_hooks(agents=enabled, dry_run=False, non_interactive=True,
+                          kinds=("ingest",))
 
     # ── Final summary ────────────────────────────────────────────────────────
     print("\nInstallation complete.")
@@ -413,10 +438,17 @@ def run(
     else:
         print("\nWatchers were skipped. Run `recall ingest` manually after each session, "
               "or set up cron/systemd yourself.")
-    if not do_hooks:
-        print("\nPre-prompt hooks were skipped. Wire them later with:")
-        print(f"  recall install-hooks                # all detected CLIs")
-        print(f"  recall install-hooks --agent claude # one CLI")
+    if not do_hooks and not do_ingest_hooks:
+        print("\nAll hooks were skipped. Wire them later with:")
+        print(f"  recall install-hooks                       # both kinds, all CLIs")
+        print(f"  recall install-hooks --kind ingest         # ingest hook only")
+        print(f"  recall install-hooks --kind memory --agent claude  # one CLI")
+    elif not do_ingest_hooks:
+        print("\nIngest hook was skipped. Wire it later with:")
+        print(f"  recall install-hooks --kind ingest")
+    elif not do_hooks:
+        print("\nSearch hook was skipped. Wire it later with:")
+        print(f"  recall install-hooks --kind memory")
     print("\nQuick start:")
     print("  recall search 'your query'            # search current project")
     print("  recall search 'query' --all-projects  # search everything")

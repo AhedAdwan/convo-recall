@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Response-completion ingest hooks** — convo-recall now installs a sibling hook (`conversation-ingest.sh`) on each agent CLI's response-end event (`Stop` for Claude/Codex, `AfterAgent` for Gemini). When your agent finishes a turn, ingest fires within ~50ms (background-detached, lock-file dedup'd to a 5-second window). Closes the long-standing Linux gap where systemd `.path` units silently missed appends inside existing project subdirs (`PathChanged=` is non-recursive — see TD-003).
+- `recall install-hooks --kind {memory,ingest,both}` flag (default: `both`); same flag on `recall uninstall-hooks`.
+- New wizard step (Step 2/5) asks whether to install ingest hooks. Default Y.
+- `recall doctor` now reports per-agent ingest-hook installation state with a one-line repair hint.
+- `CONVO_RECALL_INGEST_HOOK=off` env var to opt out without uninstalling.
+
+### Changed
+- `recall uninstall-hooks` (and the hook-cleanup pass inside `recall uninstall`) now walks BOTH the search hook and the new ingest hook by default.
+- Codex install path writes `[features] codex_hooks = true` to `~/.codex/config.toml` if missing or safely mergeable. Skipped with warning on invalid TOML.
+
+### Notes for upgraders
+- **Existing installs don't get the new hook automatically** — re-run `recall install` or `recall install-hooks --kind ingest` to wire it. `recall doctor` shows which agents are missing the hook.
+- The ingest hook is **additive** to existing schedulers (systemd `.path`, cron, polling) — they all stay installed in this release. A future release will demote systemd `.path` to opt-in.
+- **Codex `Stop` fires at session-end**, not per-turn (Codex hook system limitation). Most Codex sessions are short, so this is acceptable.
+- Background ingest cost: ~50ms hot DB; up to 1–3s cold. Detached + backgrounded — user-perceived latency is the spawn cost (~30ms).
+
+### Added
 - **Stable `project_id`** — every project gets a `sha1(realpath(cwd))[:12]` id and a separate human-readable `display_name`, normalized in a new `projects` table. Replaces the four divergent slug-derivation paths (`slug_from_cwd` / `_slug_from_cwd` / `_slug_from_path` / `_gemini_slug_from_path`) and the hardcoded `/Projects/` substring check that broke on Linux paths.
 - `recall search --cwd PATH` and `recall tail --cwd PATH` — explicit cwd override for hooks and other callers that can't rely on `os.getcwd()`.
 
