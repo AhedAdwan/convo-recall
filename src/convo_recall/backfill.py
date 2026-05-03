@@ -63,9 +63,27 @@ from .identity import (
     _legacy_project_id,
     _project_id,
 )
-# `_vec_ok`, `embed`, `_vec_insert` are accessed via `_ing.X` inside each
-# function below — tests in `test_backfill_safety.py` monkeypatch these on
-# the ingest module, and direct imports here would shadow the patches.
+# Direct imports of write-path helpers that have a stable home post-A7 and
+# aren't test-monkeypatched on `ingest`. The remaining `_ing.X` accesses
+# inside function bodies (for `_vec_ok`, `embed`, `_vec_insert`, `EMBED_SOCK`,
+# `PROJECTS_DIR`, `_load_gemini_aliases`) ARE monkeypatched in tests and
+# must keep flowing through the ingest namespace.
+from .ingest.writer import _clean_content
+from .ingest.claude import (
+    _extract_tool_result_text,
+    _is_error_result,
+    _session_id_from_path,
+)
+from .ingest.codex import (
+    _codex_event_msg_error,
+    _codex_fco_error,
+    _iter_codex_files,
+)
+from .ingest.gemini import (
+    _gemini_record_error,
+    _gemini_tool_call_error,
+    _iter_gemini_files,
+)
 
 
 def embed_backfill(con: apsw.Connection) -> None:
@@ -324,12 +342,8 @@ def _backfill_claude_tool_errors(con: apsw.Connection) -> int:
     """Walk Claude project JSONLs and harvest tool_result.is_error blocks.
     Mirrors the in-place ingest loop's logic at ingest_file but full-scans
     every file (no lines_already guard)."""
-    from . import ingest as _ing  # PROJECTS_DIR + write-path helpers (A7 cleanup)
+    from . import ingest as _ing  # PROJECTS_DIR stays in package init through v0.4.0
     PROJECTS_DIR = _ing.PROJECTS_DIR
-    _session_id_from_path = _ing._session_id_from_path
-    _extract_tool_result_text = _ing._extract_tool_result_text
-    _is_error_result = _ing._is_error_result
-    _clean_content = _ing._clean_content
 
     indexed = 0
     if not PROJECTS_DIR.exists():
@@ -407,12 +421,6 @@ def _backfill_claude_tool_errors(con: apsw.Connection) -> int:
 def _backfill_codex_tool_errors(con: apsw.Connection) -> int:
     """Walk Codex rollout JSONLs and harvest event_msg failures + FCO
     fallback. Project_id derived from session_meta.payload.cwd."""
-    from . import ingest as _ing  # _iter_codex_files + codex extractors (A7 cleanup)
-    _iter_codex_files = _ing._iter_codex_files
-    _codex_event_msg_error = _ing._codex_event_msg_error
-    _codex_fco_error = _ing._codex_fco_error
-    _clean_content = _ing._clean_content
-
     indexed = 0
     for jsonl_path in _iter_codex_files():
         session_id = jsonl_path.stem
@@ -491,15 +499,11 @@ def _backfill_gemini_tool_errors(con: apsw.Connection) -> int:
     """Walk Gemini session JSONLs and harvest top-level error/warning
     records + toolCalls[] with status in (error, cancelled). Project_id
     derived from header cwd → alias map → hash-dir fallback."""
-    from . import ingest as _ing  # _iter_gemini_files + gemini extractors (A7 cleanup)
-    _iter_gemini_files = _ing._iter_gemini_files
-    _load_gemini_aliases = _ing._load_gemini_aliases
-    _gemini_record_error = _ing._gemini_record_error
-    _gemini_tool_call_error = _ing._gemini_tool_call_error
-    _clean_content = _ing._clean_content
-
+    # _load_gemini_aliases is monkeypatched in tests (test_ingest_project_id.py,
+    # test_migration_project_id.py) — keep flowing through the ingest namespace.
+    from . import ingest as _ing
     indexed = 0
-    aliases = _load_gemini_aliases()
+    aliases = _ing._load_gemini_aliases()
     for jsonl_path in _iter_gemini_files():
         session_id = jsonl_path.stem
         hash_dir = jsonl_path.parent.parent.name

@@ -1035,7 +1035,10 @@ def test_conversation_memory_hook_emits_valid_json_for_each_cli():
     """
     import subprocess
 
-    hook = (Path(ingest.__file__).parent / "hooks" / "conversation-memory.sh").resolve()
+    # As of v0.4.0 (TD-008 / A7), `ingest` is a package. `__file__` is the
+    # package's `__init__.py`, so `.parent` is `convo_recall/ingest/` and we
+    # need `.parent.parent` to reach `convo_recall/` where `hooks/` lives.
+    hook = (Path(ingest.__file__).parent.parent / "hooks" / "conversation-memory.sh").resolve()
     assert hook.exists(), f"hook script missing at {hook}"
     assert os.access(hook, os.X_OK), f"hook script not executable: {hook}"
 
@@ -1134,8 +1137,13 @@ def test_two_connections_have_independent_vec_state(tmp_path, monkeypatch):
 def test_self_heal_orders_newest_first():
     """P2 #9: self-heal should walk unembedded messages newest-first so the
     most recent (and most-queried) rows heal before older ones. Source-
-    inspection test — the SELECT lives in `scan_all`."""
-    src = Path(ingest.__file__).read_text()
+    inspection test — the SELECT lives in `scan_all`.
+
+    As of v0.4.0 (TD-008 / A7), `scan_all` lives in
+    `convo_recall.ingest.scan` rather than the package init.
+    """
+    from convo_recall.ingest import scan as _scan_mod
+    src = Path(_scan_mod.__file__).read_text()
     # The relevant query is the LEFT JOIN message_vecs … WHERE v.rowid IS NULL
     import re as _re
     m = _re.search(
@@ -1144,7 +1152,7 @@ def test_self_heal_orders_newest_first():
         r"ORDER BY m\.rowid\s+(\w+)",
         src,
     )
-    assert m is not None, "self-heal SELECT not found in ingest.py"
+    assert m is not None, "self-heal SELECT not found in ingest/scan.py"
     direction = m.group(1)
     assert direction == "DESC", (
         f"self-heal SELECT uses ORDER BY m.rowid {direction}, "
@@ -1154,17 +1162,31 @@ def test_self_heal_orders_newest_first():
 
 def test_no_silent_apsw_error_pass_in_source():
     """P1 #5: structural test — ensure no `except apsw.Error: pass` survives
-    in ingest.py. apsw can't be monkey-patched at the cursor level (its
-    Connection.execute is read-only), so we assert via source inspection
-    instead. Every apsw.Error handler must do something visible: log,
-    count, or re-raise. A bare `pass` is the bug we're banning."""
-    src = Path(ingest.__file__).read_text()
+    on the write/backfill paths. apsw can't be monkey-patched at the cursor
+    level (its Connection.execute is read-only), so we assert via source
+    inspection instead. Every apsw.Error handler must do something visible:
+    log, count, or re-raise. A bare `pass` is the bug we're banning.
+
+    As of v0.4.0 (TD-008 / A7), apsw.Error handlers live in
+    `convo_recall.ingest.writer` (`_persist_message`) and
+    `convo_recall.backfill` (`_backfill_insert_tool_error`). Read both.
+    """
+    from convo_recall.ingest import writer as _writer_mod
+    from convo_recall import backfill as _backfill_mod
+    src = Path(_writer_mod.__file__).read_text() + "\n" + Path(_backfill_mod.__file__).read_text()
     import re as _re
-    # Find every 'except apsw.Error[...]:' block and the line immediately after.
-    for m in _re.finditer(r"except apsw\.Error[^:]*:\s*\n(\s*)([^\n]+)", src):
+    # Confirm the pattern is actually present so the test isn't vacuously
+    # passing — A7 moved these handlers, and we want to fail loudly if they
+    # ever disappear entirely.
+    matches = list(_re.finditer(r"except apsw\.Error[^:]*:\s*\n(\s*)([^\n]+)", src))
+    assert matches, (
+        "expected at least one `except apsw.Error[...]:` block on the write/"
+        "backfill paths; found none"
+    )
+    for m in matches:
         indent, next_line = m.group(1), m.group(2).strip()
         assert next_line != "pass", (
-            f"silent `except apsw.Error: pass` found in ingest.py at offset {m.start()} — "
+            f"silent `except apsw.Error: pass` found at offset {m.start()} — "
             f"every apsw.Error handler must log or surface the failure"
         )
 

@@ -18,23 +18,25 @@ Rules that span more than one sub-plan, lifted out of individual risk sections s
 
 ### Unassigned-symbol homes
 
-Eleven module-level identifiers in current `ingest.py` aren't named in any sub-plan. Their canonical homes:
+Eleven module-level identifiers in original `ingest.py` (pre-A1) aren't named in any sub-plan. Their final-canonical homes vs. their **v0.4.0** placement:
 
-| Symbol | Line | Home | Lands in |
+| Symbol | Final canonical home | v0.4.0 placement | Reason for v0.4.0 deviation |
 |---|---|---|---|
-| `SUPPORTED_AGENTS` | 42 | `ingest/scan.py` | A7 |
-| `PROJECTS_DIR` | 30 | `ingest/scan.py` | A7 |
-| `GEMINI_TMP` | 32 | `ingest/scan.py` | A7 |
-| `CODEX_SESSIONS` | 34 | `ingest/scan.py` | A7 |
-| `_CONFIG_PATH` | 38 | `ingest/scan.py` (with `load_config`/`save_config`) | A7 |
-| `_GEMINI_ALIAS_PATH` | 1553 | `ingest/gemini.py` (with `_load_gemini_aliases`) | A7 |
-| `_Row` | 68 | `db.py` | A2 |
-| `_row_factory` | 95 | `db.py` | A2 |
-| `_AGENT_SOURCE_PATHS` | 1141 | `ingest/scan.py` | A7 |
-| `_TEXT_BLOCK_TYPES` | 1043 | `ingest/writer.py` | A7 |
-| `_extract_text` | 1046 | `ingest/writer.py` (re-home from `claude.py` — generic over text/input_text/output_text blocks; called by all three per-agent parsers via `_persist_message`) | A7 |
+| `SUPPORTED_AGENTS` | `ingest/scan.py` | `ingest/__init__.py` | Test-monkeypatched; A8 finalizes |
+| `PROJECTS_DIR` | `ingest/scan.py` | `ingest/__init__.py` | Test-monkeypatched + asserted by docstring-truth reload test; A8 finalizes |
+| `GEMINI_TMP` | `ingest/scan.py` | `ingest/__init__.py` | Test-monkeypatched; A8 finalizes |
+| `CODEX_SESSIONS` | `ingest/scan.py` | `ingest/__init__.py` | Test-monkeypatched; A8 finalizes |
+| `_CONFIG_PATH` | `ingest/scan.py` (with `load_config`/`save_config`) | `ingest/__init__.py` | Test-monkeypatched; A8 finalizes |
+| `_GEMINI_ALIAS_PATH` | `ingest/gemini.py` (with `_load_gemini_aliases`) | `ingest/__init__.py` | Test-monkeypatched; A8 finalizes |
+| `_Row` | `db.py` | `db.py` ✓ | (landed in A2) |
+| `_row_factory` | `db.py` | `db.py` ✓ | (landed in A2) |
+| `_AGENT_SOURCE_PATHS` | `ingest/scan.py` | `ingest/scan.py` ✓ | (landed in A7) |
+| `_TEXT_BLOCK_TYPES` | `ingest/writer.py` | `ingest/writer.py` ✓ | (landed in A7) |
+| `_extract_text` | `ingest/writer.py` (re-home from `claude.py` — generic over text/input_text/output_text blocks; called by all three per-agent parsers via `_persist_message`) | `ingest/writer.py` ✓ | (landed in A7 per README override) |
 
-Note: this re-homes `_extract_text` and `_TEXT_BLOCK_TYPES` from `claude.py` (where A7's current text places them) into `writer.py`. This table is authoritative; A7's body will be reconciled when A7 runs.
+**v0.4.0 deviation rationale.** Six constants stay in `ingest/__init__.py` through v0.4.0 because tests monkeypatch them via `ingest.X` (e.g. `monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)`). Defining them on the package init means the monkeypatch is the canonical override point; submodules read them via lazy `from .. import ingest as _pkg; _pkg.X` inside function bodies. Plus `PROJECTS_DIR` is asserted by `test_ingest_docstring_truth.py` which reloads the package init with env vars cleared (the reload doesn't re-run sibling modules). A8 finalizes the moves to their canonical homes when test fixtures rewire off the back-compat shim.
+
+Same rationale applies to `DB_PATH` and `EMBED_SOCK` (set in A2 / A3 already) — they stay in `ingest/__init__.py` through v0.4.0 for the same reason.
 
 ### Docstring-freeze rule
 
