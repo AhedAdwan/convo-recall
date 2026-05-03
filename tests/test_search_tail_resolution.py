@@ -127,9 +127,11 @@ def test_tail_json_includes_project_id_and_legacy_alias(db, capsys):
     assert rc == 0
     out = capsys.readouterr().out.strip()
     payload = json.loads(out)
-    assert payload["project_id"] == "id-myproj"
+    # Cross-session JSON: project_id is per-message now (not on the envelope);
+    # display_name + the deprecated project_slug alias remain on the envelope.
     assert payload["display_name"] == "myproj"
     assert payload["project_slug"] == "myproj"
+    assert payload["messages"][0]["session_id"]  # per-message session_id present
 
 
 # ── Item 15: doctor orphan check ─────────────────────────────────────────────

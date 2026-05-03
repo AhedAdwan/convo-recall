@@ -1918,17 +1918,20 @@ def tail(con: apsw.Connection, n: int = _DEFAULT_TAIL_N,
          ascii_only: bool = False,
          cols: int = _TAIL_BODY_COLS,
          json_: bool = False) -> int:
-    """Print the last N messages from a session in chronological order.
+    """Print the last N messages in chronological order.
 
-    With no `session`, picks the most-recently-updated session matching
-    `project` and `agent` filters. Output is oldest-first so the latest
-    message appears at the bottom — matches a chat-log reading order.
+    Two modes:
+      - `session` given → pull the last N messages from that one session.
+      - `session` omitted → pull the last N messages by timestamp across
+        every session matching `project` and `agent` (or globally when
+        `project` is None). Session boundaries are rendered as inline
+        rules so the reader can see when the conversation jumped sessions.
 
+    Output is oldest-first so the latest message appears at the bottom.
     `expand` is a set of 1-based turn numbers to render in full (no
-    truncation, no inline collapse). `ascii_only` swaps Unicode glyphs
-    for ASCII fallbacks; useful for terminals that don't render box chars.
+    truncation). `ascii_only` swaps Unicode glyphs for ASCII fallbacks.
 
-    Returns: 0 on success, 1 if no session/messages found.
+    Returns: 0 on success, 1 if no messages match.
     """
     roles = tuple(roles) if roles else _TAIL_ROLES
     expand = expand or set()
@@ -1936,14 +1939,73 @@ def tail(con: apsw.Connection, n: int = _DEFAULT_TAIL_N,
         n = _DEFAULT_TAIL_N
 
     resolved_project = project
-    if session is None:
-        picked = _resolve_tail_session(con, project, agent)
-        if picked is None:
-            # "Did you mean" — surface display_names that fuzzily match the
-            # passed --project. Slug variants (hyphen↔underscore) no longer
-            # exist post-v4; we suggest LIKE matches from projects.display_name.
-            suggestions: list[str] = []
-            if project:
+
+    # ── single-session path ────────────────────────────────────────────────
+    if session is not None:
+        if resolved_project is None:
+            # Recover display_name from the sessions+projects join.
+            row = con.execute(
+                "SELECT p.display_name FROM sessions s "
+                "LEFT JOIN projects p ON p.project_id = s.project_id "
+                "WHERE s.session_id = ?",
+                (session,),
+            ).fetchone()
+            if row is not None and row["display_name"] is not None:
+                resolved_project = row["display_name"]
+
+        placeholders = ",".join(["?"] * len(roles))
+        rows = con.execute(
+            f"SELECT role, timestamp, content, agent, session_id "
+            f"FROM messages "
+            f"WHERE session_id = ? AND role IN ({placeholders}) "
+            f"ORDER BY timestamp DESC LIMIT ?",
+            [session, *roles, n],
+        ).fetchall()
+        rows = list(reversed(rows))
+
+        if json_:
+            import json as _json
+            sess_meta = con.execute(
+                "SELECT s.project_id, p.display_name FROM sessions s "
+                "LEFT JOIN projects p ON p.project_id = s.project_id "
+                "WHERE s.session_id = ?",
+                (session,),
+            ).fetchone()
+            sess_pid = sess_meta["project_id"] if sess_meta else None
+            sess_display = (sess_meta["display_name"] if sess_meta and
+                            sess_meta["display_name"] else resolved_project)
+            out = {
+                "session_id": session,
+                "project": resolved_project,
+                "project_id": sess_pid,
+                "display_name": sess_display,
+                # DEPRECATED alias for one release — equals display_name.
+                "project_slug": sess_display,
+                "agent": agent,
+                "n": n,
+                "messages": [
+                    {"role": r[0], "timestamp": r[1], "content": r[2],
+                     "agent": r[3], "session_id": r[4]}
+                    for r in rows
+                ],
+            }
+            print(_json.dumps(out))
+            return 0 if rows else 1
+
+        if not rows:
+            print(f"No messages found in session {session}.", file=sys.stderr)
+            return 1
+        # Falls through to the renderer at the bottom of this function.
+
+    # ── cross-session path (no `session` given) ────────────────────────────
+    else:
+        where = [f"role IN ({','.join('?' * len(roles))})"]
+        params: list = list(roles)
+        suggestions: list[str] = []
+        if project:
+            pids, _ = _resolve_project_ids(con, project)
+            if not pids:
+                # Nothing matched exactly OR via LIKE → "Did you mean".
                 like = con.execute(
                     "SELECT display_name FROM projects "
                     "WHERE display_name LIKE ? COLLATE NOCASE "
@@ -1952,97 +2014,108 @@ def tail(con: apsw.Connection, n: int = _DEFAULT_TAIL_N,
                     (f"%{project}%", project),
                 ).fetchall()
                 suggestions = [r["display_name"] for r in like[:3]]
-            label = ", ".join(filter(None, [
-                f"project='{project}'" if project else None,
-                f"agent='{agent}'" if agent else None,
-            ])) or "any project"
-            if json_:
-                import json as _json
-                payload: dict = {
-                    "session_id": None,
-                    "project": project,
-                    "agent": agent,
-                    "n": n,
-                    "messages": [],
-                    "error": f"no session found for {label}",
-                }
-                if suggestions:
-                    payload["did_you_mean"] = suggestions
-                print(_json.dumps(payload))
+                label = f"project='{project}'"
+                if agent:
+                    label += f", agent='{agent}'"
+                if json_:
+                    import json as _json
+                    payload: dict = {
+                        "session_id": None,
+                        "project": project,
+                        "agent": agent,
+                        "n": n,
+                        "messages": [],
+                        "error": f"no messages found for {label}",
+                    }
+                    if suggestions:
+                        payload["did_you_mean"] = suggestions
+                    print(_json.dumps(payload))
+                else:
+                    print(f"No messages found for {label}.", file=sys.stderr)
+                    if suggestions:
+                        print(f"Did you mean: {', '.join(suggestions)}?",
+                              file=sys.stderr)
+                return 1
+            placeholders = ",".join("?" * len(pids))
+            where.append(f"project_id IN ({placeholders})")
+            params.extend(pids)
+        if agent:
+            where.append("agent = ?")
+            params.append(agent)
+
+        sql = (f"SELECT role, timestamp, content, agent, session_id, "
+               f"       project_id "
+               f"FROM messages WHERE {' AND '.join(where)} "
+               f"ORDER BY timestamp DESC LIMIT ?")
+        rows = con.execute(sql, [*params, n]).fetchall()
+        rows = list(reversed(rows))  # chronological — newest at the bottom
+
+        # Resolve display_name for headers/JSON. When `project` is given,
+        # LIKE may have matched multiple display_names — keep the union.
+        if project:
+            pids, names = _resolve_project_ids(con, project)
+            resolved_project = (names[0] if len(names) == 1
+                                else (project if not names else "+".join(names)))
+        elif rows:
+            # No `--project` filter — derive from the rows' actual project_ids.
+            distinct = {r[5] for r in rows if r[5]}
+            if len(distinct) == 1:
+                dn = con.execute(
+                    "SELECT display_name FROM projects WHERE project_id = ?",
+                    (next(iter(distinct)),),
+                ).fetchone()
+                resolved_project = dn["display_name"] if dn else None
             else:
-                print(f"No sessions found for {label}.", file=sys.stderr)
-                if suggestions:
-                    print(f"Did you mean: {', '.join(suggestions)}?",
-                          file=sys.stderr)
+                resolved_project = "all projects"
+
+        if json_:
+            import json as _json
+            # Build a per-session summary (in chronological order of last_msg).
+            sess_seen: dict[str, dict] = {}
+            for r in rows:
+                sid = r[4]
+                if sid not in sess_seen:
+                    sess_seen[sid] = {
+                        "session_id": sid,
+                        "first_msg": r[1],
+                        "last_msg": r[1],
+                        "n_messages": 0,
+                    }
+                sess_seen[sid]["last_msg"] = r[1]
+                sess_seen[sid]["n_messages"] += 1
+            out = {
+                "session_id": None,
+                "project": project,
+                "display_name": resolved_project,
+                # DEPRECATED alias for one release — equals display_name.
+                "project_slug": resolved_project,
+                "agent": agent,
+                "n": n,
+                "sessions": list(sess_seen.values()),
+                "messages": [
+                    {"role": r[0], "timestamp": r[1], "content": r[2],
+                     "agent": r[3], "session_id": r[4]}
+                    for r in rows
+                ],
+            }
+            if not rows and suggestions:
+                out["did_you_mean"] = suggestions
+            print(_json.dumps(out))
+            return 0 if rows else 1
+
+        if not rows:
+            label = (f"project='{project}'" if project else "any project")
+            if agent:
+                label += f", agent='{agent}'"
+            print(f"No messages found for {label}.", file=sys.stderr)
             return 1
-        session, picked_pid = picked
-        # Translate picked project_id → display_name for header rendering.
-        dn = con.execute(
-            "SELECT display_name FROM projects WHERE project_id = ?",
-            (picked_pid,),
-        ).fetchone()
-        resolved_project = dn["display_name"] if dn else picked_pid
-    elif resolved_project is None:
-        # Explicit --session bypassed the picker — recover the project's
-        # display_name from the sessions+projects join so the header still
-        # shows it.
-        row = con.execute(
-            "SELECT p.display_name FROM sessions s "
-            "LEFT JOIN projects p ON p.project_id = s.project_id "
-            "WHERE s.session_id = ?",
-            (session,),
-        ).fetchone()
-        if row is not None and row["display_name"] is not None:
-            resolved_project = row["display_name"]
-
-    placeholders = ",".join(["?"] * len(roles))
-    rows = con.execute(
-        f"SELECT role, timestamp, content, agent "
-        f"FROM messages "
-        f"WHERE session_id = ? AND role IN ({placeholders}) "
-        f"ORDER BY timestamp DESC LIMIT ?",
-        [session, *roles, n],
-    ).fetchall()
-    rows = list(reversed(rows))  # chronological — newest at the bottom
-
-    if json_:
-        import json as _json
-        # Resolve display_name + project_id for the JSON envelope (item 14).
-        sess_meta = con.execute(
-            "SELECT s.project_id, p.display_name FROM sessions s "
-            "LEFT JOIN projects p ON p.project_id = s.project_id "
-            "WHERE s.session_id = ?",
-            (session,),
-        ).fetchone()
-        sess_pid = sess_meta["project_id"] if sess_meta else None
-        sess_display = (sess_meta["display_name"] if sess_meta and
-                        sess_meta["display_name"] else resolved_project)
-        out = {
-            "session_id": session,
-            "project": resolved_project,
-            "project_id": sess_pid,
-            "display_name": sess_display,
-            # DEPRECATED alias for one release — equals display_name.
-            "project_slug": sess_display,
-            "agent": agent,
-            "n": n,
-            "messages": [
-                {"role": r[0], "timestamp": r[1], "content": r[2],
-                 "agent": r[3]}
-                for r in rows
-            ],
-        }
-        print(_json.dumps(out))
-        return 0 if rows else 1
-
-    if not rows:
-        print(f"No messages found in session {session}.", file=sys.stderr)
-        return 1
+        # Falls through to the renderer below.
 
     g = _TAIL_GLYPHS["ascii" if ascii_only else "unicode"]
-    short_session = session[:8] if len(session) >= 8 else session
     now = datetime.now(timezone.utc)
+    cross_session = session is None
 
+    # Each row is (role, ts, content, agent, session_id [, project_id]).
     # Pre-compute speaker labels and column widths so the metadata column
     # is uniform across all rows (Option-E layout). Newest message is #1
     # (reverse-numbered from the bottom up).
@@ -2058,13 +2131,11 @@ def tail(con: apsw.Connection, n: int = _DEFAULT_TAIL_N,
     speakers = [_speaker_for(r[0], r[3]) for r in rows]
     speaker_w = max((len(s) for s in speakers), default=4)
     num_w = max(2, len(str(total))) + 1   # +1 for the leading '#'
-    # Pre-compute every metadata-column string so we know its exact width
-    # and can build a matching blank for body continuation lines.
     meta_strs: list[str] = []
-    for i, (role, ts, _content, _agent) in enumerate(rows):
+    for i, r in enumerate(rows):
         rev_n = total - i                    # newest = #1
-        clock = _tail_clock(ts)
-        ago = _tail_format_ago(ts, now=now)
+        clock = _tail_clock(r[1])
+        ago = _tail_format_ago(r[1], now=now)
         meta_strs.append(
             f"{('#' + str(rev_n)):<{num_w}} {clock}  {ago:<8}  "
             f"{speakers[i]:<{speaker_w}} "
@@ -2072,12 +2143,28 @@ def tail(con: apsw.Connection, n: int = _DEFAULT_TAIL_N,
     meta_w = max((len(m) for m in meta_strs), default=0)
     blank_meta = " " * meta_w
 
+    # Distinct sessions (in chronological order of first appearance).
+    sids_in_order: list[str] = []
+    for r in rows:
+        sid = r[4]
+        if sid and (not sids_in_order or sids_in_order[-1] != sid):
+            sids_in_order.append(sid)
+
     # ── header ───────────────────────────────────────────────────────────
-    header_bits = [
-        f"session {short_session}",
-        resolved_project or "?",
-        f"{total} messages",
-    ]
+    if cross_session:
+        n_sess = len(sids_in_order)
+        scope = resolved_project or "all projects"
+        sess_phrase = (f"{total} messages across {n_sess} sessions"
+                       if n_sess > 1
+                       else f"{total} messages in 1 session")
+        header_bits = [scope, sess_phrase]
+    else:
+        short_session = session[:8] if len(session) >= 8 else session
+        header_bits = [
+            f"session {short_session}",
+            resolved_project or "?",
+            f"{total} messages",
+        ]
     rng = _tail_session_range(rows)
     if rng:
         header_bits.append(rng)
@@ -2088,11 +2175,23 @@ def tail(con: apsw.Connection, n: int = _DEFAULT_TAIL_N,
 
     # ── messages ─────────────────────────────────────────────────────────
     truncated_turns: list[int] = []
+    prev_sid: str | None = None
 
-    for i, (role, ts, content_raw, msg_agent) in enumerate(rows):
+    for i, r in enumerate(rows):
+        role, ts, content_raw, msg_agent, msg_sid = r[0], r[1], r[2], r[3], r[4]
         content = content_raw if content_raw is not None else ""
         rev_n = total - i
         force_full = rev_n in expand
+
+        # Session-boundary rule (cross-session mode only). Skipped on the
+        # very first row; only fires when the session_id actually changes.
+        if cross_session and msg_sid and msg_sid != prev_sid:
+            short = msg_sid[:8]
+            date = (ts or "")[:10]
+            print(f"  {g['rule']}{g['rule']} session {short} "
+                  f"{g['dot']} {date} {g['rule']}{g['rule']}")
+            print()
+        prev_sid = msg_sid
 
         original_len = len(content)
         if not force_full and original_len > width:

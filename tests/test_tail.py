@@ -82,7 +82,9 @@ def test_tail_reverse_numbering_newest_is_one(db, capsys):
     assert "#1" in newest_line
 
 
-def test_tail_picks_latest_session_by_project(db, capsys):
+def test_tail_default_spans_all_sessions_in_project(db, capsys):
+    """Default behavior (no --session) pulls last N across every session in
+    the project — newer sessions don't hide older ones when the budget allows."""
     _seed(db, session_id="old", last_updated="2026-04-01T00:00:00Z")
     _seed(db, session_id="new", last_updated="2026-04-05T00:00:00Z")
     _msg(db, uuid="o1", session_id="old", role="user",
@@ -92,9 +94,56 @@ def test_tail_picks_latest_session_by_project(db, capsys):
 
     ingest.tail(db, n=10, project="proj_a")
     out = capsys.readouterr().out
+    # Both sessions' messages appear, oldest-first.
+    assert "OLD-MSG" in out
     assert "NEW-MSG" in out
-    assert "OLD-MSG" not in out
+    assert out.index("OLD-MSG") < out.index("NEW-MSG")
+    # Header reports cross-session count.
+    assert "across 2 sessions" in out
+    # Session-boundary rule shows the new session's short id.
     assert "session new" in out
+
+
+def test_tail_renders_session_boundary_rule(db, capsys):
+    """A `── session SHORT · DATE ──` rule appears at every session change."""
+    _seed(db, session_id="aaaaaaaa", last_updated="2026-04-01T00:00:00Z")
+    _seed(db, session_id="bbbbbbbb", last_updated="2026-04-02T00:00:00Z")
+    _msg(db, uuid="m1", session_id="aaaaaaaa", role="user",
+         text="from-A", ts="2026-04-01T00:00:01Z")
+    _msg(db, uuid="m2", session_id="bbbbbbbb", role="user",
+         text="from-B", ts="2026-04-02T00:00:01Z")
+
+    ingest.tail(db, n=10, project="proj_a")
+    out = capsys.readouterr().out
+    # Both session-boundary rules render with the truncated SID.
+    assert "session aaaaaaaa" in out
+    assert "session bbbbbbbb" in out
+    # And the rules sit before the relevant message bodies.
+    assert out.index("session aaaaaaaa") < out.index("from-A")
+    assert out.index("session bbbbbbbb") < out.index("from-B")
+
+
+def test_tail_n_caps_total_across_sessions(db, capsys):
+    """N=3 against 5 messages spread across 2 sessions returns the latest 3."""
+    _seed(db, session_id="aaaaaaaa", last_updated="2026-04-01T00:00:00Z")
+    _seed(db, session_id="bbbbbbbb", last_updated="2026-04-02T00:00:00Z")
+    _msg(db, uuid="a1", session_id="aaaaaaaa", role="user",
+         text="A1", ts="2026-04-01T00:00:01Z")
+    _msg(db, uuid="a2", session_id="aaaaaaaa", role="user",
+         text="A2", ts="2026-04-01T00:00:02Z")
+    _msg(db, uuid="b1", session_id="bbbbbbbb", role="user",
+         text="B1", ts="2026-04-02T00:00:01Z")
+    _msg(db, uuid="b2", session_id="bbbbbbbb", role="user",
+         text="B2", ts="2026-04-02T00:00:02Z")
+    _msg(db, uuid="b3", session_id="bbbbbbbb", role="user",
+         text="B3", ts="2026-04-02T00:00:03Z")
+
+    ingest.tail(db, n=3, project="proj_a")
+    out = capsys.readouterr().out
+    assert "B3" in out and "B2" in out and "B1" in out
+    assert "A1" not in out and "A2" not in out
+    # Header reports a single session for this slice, not 2.
+    assert "in 1 session" in out
 
 
 def test_tail_explicit_session_overrides_latest_pick(db, capsys):
@@ -327,14 +376,20 @@ def test_tail_json_shape_includes_agent(db, capsys):
     ingest.tail(db, n=5, project="proj_a", json_=True)
     out = capsys.readouterr().out.strip()
     payload = json.loads(out)
-    assert payload["session_id"] == "s-1"
+    # Cross-session JSON: top-level session_id is null; each message
+    # carries its own session_id; a `sessions` summary is included.
+    assert payload["session_id"] is None
     assert payload["project"] == "proj_a"
     assert payload["n"] == 5
     assert len(payload["messages"]) == 2
-    # JSON keeps raw role names (machine-readable).
     assert payload["messages"][0]["role"] == "user"
     assert payload["messages"][0]["content"] == "hello"
     assert payload["messages"][0]["agent"] == "claude"
+    assert payload["messages"][0]["session_id"] == "s-1"
+    assert payload["sessions"] == [
+        {"session_id": "s-1", "first_msg": "2026-04-01T00:00:01Z",
+         "last_msg": "2026-04-01T00:00:02Z", "n_messages": 2},
+    ]
 
 
 # ── error paths ────────────────────────────────────────────────────────────────
@@ -343,7 +398,7 @@ def test_tail_no_session_returns_1(db, capsys):
     rc = ingest.tail(db, n=10, project="nonexistent")
     err = capsys.readouterr().err
     assert rc == 1
-    assert "No sessions found" in err
+    assert "No messages found" in err
 
 
 def test_tail_no_messages_in_session_returns_1(db, capsys):
@@ -378,8 +433,8 @@ def test_tail_like_fallback_resolves_when_exact_misses(db, capsys):
     out = capsys.readouterr().out
     # Auto-fallback succeeded; rc=0 and "hi" appears in output
     assert rc == 0
-    # No "No sessions found" because LIKE resolved
-    assert "No sessions found" not in err
+    # No "No messages found" because LIKE resolved
+    assert "No messages found" not in err
 
 
 def test_tail_did_you_mean_when_no_exact_no_like(db, capsys):
@@ -402,7 +457,7 @@ def test_tail_no_suggestion_when_truly_unknown_project(db, capsys):
     rc = ingest.tail(db, n=10, project="totally-bogus-project")
     err = capsys.readouterr().err
     assert rc == 1
-    assert "No sessions found" in err
+    assert "No messages found" in err
     assert "Did you mean" not in err
 
 
