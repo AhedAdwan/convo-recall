@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6] — 2026-05-03
+
 ### Changed
 - **License: relicensed under Functional Source License v1.1 (Apache-2.0 future).** convo-recall has moved from the modified PolyForm Noncommercial 1.0.0 to **vanilla [FSL-1.1-Apache-2.0](https://fsl.software/)** — the same Fair Source license used by Sentry, Codecov, Liquibase, GitButler, and Keygen. Each released version converts automatically to **Apache License, Version 2.0** on its second anniversary. SPDX tag is now the standard `FSL-1.1-Apache-2.0`. Practical effects:
   - For-profit companies and startups can use convo-recall internally — engineers running it on their machines while building their own products is fully permitted.
@@ -18,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **README: rewrote License section** to reflect FSL framing, Acceptable Use Policy reference, dual-license offer, and trademark disclaimer.
 
 The previous IBU grant on top of PolyForm Noncommercial (drafted but never released under a tagged version) was discarded after expert review flagged that the bespoke SPDX identifier and "Apache 2.0 + perpetual rider" Future License construction would (a) trigger enterprise legal-review delays at every adoption point and (b) invite ASF trademark concerns over modified Apache-2.0 framing. Vanilla FSL with a layered AUP is the recognized industry pattern (matches Hippocratic License's approach to ethical-use riders on permissive bases) and avoids both issues.
+
+### Fixed
+- `tests/test_install_wizard.py` no longer crashes with `PermissionError` when probing `/root/.local/bin/recall` in restricted sandbox environments. Probe now treats permission denial as "not installed" and falls through to the normal install path.
+
+### Documentation
+- README rewritten: feature list moved to the top; "How it works" and competitor-comparison sections dropped. Install section slimmed to two paths and aligned with the v0.3.5 hook-driven ingest model (no scheduler-watcher question).
 
 ## [0.3.5] — 2026-05-03
 
