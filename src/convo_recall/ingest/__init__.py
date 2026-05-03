@@ -6,6 +6,23 @@ via environment variables:
   CONVO_RECALL_DB       — path to SQLite DB (default ~/.local/share/convo-recall/conversations.db)
   CONVO_RECALL_PROJECTS — path to Claude projects dir (default ~/.claude/projects)
   CONVO_RECALL_SOCK     — path to embed UDS socket (default ~/.local/share/convo-recall/embed.sock)
+
+DEPRECATED in v0.4.0 (TD-008): this module is a back-compat shim. Every
+legacy import (`from convo_recall.ingest import open_db, search,
+ingest_file, ...`) still works, but new code should import from canonical
+homes:
+    from convo_recall.db       import open_db, close_db
+    from convo_recall.query    import search, tail
+    from convo_recall.embed    import embed
+    from convo_recall.backfill import embed_backfill, tool_error_backfill, ...
+    from convo_recall.admin    import stats, doctor, forget
+    from convo_recall.identity import _project_id, _display_name
+    from convo_recall.ingest.scan   import scan_all, scan_one_agent, watch_loop
+    from convo_recall.ingest.claude import ingest_file
+    from convo_recall.ingest.gemini import ingest_gemini_file
+    from convo_recall.ingest.codex  import ingest_codex_file
+The shim emits `DeprecationWarning` in a v0.4.x minor release and is
+removed entirely in v0.5.0.
 """
 
 import os

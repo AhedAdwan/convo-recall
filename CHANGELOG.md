@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-03
+
+### Changed (internal — no user-visible behavior change)
+- **Closes [TD-008](docs/TECH_DEBT.md): the 3,626-line `ingest.py` monolith is decomposed.** The single file that held 79% of the package's source has been split into seven focused modules:
+  - `convo_recall/identity.py` (201 LOC) — project_id derivation + legacy slug helpers (A1).
+  - `convo_recall/db.py` (605 LOC) — schema, migrations, `open_db`/`close_db`, vec state (A2).
+  - `convo_recall/embed.py` (197 LOC) — UDS sidecar client + sqlite-vec helpers (A3).
+  - `convo_recall/query.py` (896 LOC) — `search`, `tail`, RRF fusion, decay (A4).
+  - `convo_recall/backfill.py` (597 LOC) — embed/tool_error/clean/redact/chunk backfills (A5).
+  - `convo_recall/admin.py` (453 LOC) — `stats`, `doctor`, `forget` (A6).
+  - `convo_recall/ingest/` package (1,407 LOC across 6 files) — `claude.py`, `gemini.py`, `codex.py` per-agent ingesters; `writer.py` for shared persistence (`_persist_message`, `_clean_content`, `_extract_text`); `scan.py` for dispatch + watch + the self-heal embed pass (A7).
+- The original `convo_recall/ingest.py` file is gone, replaced by the `convo_recall/ingest/` package whose `__init__.py` is a back-compat shim. **All legacy imports (`from convo_recall.ingest import open_db, search, ingest_file, ...`) keep working in v0.4.0.** No CLI-surface change, no DB-schema change, no hook-protocol change.
+- Test-monkeypatched constants (`DB_PATH`, `EMBED_SOCK`, `PROJECTS_DIR`, `GEMINI_TMP`, `CODEX_SESSIONS`, `_CONFIG_PATH`, `_GEMINI_ALIAS_PATH`, `SUPPORTED_AGENTS`) stay defined in `convo_recall/ingest/__init__.py` so `monkeypatch.setattr(ingest, "X", ...)` and the docstring-truth reload test continue working without churn. Their canonical homes (`db.py`, `embed.py`, `ingest/scan.py`, `ingest/gemini.py`) move in v0.5.0 alongside the shim removal.
+
+### Deprecated
+- The `convo_recall.ingest` namespace is now the back-compat shim path. New code should import from canonical homes:
+  - `from convo_recall.db import open_db, close_db`
+  - `from convo_recall.query import search, tail`
+  - `from convo_recall.embed import embed`
+  - `from convo_recall.backfill import embed_backfill, tool_error_backfill, ...`
+  - `from convo_recall.admin import stats, doctor, forget`
+  - `from convo_recall.identity import _project_id, _display_name`
+  - `from convo_recall.ingest.scan import scan_all, scan_one_agent, watch_loop`
+  - `from convo_recall.ingest.claude import ingest_file` (and `.codex`, `.gemini`)
+- The shim is scheduled to emit `DeprecationWarning` in a v0.4.x minor release and to be removed entirely in v0.5.0. Until then `from convo_recall.ingest import …` keeps working silently — internal callers (`cli.py`, the test suite) still go through it.
+
+### Verification
+- `pytest tests/` → 364 passed, 3 skipped (zero regressions vs v0.3.6).
+- Live-DB probe: 105 invariants verified across all seven new modules — including `ingest_file.__module__ == "convo_recall.ingest.claude"`, `_persist_message.__module__ == "convo_recall.ingest.writer"`, dispatch-table identity preservation across the shim, and a synthetic-JSONL TD-006 hot-path regression (tool_result.is_error block produces a tool_error row even when the user record carries no accompanying text).
+
 ## [0.3.6] — 2026-05-03
 
 ### Changed
