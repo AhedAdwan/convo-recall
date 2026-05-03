@@ -1396,7 +1396,9 @@ def test_tool_error_backfill_uses_correct_agent(db, tmp_path, monkeypatch):
     # The INSERT now lives in the shared helper _backfill_insert_tool_error.
     # Verify it explicitly lists the `agent` column so non-claude rows can't
     # silently pick up the schema's DEFAULT 'claude'.
-    src = Path(ingest.__file__).read_text()
+    # As of v0.4.0 (TD-008), this helper lives in convo_recall.backfill.
+    from convo_recall import backfill as _backfill
+    src = Path(_backfill.__file__).read_text()
     import re as _re
     helper_block = _re.search(
         r"def _backfill_insert_tool_error.*?(?=\ndef |\Z)", src, _re.DOTALL
