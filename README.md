@@ -299,6 +299,6 @@ Full FSL text in [`LICENSE`](LICENSE). AUP details in [`ACCEPTABLE_USE.md`](ACCE
 
 convo-recall is provided **as-is**, without warranty of any kind. The codebase ships with 365+ tests and several end-to-end sandbox runs, but your environment is not our environment.
 
-Before installing on a workstation you care about: read [`SECURITY.md`](SECURITY.md), run a sandbox first (`tests/sandbox-*.sh` spin up disposable Docker environments that exercise install / search / uninstall), and do your own due diligence on the source (~7,500 lines of Python across `db.py / query.py / embed.py / identity.py / backfill.py / admin.py / ingest/ / install/`).
+Before installing on a workstation you care about: read [`SECURITY.md`](SECURITY.md) and run a sandbox first (`tests/sandbox-*.sh` spin up disposable Docker environments that exercise install / search / uninstall).
 
 You run convo-recall at your own risk. See [`LICENSE`](LICENSE) § *No Liability* for binding terms.
