@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-05-03
+
+No user-visible changes. CI/test hygiene only.
+
+### Changed
+- `Publish to PyPI` workflow trigger switched from `push: tags` to `workflow_dispatch` until PyPI Trusted Publisher is configured for this project. Stops every release tag from leaving a red ❌ on the repo's main page; release flow becomes "Actions tab → Run workflow → enter tag" once trusted publishing is set up.
+
+### Fixed
+- Two local-only test failures pre-dating v0.3.0:
+  - `tests/test_safety_cli.py` — switched the read-only DB connection from `?mode=ro` to `?immutable=1`. macOS `/var/folders` is symlinked to `/private/var/folders`, and `mode=ro` couldn't open the WAL sidecar file through the symlink.
+  - `tests/test_ingest.py` — the "vector search disabled" branch is now exercised deterministically by monkeypatching `EMBED_SOCK`, instead of depending on whether the host machine has `[embeddings]` installed.
+- Removed `tests/test_safety_cli.py::test_uninstall_purge_data_no_confirm_does_not_delete_db`. The test invoked the real `recall uninstall` binary as a subprocess but only redirected `CONVO_RECALL_DB` and `CONVO_RECALL_CONFIG` — not `HOME` or `LAUNCHAGENTS`. Result: every `pytest tests/` silently unwired hooks from the developer's real `~/.claude/settings.json` and `~/.codex/hooks.json`, and on macOS removed `~/Library/LaunchAgents/com.convo-recall.embed.plist` (killing the live sidecar). Argparse-level coverage for `--purge-data` / `--confirm` is preserved by `tests/test_uninstall_walks_all_tiers.py:288-411` (5× redundant fixture-isolated paths).
+
+## [0.3.1] — 2026-05-03
+
+### Added
+- `recall tail [N]` now picks the most-recent session in the current project when `--session` is omitted, instead of erroring. Pass `--all-projects` to pick globally; `--session SID` still pins to a specific session. Closes the "what was our last conversation about?" path that had to fall back to FTS search.
+
+### Fixed
+- `recall --version` no longer drifts from the installed package version. `__version__` now derives from `importlib.metadata.version("convo-recall")` instead of a hardcoded literal in `__init__.py`. The hardcoded literal had been missed in the v0.3.0 release bump and printed `0.3.0` (sometimes `0.2.0` after fresh installs from older pipx caches) on installs that were actually on a newer version.
+- `src/convo_recall/ingest.py` module docstring (lines 6–8) now reflects the actual code defaults — `CONVO_RECALL_DB` defaults to `~/.local/share/convo-recall/conversations.db` (was: stale `~/.claude/index/conversations.db`), `CONVO_RECALL_SOCK` defaults to `~/.local/share/convo-recall/embed.sock` (was: stale `~/.midcortex/engram/embed.sock` from pre-fork code). The old docstring could mislead anyone reading it as documentation into pointing the CLI at a dead path.
+
+### Tests
+- New `tests/test_ingest_docstring_truth.py` — parses the `ingest.py` module docstring and asserts the documented `CONVO_RECALL_*` defaults match the live `Path` constants. Reloads the module under cleared env vars so the test is robust against `CONVO_RECALL_DB` pollution from other tests.
+- New `tests/test_conversation_memory_md_recipes.py` — extracts every Python code fence from `~/.claude/rules/conversation-memory.md` and runs them against the live DB, catching schema-drift bugs in the rule file (e.g., `messages.project_slug` references after the v4 rename). Auto-skips when the rule file or DB are absent (CI / fresh machines).
+
+### Docs
+- Tech-debt register entries logged: TD-006 (tool_error ingestion silently stopped 2026-04-29), TD-007 (`chunk_vecs` empty / chunk-backfill never run — later reframed as housekeeping; see Unreleased), TD-008 (ingest.py monolith, 3,127 lines mixing read/write/admin/identity).
+
 ## [0.3.0] — 2026-05-02
 
 ### Added

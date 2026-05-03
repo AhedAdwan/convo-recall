@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "convo-recall"
-version = "0.3.1"
+version = "0.3.2"
 description = "Searchable memory for AI coding-agent sessions (Claude/Gemini/Codex) — FTS5 + vector hybrid search"
 readme = "README.md"
 requires-python = ">=3.11"
