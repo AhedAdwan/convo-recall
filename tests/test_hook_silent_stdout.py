@@ -234,15 +234,28 @@ def test_hook_silent_when_hook_log_path_unwritable(
     _assert_contract(proc, "unwritable_hook_log")
 
 
+def _hardcoded_fallback_recall_resolves() -> bool:
+    """True iff one of the hook's hard-coded fallback `recall` paths is
+    a callable executable visible to this process. Wrapped in try/except
+    because some CI runners can SEE the `/root/.local/bin/recall` path
+    via stat but raise PermissionError when reading it (the runner user
+    isn't root). A path we can't access is one we won't fall through to,
+    so it counts as 'no fallback resolves here'."""
+    for p in (
+        "/root/.local/bin/recall",
+        "/usr/local/bin/recall",
+        "/opt/homebrew/bin/recall",
+    ):
+        try:
+            if Path(p).is_file() and os.access(p, os.X_OK):
+                return True
+        except (OSError, PermissionError):
+            continue
+    return False
+
+
 @pytest.mark.skipif(
-    any(
-        Path(p).is_file() and os.access(p, os.X_OK)
-        for p in (
-            "/root/.local/bin/recall",
-            "/usr/local/bin/recall",
-            "/opt/homebrew/bin/recall",
-        )
-    ),
+    _hardcoded_fallback_recall_resolves(),
     reason=(
         "A hard-coded fallback path resolves on this host; the 'no recall "
         "discoverable' branch cannot be exercised deterministically. CI "
