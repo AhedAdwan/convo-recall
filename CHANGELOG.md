@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **TD-006: tool_error ingestion silently dropped since 2026-04-29.** The hot-path in `ingest_file()` had a `if not text: continue` early-out that ran BEFORE the tool_result error harvesting loop. Modern Claude Code emits user records whose content is ONLY a tool_result block (no accompanying `text`/`input_text`), so `_extract_text(...)` returned empty and the iteration aborted before the tool_error scanner ran. Restructured the user-message branch so persistence and tool_error harvesting are independent steps. Existing DBs can heal historical rows via `recall tool-error-backfill`. Two regression tests added.
+
+### Removed
+- Fossil tables `chunks` (5,668 orphan rows) and `chunk_vecs` (0 rows) dropped from the live DB on the maintainer's machine. These were leftovers from a per-chunk vector design reverted on 2026-04-29 in favor of sidecar-side sliding-window mean-pooling into a single `message_vecs` row. Fresh installs of v0.3.x never created these tables — there's no migration to add for them. Documenting the cleanup here for transparency.
+
 ## [0.3.2] — 2026-05-03
 
 No user-visible changes. CI/test hygiene only.
