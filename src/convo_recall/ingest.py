@@ -1146,19 +1146,22 @@ def ingest_file(con: apsw.Connection, jsonl_path: Path,
             role = msg.get("role", rtype)
             raw_text = _extract_text(msg.get("content", ""))
             text = _clean_content(raw_text)
-            if not text:
-                continue
 
             uuid = rec.get("uuid", f"{session_id}:{lineno}")
             timestamp = rec.get("timestamp")
             model = msg.get("model") if role == "assistant" else None
 
-            inserted += _persist_message(
-                con, agent, project_id, session_id, uuid, role, text,
-                timestamp, do_embed, model=model,
-            )
+            if text:
+                inserted += _persist_message(
+                    con, agent, project_id, session_id, uuid, role, text,
+                    timestamp, do_embed, model=model,
+                )
 
-            # Index tool_result error blocks within user messages
+            # Index tool_result error blocks within user messages. This runs
+            # independently of `text` — modern Claude Code emits user records
+            # whose content is ONLY a tool_result block (no accompanying text),
+            # so an early-out on empty `text` would silently drop every
+            # tool error. See TD-006.
             if rtype == "user":
                 content_blocks = msg.get("content", [])
                 if isinstance(content_blocks, list):

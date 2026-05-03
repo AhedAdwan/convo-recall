@@ -1166,6 +1166,61 @@ def test_no_silent_apsw_error_pass_in_source():
         )
 
 
+def test_ingest_file_captures_tool_error_when_no_text_block(db, tmp_path, monkeypatch):
+    """TD-006 regression: modern Claude Code emits user records whose `content`
+    is ONLY a tool_result block (no text/input_text/output_text alongside).
+    The hot-path used to early-out on `if not text: continue` BEFORE the
+    tool_result harvesting loop ran, silently dropping every tool error since
+    2026-04-29. Fix lives in ingest_file's user-msg branch — text-empty path
+    must still scan tool_result blocks."""
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    session = tmp_path / "proj_foo" / "session-td006.jsonl"
+    _write_session(session, [
+        # User message with ONLY a tool_result error block (no text alongside)
+        {"uuid": "u1", "type": "user", "timestamp": "2026-05-03T10:00:00Z",
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "toolu_abc",
+              "is_error": True,
+              "content": [{"type": "text", "text": "Error: ECONNREFUSED 1.2.3.4:80"}]},
+         ]}},
+    ])
+    n = ingest.ingest_file(db, session, do_embed=False)
+    assert n == 1, f"expected 1 inserted (the tool_error), got {n}"
+
+    rows = db.execute(
+        "SELECT role, content FROM messages WHERE role='tool_error'"
+    ).fetchall()
+    assert len(rows) == 1, \
+        "tool_result-only user message did not produce a tool_error row — TD-006 regression"
+    assert "ECONNREFUSED" in rows[0]["content"]
+
+
+def test_ingest_file_captures_tool_error_alongside_text(db, tmp_path, monkeypatch):
+    """Sister case to TD-006: when a user message has BOTH a text block AND
+    a tool_result error block, both should be captured (one user row + one
+    tool_error row). Ensures the fix didn't break the legacy shape."""
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    session = tmp_path / "proj_foo" / "session-td006-mixed.jsonl"
+    _write_session(session, [
+        {"uuid": "u1", "type": "user", "timestamp": "2026-05-03T10:00:00Z",
+         "message": {"role": "user", "content": [
+             {"type": "text", "text": "please fix this"},
+             {"type": "tool_result", "tool_use_id": "toolu_xyz",
+              "is_error": True,
+              "content": [{"type": "text", "text": "Traceback (most recent call)"}]},
+         ]}},
+    ])
+    n = ingest.ingest_file(db, session, do_embed=False)
+    assert n == 2, f"expected 2 inserted (user + tool_error), got {n}"
+
+    rows = db.execute(
+        "SELECT role, content FROM messages ORDER BY rowid"
+    ).fetchall()
+    roles = [r["role"] for r in rows]
+    assert "user" in roles and "tool_error" in roles, \
+        f"expected user + tool_error rows, got {roles}"
+
+
 def test_tool_error_backfill_uses_correct_agent(db, tmp_path, monkeypatch):
     """P1 #6: tool_error_backfill INSERT statement is missing the `agent`
     column. Today it relies on DEFAULT 'claude' — works for claude sessions
