@@ -3117,6 +3117,8 @@ def _backfill_claude_tool_errors(con: apsw.Connection) -> int:
     Mirrors the in-place ingest loop's logic at ingest_file but full-scans
     every file (no lines_already guard)."""
     indexed = 0
+    if not PROJECTS_DIR.exists():
+        return 0
     for project_dir in PROJECTS_DIR.iterdir():
         if not project_dir.is_dir():
             continue
@@ -3140,8 +3142,14 @@ def _backfill_claude_tool_errors(con: apsw.Connection) -> int:
                     continue
                 if recovered_cwd:
                     project_id = _project_id(recovered_cwd)
+                    display_name = _display_name(recovered_cwd)
+                    cwd_real = os.path.realpath(recovered_cwd)
                 else:
-                    project_id = _legacy_project_id(_legacy_claude_slug(jsonl_path))
+                    legacy = _legacy_claude_slug(jsonl_path)
+                    project_id = _legacy_project_id(legacy)
+                    display_name = legacy
+                    cwd_real = None
+                _upsert_project(con, project_id, display_name, cwd_real)
                 try:
                     with open(jsonl_path, "r", errors="replace") as f:
                         for lineno, raw in enumerate(f):
@@ -3188,6 +3196,8 @@ def _backfill_codex_tool_errors(con: apsw.Connection) -> int:
     for jsonl_path in _iter_codex_files():
         session_id = jsonl_path.stem
         project_id = _legacy_project_id("codex_unknown")
+        display_name: str = "codex_unknown"
+        cwd_real: str | None = None
         try:
             with open(jsonl_path, "r", errors="replace") as fh:
                 for i, line in enumerate(fh):
@@ -3204,9 +3214,12 @@ def _backfill_codex_tool_errors(con: apsw.Connection) -> int:
                     cwd = payload.get("cwd")
                     if cwd:
                         project_id = _project_id(cwd)
+                        display_name = _display_name(cwd)
+                        cwd_real = os.path.realpath(cwd)
                     break
         except OSError:
             continue
+        _upsert_project(con, project_id, display_name, cwd_real)
         try:
             with open(jsonl_path, "r", errors="replace") as f:
                 for lineno, raw in enumerate(f):
@@ -3263,9 +3276,13 @@ def _backfill_gemini_tool_errors(con: apsw.Connection) -> int:
         session_id = jsonl_path.stem
         hash_dir = jsonl_path.parent.parent.name
         project_id: str | None = None
+        display_name: str | None = None
+        cwd_real: str | None = None
         aliased_cwd = aliases.get(hash_dir)
         if aliased_cwd:
             project_id = _project_id(aliased_cwd)
+            display_name = _display_name(aliased_cwd)
+            cwd_real = os.path.realpath(aliased_cwd)
         # Read header for cwd / sessionId override
         try:
             with open(jsonl_path, "r", errors="replace") as fh:
@@ -3278,12 +3295,17 @@ def _backfill_gemini_tool_errors(con: apsw.Connection) -> int:
                             cwd = head.get("cwd") or head.get("projectDir")
                             if cwd and project_id is None:
                                 project_id = _project_id(cwd)
+                                display_name = _display_name(cwd)
+                                cwd_real = os.path.realpath(cwd)
                 except (json.JSONDecodeError, ValueError):
                     pass
         except OSError:
             continue
         if project_id is None:
             project_id = _gemini_hash_project_id(hash_dir)
+            display_name = hash_dir
+            cwd_real = None
+        _upsert_project(con, project_id, display_name or hash_dir, cwd_real)
         try:
             with open(jsonl_path, "r", errors="replace") as f:
                 for lineno, raw in enumerate(f):

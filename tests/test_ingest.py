@@ -1408,6 +1408,46 @@ def test_tool_error_backfill_uses_correct_agent(db, tmp_path, monkeypatch):
         )
 
 
+def test_tool_error_backfill_upserts_projects(db, tmp_path, monkeypatch):
+    """Regression: backfill must populate the `projects` lookup table so
+    backfilled tool_error rows display with a human-readable display_name
+    instead of an unresolved project_id hash. Hot-path ingesters do this;
+    backfill helpers were missing the call before this fix."""
+    # Codex source with a real cwd → display_name should resolve to "Foo".
+    cdir = tmp_path / "codex" / "sessions" / "2026" / "05" / "03"
+    cdir.mkdir(parents=True)
+    sess = cdir / "rollout-2026-05-03T02-00-00-up.jsonl"
+    sess.write_text(
+        json.dumps({"type": "session_meta", "timestamp": "2026-05-03T02:00:00Z",
+                    "payload": {"id": "c-up",
+                                "cwd": "/Users/x/Projects/mcp/Foo",
+                                "timestamp": "2026-05-03T02:00:00Z"}}) + "\n"
+        + json.dumps({"type": "event_msg", "timestamp": "2026-05-03T02:00:01Z",
+                      "payload": {"type": "exec_command_end",
+                                  "call_id": "call_proj",
+                                  "exit_code": 1,
+                                  "aggregated_output": "boom"}}) + "\n"
+    )
+    monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path / "no-claude")
+    monkeypatch.setattr(ingest, "CODEX_SESSIONS", tmp_path / "codex" / "sessions")
+    monkeypatch.setattr(ingest, "GEMINI_TMP", tmp_path / "no-gemini")
+
+    ingest.tool_error_backfill(db)
+
+    rows = db.execute("""
+        SELECT m.role, m.agent, p.display_name, p.cwd_realpath
+        FROM messages m
+        LEFT JOIN projects p ON p.project_id = m.project_id
+        WHERE m.role='tool_error'
+    """).fetchall()
+    assert rows, "backfill produced no tool_error rows"
+    assert all(r["agent"] == "codex" for r in rows)
+    assert all(r["display_name"] == "Foo" for r in rows), \
+        f"projects row missing or display_name not registered: {[r['display_name'] for r in rows]}"
+    assert all(r["cwd_realpath"] is not None for r in rows), \
+        "backfill did not set cwd_realpath in projects table"
+
+
 def test_embed_returns_none_on_non_200_response(monkeypatch):
     """Bonus #14: embed() does not check resp.status — non-200 responses
     raise KeyError('vector') instead of returning None gracefully.
