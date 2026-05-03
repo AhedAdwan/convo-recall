@@ -2,101 +2,30 @@
 
 [![Tests](https://github.com/AhedAdwan/convo-recall/actions/workflows/test.yml/badge.svg)](https://github.com/AhedAdwan/convo-recall/actions/workflows/test.yml)
 
-> **You've been using a coding-agent CLI for a year. Hundreds of conversations — decisions made, approaches that failed, the exact fix for that recurring bug, the prompt that finally worked. You think all that knowledge and wisdom is gone.**
->
-> **It's not. It's all on disk. convo-recall makes it visible again.**
->
-> _It doesn't tell you what to do with it — that's still up to you and your agent. It just gets your memory back._
+> **Searchable memory for your coding-agent conversations — across sessions, across projects, across Claude Code, Codex, and Gemini.**
 
-> **AI agents are stateless by design. convo-recall makes them stateful by infrastructure.**
-
-_Inspired by Andrej Karpathy's [LLM Wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f). Where Karpathy's wiki has the LLM synthesize external sources into curated markdown, convo-recall captures verbatim agent session transcripts in SQLite — same instinct (agents need persistent state across sessions), different object. The two are complementary, not competing._
-
-Every coding-agent session starts blind. Decisions made last week, approaches that failed, the exact fix for that recurring bug — all of it vanishes when the context window closes. As sessions grow longer, the cost of keeping that context alive skews toward noise over signal. And when multiple agents work on the same project, each one starts from zero with no knowledge of what the others have done.
-
-convo-recall fixes this. It indexes every conversation from your coding agents — **Claude Code, Gemini CLI, and Codex** — into one local SQLite database and makes it searchable by keyword, by semantic meaning, or both. Your agents get a shared memory that survives the context window AND crosses tool boundaries.
+Coding agents are stateless by design. convo-recall makes them stateful by infrastructure: every conversation lands in one local SQLite index, searchable by keyword and semantic meaning, and auto-fed back into the agent's context on every prompt.
 
 ```bash
 recall search "how did we fix the auth middleware"
 recall search "approaches we tried for the chunking problem" --recent
 recall search "deployment config" --all-projects
-recall search "the prompt that worked" --agent gemini      # filter to one agent
+recall search "the prompt that worked" --agent gemini
 ```
 
 ---
 
-## Why not the agent's built-in memory or compaction?
+## Key features
 
-Most coding agents ship with two related-but-distinct features for surviving long conversations: **in-session compaction** and a **curated memory layer**. Names vary — Claude has *compaction* + *memory*, Codex has *resumable sessions*, Gemini has `/chat save` + the *Memory MCP* — but the shape is similar everywhere.
+- **One memory across every agent.** Claude Code, Codex, and Gemini sessions all land in the same SQLite DB. Claude can find what Codex did yesterday.
+- **Verbatim, source-traceable.** Full transcripts indexed — not LLM summaries. Every hit links back to the originating session and timestamp.
+- **Hybrid FTS + vector search.** SQLite FTS5 (porter stemming) fused with semantic recall (BAAI/bge-large-en-v1.5, 1024-dim, running locally on MPS/CPU) via Reciprocal Rank Fusion.
+- **Cross-project recall.** Auto-scopes to the current repo by default; `--all-projects` for global search.
+- **Zero-upkeep ingest.** Response-completion hooks index every turn within ~50 ms — no daemons to babysit.
+- **Auto-context injection.** A pre-prompt hook runs `recall search` on every substantive prompt and feeds the top hits to the agent, so it actually knows what you've already worked on.
+- **Local-only, secrets redacted.** Everything stays on your machine. OpenAI/Anthropic/GitHub/AWS/JWT/Slack token shapes are stripped on the way in. No cloud, no telemetry.
 
-| | In-session compaction | Curated memory layer | convo-recall |
-|---|---|---|---|
-| Survives across sessions | — | ✅ | ✅ |
-| Full verbatim transcript | — | — | ✅ |
-| Semantic search | — | — | ✅ |
-| Automatic, zero-setup | ✅ | ✅ | ✅ (launchd / systemd / cron) |
-| Cross-project recall | — | — | ✅ |
-| Cross-agent recall (Claude ↔ Codex ↔ Gemini) | — | — | ✅ |
-| Source-traceable | — | — | ✅ |
-
-**Compaction** summarizes and discards — the detail is gone. Useful for staying within a context window, but it only knows the current session.
-
-**Curated memory layers** are agent-written prose — the model decides what's worth saving, which means everything it didn't think to record is permanently lost. No semantic search, no source tracing. Each agent's memory layer is also walled off from the others: Claude's memory file can't see what Codex did yesterday.
-
-**convo-recall** indexes everything automatically across every supported agent, keeps the full transcript, and lets you query it with natural language. The two approaches are complementary: use the agent's own memory for high-signal curated facts (intent, preferences, ongoing goals), use convo-recall for full verbatim history on demand — including across agents.
-
----
-
-## What this enables
-
-### For single-agent workflows
-
-- **No more context amnesia** — start a new session and immediately retrieve what was decided, tried, and rejected in prior sessions.
-- **Replace long context with precise retrieval** — instead of cramming weeks of history into the context window, ask for the 5 most relevant fragments. The model stays focused.
-- **Reasoning is searchable, not just code** — git history stores what changed. convo-recall stores *why*. "Why did we switch from X to Y?" is here, not in the diff.
-
-### For multi-agent workflows
-
-- **Shared memory pool** — agents working on different sub-tasks of the same project index into the same DB. Each agent can retrieve what others have done without coordination overhead.
-- **Dead ends as first-class data** — approaches that were tried and abandoned are indexed. The next agent doesn't re-explore the same dead end.
-- **Subagent transparency** — parallel agents' full transcripts are indexed, not just their summaries. You can query what a sub-agent actually did.
-- **Cross-project knowledge transfer** — a decision made in one project surfaces when you're solving the same class of problem in another.
-
----
-
-## How it works
-
-Each coding agent writes session transcripts as `.jsonl` files in its own location. convo-recall watches each directory via a per-agent launchd job, parses the JSONL, cleans the content, and indexes it with:
-
-- **FTS5** — SQLite full-text search with porter stemming. Instant. No model required.
-- **Vector KNN** (optional) — semantic search via BAAI/bge-large-en-v1.5 (1024-dim), running locally on MPS/CPU. Results fused with FTS via Reciprocal Rank Fusion.
-
-New conversations are searchable within ~10 seconds of being written. The embedding sidecar stays warm in the background so hybrid search stays fast.
-
-Without embeddings, search is FTS-only. With the `[embeddings]` extra and `recall serve`, search becomes hybrid — keyword and semantic together.
-
-### Supported agents
-
-| Agent  | Source dir                 | Pattern                                    |
-|--------|----------------------------|--------------------------------------------|
-| claude | `~/.claude/projects/`      | `*/*.jsonl`, `*/subagents/*.jsonl`         |
-| gemini | `~/.gemini/tmp/`           | `*/chats/session-*.jsonl`                  |
-| codex  | `~/.codex/sessions/`       | `{YYYY}/{MM}/{DD}/rollout-*.jsonl`         |
-
-`recall install` auto-detects which agents are present on your machine and installs one launchd job per agent. The set of enabled agents is persisted in `~/.local/share/convo-recall/config.json` and can be edited directly.
-
-For Codex sessions, the project slug is derived from the session's `cwd` so cross-agent search-by-project works the same way it does for Claude.
-
-Tool calls and reasoning blocks are NOT indexed — only human-readable user/assistant text. Codex `~/.codex/history.jsonl` is intentionally skipped (rollout files are the source of truth).
-
----
-
-## Requirements
-
-- macOS or Linux. Python **3.11, 3.12, 3.13, or 3.14** — CI tests every version on both OSes; the lower bound is 3.11.
-  - macOS: launchd watcher (default).
-  - Linux: systemd-user, cron, or polling fallback — auto-detected. See [Schedulers](#schedulers).
-- Claude Code, Codex, or Gemini CLI (any subset; hooks work across all three).
+Runs on macOS or Linux. Python 3.11–3.14. Works with any subset of Claude Code, Codex, or Gemini CLI.
 
 ---
 
@@ -120,230 +49,138 @@ pipx install -e '.[embeddings]'
 recall install
 ```
 
-`recall install` runs an interactive wizard that walks through every decision (response-completion ingest hooks, embed sidecar, pre-prompt search hooks, initial ingest) — each prompt prints what happens if you answer yes vs. no. Run it as-is on first install so the full wizard surface is visible.
+`recall install` runs an interactive wizard that walks through every decision (response-completion ingest hooks, embed sidecar, pre-prompt search hooks, initial ingest) — each prompt prints what happens if you answer yes vs. no.
 
-The wizard kicks off the initial ingest + embed-backfill in a **detached background process** so it returns control immediately. Watch progress with `recall stats` (shows a one-shot tqdm bar at the top while the job is active) or `tail -f ~/Library/Logs/convo-recall-wizard-backfill.log`.
+The wizard kicks off the initial ingest + embed-backfill in a **detached background process** so it returns control immediately. Watch progress with `recall stats` (one-shot tqdm bar at the top while the job is active) or `tail -f ~/Library/Logs/convo-recall-wizard-backfill.log`.
 
 The embedding model (BAAI/bge-large-en-v1.5, ~1.3 GB) downloads on first use. Long texts are chunked with a 450-token sliding window (50-token overlap) and mean-pooled — no silent truncation at 512 tokens.
 
 ### Uninstall
 
-Two-step chain. Order matters — run `recall uninstall` **before** `pipx uninstall`, otherwise the bundled hook script can't be located and entries get left dangling in each agent's settings file:
-
 ```bash
-recall uninstall              # removes hooks + watchers + sidecar (DB + config preserved)
+recall uninstall              # removes hooks + sidecar (DB + config preserved)
 pipx uninstall convo-recall   # removes the package itself
 ```
 
-Full purge (also deletes the indexed conversation DB, logs, runtime cruft):
+Order matters — `recall uninstall` first, otherwise the bundled hook script can't be located and entries get left dangling in each agent's settings file.
+
+Full purge (also drops the indexed DB, logs, runtime cruft):
 
 ```bash
 recall uninstall --purge-data
 pipx uninstall convo-recall
 ```
 
-`--purge-data` removes `~/.local/share/convo-recall/` (DB + config), `~/Library/Caches/convo-recall/` on macOS or `$XDG_RUNTIME_DIR/convo-recall/` on Linux (sockets + cron backups), and `convo-recall-*.log` files in your platform log dir.
-
-**Always preserved** (clean up manually if desired):
-
-- Settings backups: `~/.claude/settings.json.bak.*`, `~/.codex/hooks.json.bak.*`, `~/.gemini/settings.json.bak.*` — kept as a recovery safety net.
-- Embedding model cache: `~/.cache/huggingface/hub/models--BAAI--bge-large-en-v1.5/` — shared across tools (delete only if no other tool uses BGE).
+Settings backups (`~/.claude/settings.json.bak.*`, etc.) and the BGE model cache (`~/.cache/huggingface/hub/models--BAAI--bge-large-en-v1.5/`) are always preserved — clean up manually if you want them gone.
 
 ---
 
 ## Schedulers
 
-`recall install` picks one of four schedulers automatically — used to supervise the embed sidecar. Since v0.3.5, the response-completion ingest hook handles ingestion (no separate watcher daemons), so the scheduler tier matters mainly for keeping the embedding service warm.
+`recall install` picks one of four schedulers automatically — used to supervise the embed sidecar. Since v0.3.5, the response-completion ingest hook handles ingestion, so the scheduler tier matters mainly for keeping the embedding service warm.
 
 | Scheduler | Detected when | Survives reboot | Notes |
 |---|---|---|---|
-| `launchd` | macOS | yes | Uses `~/Library/LaunchAgents` plists. Default on Darwin. |
-| `systemd` | Linux + `systemctl --user is-system-running` succeeds | yes (with linger) | User-mode `.service` units. Run `loginctl enable-linger $USER` if you want the sidecar to survive logout. |
+| `launchd` | macOS | yes | `~/Library/LaunchAgents` plists. Default on Darwin. |
+| `systemd` | Linux + `systemctl --user is-system-running` succeeds | yes (with linger) | User-mode `.service` units. Run `loginctl enable-linger $USER` to keep the sidecar alive after logout. |
 | `cron` | Linux + `crontab` available, no usable systemd-user | yes | `@reboot` lines tagged `# convo-recall:*`. Tagged-line filtering on uninstall preserves your other crontab entries. |
-| `polling` | always | NO | Last-resort fallback: spawns the sidecar as a `Popen` child. Dies at logout/reboot. |
+| `polling` | always | NO | Last-resort fallback: `Popen` child. Dies at logout/reboot. |
 
-The wizard prints `Selected scheduler: <X>` so you always know which tier you're on. `recall uninstall` walks every scheduler so a host that switched OS gets clean teardown.
+`recall uninstall` walks every scheduler, so a host that switched OS gets clean teardown.
 
 ---
 
 ## Usage
 
 ```bash
-# Search (auto-scopes to current project if inside a Claude Code project dir)
+# Search (auto-scopes to current project)
 recall search "sqlite vector search"
 recall search "chunking strategy" --recent        # bias toward recent conversations
-recall search "embedding model" --all-projects    # search across all projects
-recall search "bug fix" -n 20                     # more results
+recall search "embedding model" --all-projects    # search every project
 recall search "the failing test" --agent codex    # filter to one agent
+recall search "bug fix" -n 20
+
+# Recent conversation tail
+recall tail                       # last 30 messages of the latest session in this project
+recall tail 50 --all-projects     # latest session across all projects
 
 # Maintenance
-recall ingest                   # manual ingest trigger (all enabled agents)
-recall ingest --agent gemini    # ingest only one agent
-recall watch                    # polling watcher for Linux/sandbox (no launchd)
-recall stats                    # DB statistics (with per-agent counts)
-recall serve                    # start embedding sidecar manually (if not using launchd)
+recall ingest                     # manual ingest trigger
+recall ingest --agent gemini      # one agent only
+recall stats                      # DB statistics, per-agent counts
+recall doctor                     # health check + per-agent hook state
 
 # One-time backfills (run after upgrading)
-recall embed-backfill           # embed any un-embedded messages
-recall chunk-backfill           # re-embed long messages with chunked mean-pooling
-recall backfill-clean           # re-clean content and rebuild FTS index
-recall backfill-redact          # apply secret redaction to existing rows
-recall tool-error-backfill      # index tool error blocks from existing sessions
-
-# Health checks
-recall doctor                   # general DB health
-recall doctor --scan-secrets    # count credential-shaped tokens in indexed content
+recall embed-backfill             # embed any un-embedded messages
+recall chunk-backfill             # re-embed long messages with chunked mean-pooling
+recall backfill-clean             # re-clean content + rebuild FTS index
+recall backfill-redact            # apply secret redaction to existing rows
+recall tool-error-backfill        # index tool error blocks from existing sessions
 ```
 
 ---
 
-## Project scope
+## Project identity
 
-### Project identity
+Every project is identified by:
 
-Every project is identified by **two stable values**:
+- **`project_id`** = `sha1(realpath(cwd))[:12]` — collision-free, deterministic, hyphen-vs-slash safe. Symlinked paths that resolve to the same target collapse to one id.
+- **`display_name`** = basename of the nearest ancestor containing a project-root marker (`.git`, `package.json`, `Cargo.toml`, `pyproject.toml`, `go.mod`, …). Falls back to the basename of `realpath(cwd)`.
 
-- **`project_id`** — `sha1(realpath(cwd))[:12]`. Hyphen-vs-slash safe, collision-free, deterministic from the directory. Two symlinked paths that resolve to the same target collapse to one id.
-- **`display_name`** — basename of the nearest ancestor containing a project-root marker (`.git`, `package.json`, `Cargo.toml`, `pyproject.toml`, `go.mod`, …). Falls back to the basename of `realpath(cwd)` when no marker is found upstream.
+Search and tail accept `--project <display_name>` and resolve to the right `project_id` (exact match first, LIKE fallback with a multi-match warning). `recall forget --project X` requires an *exact* display_name match — no fallback.
 
-Both live in a normalized `projects` table (`project_id PK, display_name, cwd_realpath, first_seen, last_updated`). Search and tail accept the **display_name** via `--project X` and resolve to the right `project_id` internally — exact match first, with a LIKE fallback that warns when more than one project matches.
-
-```
-/Users/x/Projects/apps/my-app                   →  display_name "my-app"
-/Users/x/Projects/libs/convo-recall (with .git) →  display_name "convo-recall"
-```
-
-`recall search foo` auto-scopes to the current cwd. Override with `--project <name>` (display_name) or search everywhere with `--all-projects`. Hooks pass `--cwd PATH` explicitly so they don't depend on `os.getcwd()` being correct.
-
-### Cross-machine identity (limitation)
-
-There is **no cross-machine project identity**. The same repo at `~/work/repo` on machine A and `/srv/repo` on machine B has the same `display_name` but a *different* `project_id` (because the realpaths differ). If you sync your DB across machines whose paths differ, the same logical project will appear twice in the index. Search across both with `recall search foo --project repo` (matches by display_name).
-
-### Forget is exact-only
-
-`recall forget --project X` requires an **exact** `display_name` match — no LIKE fallback. If the name is ambiguous you must spell it out fully. Search and tail use exact-then-LIKE (with a multi-match warning) for ergonomic auto-scope.
-
-**Search snippet highlighting:** matched query tokens in result snippets are wrapped in `[brackets]` (SQLite FTS5's `snippet()` highlighter). For example, searching `"claude codex"` will return snippets with `[claude]` and `[codex]` bracketed. Tokens that aren't in your query are unbracketed — this isn't redaction or asymmetry, it's just where the match landed.
+**Cross-machine limitation:** project identity is path-based. The same repo at `~/work/repo` on machine A and `/srv/repo` on machine B has different `project_id`s. If you sync the DB across machines, the same logical project appears twice — search across both with `recall search foo --project repo` (display_name match).
 
 ---
 
-## Pre-prompt hooks (Claude / Codex / Gemini)
+## Hooks
 
-convo-recall ships a single shell hook that auto-runs `recall search` against your prompt and injects the top hits as context on every substantive user turn. Same script works in all three CLIs — it auto-detects the event from the JSON payload each CLI sends on stdin and echoes back the right `hookEventName` so each accepts the response.
+convo-recall ships two shell hooks that auto-detect each CLI's payload shape and work across all three:
 
-The script is at `src/convo_recall/hooks/conversation-memory.sh`. Without these hooks wired, your AI agents won't know convo-recall exists and will keep guessing/web-searching despite the indexed history sitting right there.
+- **`conversation-memory.sh`** (pre-prompt) — runs `recall search "$prompt" -n 3 --json` on every substantive user turn (≥12 chars, not pure interjections like "yes" / "ok" / "hmm") and injects the top hits into the agent's context. Trivial prompts are no-ops. Opt out with `CONVO_RECALL_HOOK_AUTO_SEARCH=off`.
+- **`conversation-ingest.sh`** (response-completion) — fires on Claude `Stop` / Codex `Stop` / Gemini `AfterAgent`, spawns `recall ingest` detached. Throttled to one ingest per 5 s via a lock file. Opt out with `CONVO_RECALL_INGEST_HOOK=off`.
 
-**Behavior:**
-- Substantive prompts (≥12 chars, not pure interjections like "yes" / "ok" / "hmm"): hook runs `recall search "$prompt" -n 3 --json` and prepends top hits to context.
-- Trivial prompts: hook returns empty context, zero token bloat.
-- Opt out entirely: set `CONVO_RECALL_HOOK_AUTO_SEARCH=off` in your env.
+`recall install` wires both into every detected CLI. To wire later or selectively:
+
+```bash
+recall install-hooks                       # both kinds, all detected CLIs
+recall install-hooks --kind ingest         # ingest only
+recall install-hooks --kind memory         # search only
+recall install-hooks --agent claude        # one CLI
+recall doctor                              # show per-agent wired/NOT-wired state
+recall uninstall-hooks                     # remove only convo-recall blocks
+```
+
+Every operation backs up the original settings file with a `.bak.<timestamp>` suffix.
 
 ### Custom instructions
 
-The hook also reads two optional files and prepends their content to the injected context — useful for per-machine and per-repo guidance:
+The pre-prompt hook also reads two optional files and prepends them to injected context (each capped at 2 KB):
 
-- **Global**: `~/.config/convo-recall/instructions.md` (or `$XDG_CONFIG_HOME/convo-recall/instructions.md`)
-- **Per-project**: `.recall-instructions.md` in the cwd
+- **Global**: `~/.config/convo-recall/instructions.md`
+- **Per-project**: `.recall-instructions.md` in cwd
 
-Each is capped at 2 KB. Both are optional. If both exist, global content goes first, then per-project, then prior-context, then the static reminder.
+Order: global → per-project → prior-context → static reminder.
 
-### Quickest path
+### Continuous ingest
 
-```bash
-recall install-hooks            # interactive: confirms each detected CLI before wiring
-recall install-hooks -y         # non-interactive: wires every detected CLI
-recall install-hooks --dry-run  # shows what would change without writing
-recall install-hooks --agent claude --agent codex   # subset
-recall uninstall-hooks          # removes only the convo-recall block; user's other hooks stay
-```
-
-`recall install` runs this as one stage of the full wizard and asks before modifying any settings file. Every operation backs up the original file with a `.bak.<timestamp>` suffix.
-
-### Wire it up manually
-
-**Claude Code** (`~/.claude/settings.json`):
-```json
-{
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {"type": "command", "command": "/path/to/conversation-memory.sh", "timeout": 5}
-        ]
-      }
-    ]
-  }
-}
-```
-
-**Codex CLI** (`~/.codex/hooks.json`):
-```json
-{
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {"type": "command", "command": "/path/to/conversation-memory.sh", "timeout": 5}
-        ]
-      }
-    ]
-  }
-}
-```
-
-**Gemini CLI** (`~/.gemini/settings.json`):
-```json
-{
-  "hooks": {
-    "BeforeAgent": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {"name": "convo-recall", "type": "command", "command": "/path/to/conversation-memory.sh", "timeout": 5000}
-        ]
-      }
-    ]
-  }
-}
-```
-
-Notes:
-- Gemini's `timeout` is in **milliseconds** (default 60000). Claude/Codex use **seconds**. Easy to get wrong.
-- Set `CONVO_RECALL_HOOK_LOG=/some/path.log` to log every hook firing for debugging.
-- Tested e2e in the claude-sandbox container: see `tests/sandbox-hooks-e2e.sh`. The test wires the hook into all three CLIs, runs each headless (`claude -p`, `codex exec`, `gemini -p --yolo --skip-trust`), and verifies the model actually receives the hint by asking it to echo the word "convo-recall" back.
-
-### Continuous ingest (response-completion hooks)
-
-Since v0.3.5 ingestion runs entirely off agent response-completion hooks. `conversation-ingest.sh` fires on each CLI's end-of-turn event and spawns `recall ingest` detached + backgrounded — within ~50 ms of every agent turn ending.
+Since v0.3.5, ingestion runs entirely off response-completion hooks. `conversation-ingest.sh` fires on each CLI's end-of-turn event:
 
 | CLI | Event | Per-turn? |
 |---|---|---|
-| Claude Code | `Stop` | ✅ yes (mature, 21+ events) |
+| Claude Code | `Stop` | ✅ yes |
 | Gemini CLI | `AfterAgent` | ✅ yes (default-on since v0.26.0) |
 | Codex CLI | `Stop` | ⚠ session-end only — Codex hook system limitation |
 
-**Codex caveats:** Codex hooks are experimental and gated behind `[features] codex_hooks = true` in `~/.codex/config.toml`. `recall install` writes the flag automatically when safely mergeable; skips with a warning when the file is invalid TOML or when running on Windows (Codex hooks are unsupported there).
+**Codex caveats:** Codex hooks are experimental and gated behind `[features] codex_hooks = true` in `~/.codex/config.toml`. `recall install` writes the flag automatically when safely mergeable; skips with a warning when the file is invalid TOML or when running on Windows.
 
-**Throttling:** the ingest hook uses a 5-second lock file at `${XDG_RUNTIME_DIR:-/tmp}/convo-recall/ingest.lock`. If another ingest fired within the last 5 seconds, the hook is a no-op — safe under chatty per-turn firings.
-
-```bash
-recall install-hooks --kind ingest          # wire only the ingest hook
-recall install-hooks --kind memory          # wire only the search hook
-recall install-hooks                        # both (default)
-recall doctor                               # shows per-agent wired/NOT-wired state
-```
-
-**Opt out** without uninstalling: `CONVO_RECALL_INGEST_HOOK=off`.
-
-Scheduler-tier watchers (launchd / systemd `.path` units / cron) are no longer installed by default — the response-completion hook makes them redundant. The watcher install code is still in the codebase (re-enable by uncommenting the `_ask` block in `_wizard.py`) for users with bespoke flows where the hook can't fire.
+Scheduler-tier watchers (launchd / systemd `.path` units / cron) are no longer installed by default — the response-completion hook makes them redundant. The watcher install code remains in the codebase for users with bespoke flows; re-enable by uncommenting the `_ask` block in `_wizard.py`.
 
 ---
 
 ## Privacy
 
-convo-recall ingests your conversation history verbatim into a local SQLite DB. To reduce the chance that secrets pasted into chats end up indexed and searchable, ingestion runs a **secret redaction** pass that replaces well-known credential token shapes with stable placeholders before they reach the FTS / vector index.
-
-Patterns redacted by default:
+convo-recall ingests your conversation history verbatim into a local SQLite DB. To reduce the chance that secrets pasted into chats end up indexed, ingestion runs a **secret redaction** pass that replaces well-known credential token shapes with stable placeholders before they reach the FTS / vector index.
 
 | Shape | Placeholder |
 |---|---|
@@ -354,16 +191,14 @@ Patterns redacted by default:
 | JWTs (`eyJ….….…`) | `«REDACTED-JWT»` |
 | Slack tokens (`xoxb-/xoxp-/…`) | `«REDACTED-SLACK-TOKEN»` |
 
-Redaction is **on by default**. Set `CONVO_RECALL_REDACT=off` to disable it (e.g. for security-research workflows where you want to grep across raw content).
-
-Helpers for an existing DB that pre-dates redaction:
+Redaction is on by default. Set `CONVO_RECALL_REDACT=off` to disable (e.g. for security-research workflows where you want raw content). For a DB that pre-dates redaction:
 
 ```bash
 recall doctor --scan-secrets   # count what's already indexed
-recall backfill-redact         # re-apply redaction to existing rows + rebuild FTS
+recall backfill-redact         # re-apply redaction + rebuild FTS
 ```
 
-The DB and its WAL/SHM sidecars are chmod-0600 (owner-only) on a multi-user system. The parent directory is chmod-0700.
+The DB and its WAL/SHM sidecars are chmod-0600; the parent directory is chmod-0700.
 
 ---
 
@@ -400,37 +235,31 @@ The bundled sidecar uses 1024-dim vectors. If your service uses a different dime
 
 ## License
 
-**Source-available, noncommercial, no government, no military.** convo-recall is licensed under a modified PolyForm Noncommercial 1.0.0 (SPDX: `LicenseRef-PolyForm-Noncommercial-1.0.0-convo-recall`). It is not OSI-open source. The base license text is the upstream [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0); the licensor has removed government use and added an explicit prohibition on military/defense/weapons/intelligence/mass-surveillance use.
+**Source-available, noncommercial, no government, no military.** Modified PolyForm Noncommercial 1.0.0 (SPDX `LicenseRef-PolyForm-Noncommercial-1.0.0-convo-recall`). Not OSI-open source. The base text is upstream [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0); the licensor has removed government use and added an explicit prohibition on military / defense / weapons / intelligence / mass-surveillance use.
 
 **You may** — for free, with no further permission:
+
 - Read, fork, modify, and redistribute the source.
-- Use it for personal projects, hobby work, research, experimentation, education, and personal study.
-- Use it inside charitable organizations, educational institutions (including public schools and universities for teaching and academic research), public research organizations, public safety / public health organizations, and environmental protection organizations.
+- Use it for personal projects, research, experimentation, education.
+- Use it inside charitable orgs, educational institutions (incl. public schools / universities for teaching and academic research), public research / public health / environmental orgs.
 
 **You may not** — under any circumstance:
-- Use convo-recall in or with any commercial software, product, or service.
-- Embed convo-recall as a dependency in software that any company sells, hosts, or distributes commercially.
-- Use convo-recall internally at a for-profit company for work-related purposes.
-- Use convo-recall by, on behalf of, or for the benefit of any government institution at any level (national, state, provincial, regional, county, municipal, or quasi-public) — except for public schools/universities used solely for teaching and academic research.
-- Use convo-recall for any military, defense, weapons system, intelligence service, or armed-conflict purpose — including reconnaissance, targeting, autonomous-weapons, command-and-control, or any training/deployment/evaluation thereof.
-- Use convo-recall in any mass-surveillance, social-credit, or biometric-identification system operated against a general population.
 
-If you want to use convo-recall commercially, reach out for a commercial license — open to discussion for genuinely civilian, non-military use cases. See [LICENSE](LICENSE) for the full text.
+- Use convo-recall in or with any commercial software, product, or service.
+- Embed it as a dependency in software any company sells, hosts, or distributes commercially.
+- Use it internally at a for-profit company for work-related purposes.
+- Use it by, on behalf of, or for the benefit of any government institution at any level — except public schools / universities for teaching and academic research.
+- Use it for any military / defense / weapons / intelligence / armed-conflict purpose — including reconnaissance, targeting, autonomous weapons, or training/deployment/evaluation thereof.
+- Use it in mass-surveillance, social-credit, or biometric-identification systems operated against a general population.
+
+For commercial licensing on civilian, non-military use cases, reach out. Full text in [LICENSE](LICENSE).
 
 ---
 
 ## Disclaimer
 
-convo-recall is provided **as-is**, without warranty of any kind. While the
-codebase ships with 200+ tests and several end-to-end sandbox runs, your
-environment is not our environment.
+convo-recall is provided **as-is**, without warranty of any kind. The codebase ships with 360+ tests and several end-to-end sandbox runs, but your environment is not our environment.
 
-**Before installing on a workstation you care about:**
-- Read [`SECURITY.md`](SECURITY.md) and the install wizard's per-step prompts.
-- Run a sandbox first — the `tests/sandbox-*.sh` scripts spin up disposable
-  Docker environments that exercise the full install / search / uninstall path.
-- The source is small (~3K lines of Python) — do your own due diligence.
+Before installing on a workstation you care about: read [`SECURITY.md`](SECURITY.md), run a sandbox first (`tests/sandbox-*.sh` spin up disposable Docker environments that exercise install / search / uninstall), and do your own due diligence on the source (~3K lines of Python).
 
-You run convo-recall at your own risk. The author is not responsible for any
-data loss, system damage, or other consequences. See [`LICENSE`](LICENSE) §
-*No Liability* for the binding legal terms.
+You run convo-recall at your own risk. See [`LICENSE`](LICENSE) § *No Liability* for binding terms.
