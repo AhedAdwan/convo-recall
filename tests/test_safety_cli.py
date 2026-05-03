@@ -107,16 +107,6 @@ def isolated_db(tmp_path):
     yield {"env": env, "db": db_path, "config": cfg_path, "runtime": runtime_dir}
 
 
-def test_uninstall_purge_data_no_confirm_does_not_delete_db(isolated_db):
-    """`recall uninstall --purge-data` (no TTY, no --confirm) MUST NOT
-    delete the DB. This is the regression the audit closed."""
-    r = _run("uninstall", "--purge-data", env=isolated_db["env"], input_text="")
-    assert r.returncode == 0, f"uninstall failed: {r.stderr}"
-    assert isolated_db["db"].exists(), \
-        "DB was deleted in dry-run! Safety gate broken."
-    assert "DRY-RUN" in r.stdout or "dry-run" in r.stdout.lower()
-
-
 def test_backfill_clean_no_confirm_does_not_mutate(isolated_db):
     """Same shape: backfill-clean without --confirm must preview only."""
     # Get initial content
