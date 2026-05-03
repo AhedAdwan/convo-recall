@@ -174,7 +174,7 @@ Since v0.3.5, ingestion runs entirely off response-completion hooks. `conversati
 
 **Codex™ caveats:** Codex hooks are experimental and gated behind `[features] codex_hooks = true` in `~/.codex/config.toml`. `recall install` writes the flag automatically when safely mergeable; skips with a warning when the file is invalid TOML or when running on Windows.
 
-Scheduler-tier watchers (launchd / systemd `.path` units / cron) are no longer installed by default — the response-completion hook makes them redundant. The watcher install code remains in the codebase for users with bespoke flows; re-enable by uncommenting the `_ask` block in `_wizard.py`.
+Scheduler-tier watchers (launchd / systemd `.path` units / cron) are no longer installed by default — the response-completion hook makes them redundant. The watcher install code remains in the codebase for users with bespoke flows; re-enable by flipping `do_watchers = False` to `True` in `install/_wizard.py`.
 
 ---
 
@@ -297,8 +297,8 @@ Full FSL text in [`LICENSE`](LICENSE). AUP details in [`ACCEPTABLE_USE.md`](ACCE
 
 ## Disclaimer
 
-convo-recall is provided **as-is**, without warranty of any kind. The codebase ships with 360+ tests and several end-to-end sandbox runs, but your environment is not our environment.
+convo-recall is provided **as-is**, without warranty of any kind. The codebase ships with 365+ tests and several end-to-end sandbox runs, but your environment is not our environment.
 
-Before installing on a workstation you care about: read [`SECURITY.md`](SECURITY.md), run a sandbox first (`tests/sandbox-*.sh` spin up disposable Docker environments that exercise install / search / uninstall), and do your own due diligence on the source (~3K lines of Python).
+Before installing on a workstation you care about: read [`SECURITY.md`](SECURITY.md), run a sandbox first (`tests/sandbox-*.sh` spin up disposable Docker environments that exercise install / search / uninstall), and do your own due diligence on the source (~7,500 lines of Python across `db.py / query.py / embed.py / identity.py / backfill.py / admin.py / ingest/ / install/`).
 
 You run convo-recall at your own risk. See [`LICENSE`](LICENSE) § *No Liability* for binding terms.
