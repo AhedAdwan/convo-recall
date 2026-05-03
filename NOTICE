@@ -1,0 +1,81 @@
+convo-recall
+Copyright 2026 Ahed Aladwan
+https://github.com/AhedAdwan/convo-recall
+
+Licensed under the Functional Source License, Version 1.1, Apache 2.0 Future
+License (FSL-1.1-Apache-2.0). See LICENSE for the full terms. Use is also
+subject to the convo-recall Acceptable Use Policy in ACCEPTABLE_USE.md.
+
+================================================================================
+Third-Party Components
+================================================================================
+
+This product includes software developed by third parties. The following
+components are dependencies of convo-recall, used under their respective
+licenses. convo-recall does NOT modify or redistribute the source of these
+components — they are pulled at install time by your package manager from
+their own canonical sources.
+
+--------------------------------------------------------------------------------
+APSW — Another Python SQLite Wrapper
+--------------------------------------------------------------------------------
+Author:  Roger Binns
+Source:  https://github.com/rogerbinns/apsw
+License: zlib-style permissive ("any OSI-approved open source license")
+
+--------------------------------------------------------------------------------
+sqlite-vec
+--------------------------------------------------------------------------------
+Author:  Alex Garcia
+Source:  https://github.com/asg017/sqlite-vec
+License: MIT OR Apache-2.0 (dual-licensed; choose either)
+
+--------------------------------------------------------------------------------
+sentence-transformers (optional, with [embeddings] extra)
+--------------------------------------------------------------------------------
+Author:  UKPLab
+Source:  https://github.com/UKPLab/sentence-transformers
+License: Apache-2.0
+
+--------------------------------------------------------------------------------
+PyTorch (optional, with [embeddings] extra)
+--------------------------------------------------------------------------------
+Author:  Meta AI / The PyTorch Authors
+Source:  https://github.com/pytorch/pytorch
+License: BSD-3-Clause (with patent grant addendum; see PyTorch LICENSE)
+
+--------------------------------------------------------------------------------
+aiohttp (optional, with [embeddings] extra)
+--------------------------------------------------------------------------------
+Author:  aio-libs
+Source:  https://github.com/aio-libs/aiohttp
+License: Apache-2.0
+
+================================================================================
+Models Downloaded at Runtime
+================================================================================
+
+The following model is downloaded by your package manager / Hugging Face hub
+client at runtime. convo-recall does NOT redistribute the model weights.
+
+--------------------------------------------------------------------------------
+BAAI/bge-large-en-v1.5
+--------------------------------------------------------------------------------
+Author:  Beijing Academy of Artificial Intelligence (BAAI)
+Source:  https://huggingface.co/BAAI/bge-large-en-v1.5
+License: MIT (per model card; permitted for commercial use)
+
+================================================================================
+Trademarks
+================================================================================
+
+Claude(TM) and Claude Code(TM) are trademarks of Anthropic, PBC.
+Codex(TM) is a trademark of OpenAI OpCo, LLC.
+Gemini(TM) is a trademark of Google LLC.
+All other trademarks are the property of their respective owners.
+
+convo-recall is an independent open project. It is NOT affiliated with,
+endorsed by, sponsored by, or otherwise associated with Anthropic, OpenAI, or
+Google. References to these CLIs in convo-recall's source code, documentation,
+or output are nominative — they identify the third-party tools whose session
+files convo-recall reads — and do not imply endorsement by their owners.

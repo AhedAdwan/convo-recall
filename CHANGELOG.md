@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **License: relicensed under Functional Source License v1.1 (Apache-2.0 future).** convo-recall has moved from the modified PolyForm Noncommercial 1.0.0 to **vanilla [FSL-1.1-Apache-2.0](https://fsl.software/)** — the same Fair Source license used by Sentry, Codecov, Liquibase, GitButler, and Keygen. Each released version converts automatically to **Apache License, Version 2.0** on its second anniversary. SPDX tag is now the standard `FSL-1.1-Apache-2.0`. Practical effects:
+  - For-profit companies and startups can use convo-recall internally — engineers running it on their machines while building their own products is fully permitted.
+  - The FSL blocks **Competing Use only**: making convo-recall available to others as a product or service that substitutes for, or offers substantially similar functionality to, convo-recall itself (SaaS hosting, reselling as the product, managed convo-recall offerings).
+  - Use cases the FSL doesn't permit (e.g., bundling convo-recall in a commercial product) are available via commercial licensing — email the author.
+- **Added: convo-recall Acceptable Use Policy** (`ACCEPTABLE_USE.md`). A perpetual ethical-use rider that survives the two-year Apache 2.0 conversion. Prohibits use in or for: any government institution (except public schools / universities for teaching and academic research); any military, defense, weapons, intelligence, or armed-conflict purpose; any mass-surveillance, social-credit, or biometric-identification system operated against a general population.
+- **Added: third-party attributions** (`NOTICE`). Lists every dependency (apsw, sqlite-vec, sentence-transformers, torch, aiohttp, BAAI/bge-large-en-v1.5) with its license, plus trademark disclaimer for Claude™, Claude Code™, Codex™, and Gemini™.
+- **Added: contributor agreement** (`CLA.md`). Lightweight DCO-style sign-off plus an explicit grant that lets the maintainer continue offering commercial licenses as the project grows. Required for all PRs going forward.
+- **README: rewrote License section** to reflect FSL framing, Acceptable Use Policy reference, dual-license offer, and trademark disclaimer.
+
+The previous IBU grant on top of PolyForm Noncommercial (drafted but never released under a tagged version) was discarded after expert review flagged that the bespoke SPDX identifier and "Apache 2.0 + perpetual rider" Future License construction would (a) trigger enterprise legal-review delays at every adoption point and (b) invite ASF trademark concerns over modified Apache-2.0 framing. Vanilla FSL with a layered AUP is the recognized industry pattern (matches Hippocratic License's approach to ethical-use riders on permissive bases) and avoids both issues.
+
 ## [0.3.5] — 2026-05-03
 
 ### Changed

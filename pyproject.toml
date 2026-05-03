@@ -16,8 +16,8 @@ requires-python = ">=3.11"
 # permitted. The "convo-recall" qualifier on the LicenseRef signals this is
 # the licensor-modified variant, not the unmodified PolyForm-NC. Per PEP 639,
 # `license-files` declares the file that ships in the wheel/sdist.
-license = "LicenseRef-PolyForm-Noncommercial-1.0.0-convo-recall"
-license-files = ["LICENSE"]
+license = "LicenseRef-FSL-1.1-Apache-2.0"
+license-files = ["LICENSE", "ACCEPTABLE_USE.md", "NOTICE"]
 authors = [
     {name = "Ahed Isir"},
 ]

@@ -2,7 +2,7 @@
 
 [![Tests](https://github.com/AhedAdwan/convo-recall/actions/workflows/test.yml/badge.svg)](https://github.com/AhedAdwan/convo-recall/actions/workflows/test.yml)
 
-> **Searchable memory for your coding-agent conversations — across sessions, across projects, across Claude Code, Codex, and Gemini.**
+> **Searchable memory for your coding-agent conversations — across sessions, across projects, across Claude Code™, Codex™, and Gemini™.**
 
 Coding agents are stateless by design. convo-recall makes them stateful by infrastructure: every conversation lands in one local SQLite index, searchable by keyword and semantic meaning, and auto-fed back into the agent's context on every prompt.
 
@@ -17,7 +17,7 @@ recall search "the prompt that worked" --agent gemini
 
 ## Key features
 
-- **One memory across every agent.** Claude Code, Codex, and Gemini sessions all land in the same SQLite DB. Claude can find what Codex did yesterday.
+- **One memory across every agent.** Claude Code™, Codex™, and Gemini™ sessions all land in the same SQLite DB. Claude™ can find what Codex did yesterday.
 - **Verbatim, source-traceable.** Full transcripts indexed — not LLM summaries. Every hit links back to the originating session and timestamp.
 - **Hybrid FTS + vector search.** SQLite FTS5 (porter stemming) fused with semantic recall (BAAI/bge-large-en-v1.5, 1024-dim, running locally on MPS/CPU) via Reciprocal Rank Fusion.
 - **Cross-project recall.** Auto-scopes to the current repo by default; `--all-projects` for global search.
@@ -25,7 +25,7 @@ recall search "the prompt that worked" --agent gemini
 - **Auto-context injection.** A pre-prompt hook runs `recall search` on every substantive prompt and feeds the top hits to the agent, so it actually knows what you've already worked on.
 - **Local-only, secrets redacted.** Everything stays on your machine. OpenAI/Anthropic/GitHub/AWS/JWT/Slack token shapes are stripped on the way in. No cloud, no telemetry.
 
-Runs on macOS or Linux. Python 3.11–3.14. Works with any subset of Claude Code, Codex, or Gemini CLI.
+Runs on macOS or Linux. Python 3.11–3.14. Works with any subset of Claude Code™, Codex™, or Gemini™ CLI.
 
 ---
 
@@ -138,7 +138,7 @@ Search and tail accept `--project <display_name>` and resolve to the right `proj
 convo-recall ships two shell hooks that auto-detect each CLI's payload shape and work across all three:
 
 - **`conversation-memory.sh`** (pre-prompt) — runs `recall search "$prompt" -n 3 --json` on every substantive user turn (≥12 chars, not pure interjections like "yes" / "ok" / "hmm") and injects the top hits into the agent's context. Trivial prompts are no-ops. Opt out with `CONVO_RECALL_HOOK_AUTO_SEARCH=off`.
-- **`conversation-ingest.sh`** (response-completion) — fires on Claude `Stop` / Codex `Stop` / Gemini `AfterAgent`, spawns `recall ingest` detached. Throttled to one ingest per 5 s via a lock file. Opt out with `CONVO_RECALL_INGEST_HOOK=off`.
+- **`conversation-ingest.sh`** (response-completion) — fires on Claude™ `Stop` / Codex™ `Stop` / Gemini™ `AfterAgent`, spawns `recall ingest` detached. Throttled to one ingest per 5 s via a lock file. Opt out with `CONVO_RECALL_INGEST_HOOK=off`.
 
 `recall install` wires both into every detected CLI. To wire later or selectively:
 
@@ -168,11 +168,11 @@ Since v0.3.5, ingestion runs entirely off response-completion hooks. `conversati
 
 | CLI | Event | Per-turn? |
 |---|---|---|
-| Claude Code | `Stop` | ✅ yes |
-| Gemini CLI | `AfterAgent` | ✅ yes (default-on since v0.26.0) |
-| Codex CLI | `Stop` | ⚠ session-end only — Codex hook system limitation |
+| Claude Code™ | `Stop` | ✅ yes |
+| Gemini™ CLI | `AfterAgent` | ✅ yes (default-on since v0.26.0) |
+| Codex™ CLI | `Stop` | ⚠ session-end only — Codex hook system limitation |
 
-**Codex caveats:** Codex hooks are experimental and gated behind `[features] codex_hooks = true` in `~/.codex/config.toml`. `recall install` writes the flag automatically when safely mergeable; skips with a warning when the file is invalid TOML or when running on Windows.
+**Codex™ caveats:** Codex hooks are experimental and gated behind `[features] codex_hooks = true` in `~/.codex/config.toml`. `recall install` writes the flag automatically when safely mergeable; skips with a warning when the file is invalid TOML or when running on Windows.
 
 Scheduler-tier watchers (launchd / systemd `.path` units / cron) are no longer installed by default — the response-completion hook makes them redundant. The watcher install code remains in the codebase for users with bespoke flows; re-enable by uncommenting the `_ask` block in `_wizard.py`.
 
@@ -207,9 +207,9 @@ The DB and its WAL/SHM sidecars are chmod-0600; the parent directory is chmod-07
 | Variable | Default | Description |
 |---|---|---|
 | `CONVO_RECALL_DB` | `~/.local/share/convo-recall/conversations.db` | SQLite database path |
-| `CONVO_RECALL_PROJECTS` | `~/.claude/projects` | Claude Code projects directory |
-| `CONVO_RECALL_GEMINI_TMP` | `~/.gemini/tmp` | Gemini CLI session root |
-| `CONVO_RECALL_CODEX_SESSIONS` | `~/.codex/sessions` | Codex rollout root |
+| `CONVO_RECALL_PROJECTS` | `~/.claude/projects` | Claude Code™ projects directory |
+| `CONVO_RECALL_GEMINI_TMP` | `~/.gemini/tmp` | Gemini™ CLI session root |
+| `CONVO_RECALL_CODEX_SESSIONS` | `~/.codex/sessions` | Codex™ rollout root |
 | `CONVO_RECALL_CONFIG` | `~/.local/share/convo-recall/config.json` | Enabled-agents config file |
 | `CONVO_RECALL_SOCK` | `~/.local/share/convo-recall/embed.sock` | Embedding sidecar socket path |
 | `CONVO_RECALL_REDACT` | _on_ | Set to `off` to disable secret redaction during ingest |
@@ -235,24 +235,37 @@ The bundled sidecar uses 1024-dim vectors. If your service uses a different dime
 
 ## License
 
-**Source-available, noncommercial, no government, no military.** Modified PolyForm Noncommercial 1.0.0 (SPDX `LicenseRef-PolyForm-Noncommercial-1.0.0-convo-recall`). Not OSI-open source. The base text is upstream [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0); the licensor has removed government use and added an explicit prohibition on military / defense / weapons / intelligence / mass-surveillance use.
+**Fair Source.** convo-recall is licensed under the [Functional Source License v1.1, Apache 2.0 Future License](https://fsl.software/) (SPDX: `FSL-1.1-Apache-2.0`) — the same Fair Source license used by Sentry, Codecov, Liquibase, GitButler, and Keygen. After two years, each released version converts automatically to the **Apache License, Version 2.0**.
 
-**You may** — for free, with no further permission:
+In addition, all use is subject to the [convo-recall Acceptable Use Policy](ACCEPTABLE_USE.md), which is a perpetual ethical-use rider that survives the Apache 2.0 conversion.
 
-- Read, fork, modify, and redistribute the source.
-- Use it for personal projects, research, experimentation, education.
-- Use it inside charitable orgs, educational institutions (incl. public schools / universities for teaching and academic research), public research / public health / environmental orgs.
+### What you may do — for free, with no further permission
 
-**You may not** — under any circumstance:
+- Use convo-recall internally at any company, including a for-profit company — engineers can run it on their machines while building their own products.
+- Modify, fork, redistribute the source under these same terms.
+- Use it for personal projects, hobby work, non-commercial education, non-commercial research.
+- Provide professional services to a licensee that is itself using convo-recall in compliance with these terms.
+- After the two-year conversion, use it under Apache 2.0 (still subject to the AUP).
 
-- Use convo-recall in or with any commercial software, product, or service.
-- Embed it as a dependency in software any company sells, hosts, or distributes commercially.
-- Use it internally at a for-profit company for work-related purposes.
-- Use it by, on behalf of, or for the benefit of any government institution at any level — except public schools / universities for teaching and academic research.
-- Use it for any military / defense / weapons / intelligence / armed-conflict purpose — including reconnaissance, targeting, autonomous weapons, or training/deployment/evaluation thereof.
-- Use it in mass-surveillance, social-credit, or biometric-identification systems operated against a general population.
+### What the FSL does not permit — needs a commercial license from the author
 
-For commercial licensing on civilian, non-military use cases, reach out. Full text in [LICENSE](LICENSE).
+- A **Competing Use**: making convo-recall available to others as a commercial product or service that substitutes for, or offers substantially similar functionality to, convo-recall itself. Hosting convo-recall as a SaaS, reselling it as the product, or offering managed convo-recall is a Competing Use.
+
+If your use case falls outside the FSL — e.g., you want to bundle convo-recall in a commercial product, host it as a managed service, or remove the AUP rider — **email the author** to discuss commercial licensing terms.
+
+### What the AUP forbids — under all licenses, perpetually
+
+Notwithstanding any license grant (including the post-conversion Apache 2.0), convo-recall may not be used in or for:
+
+- Any government institution at any level (except public schools / universities for teaching and academic research).
+- Any military, defense, weapons, intelligence, or armed-conflict purpose — including reconnaissance, targeting, autonomous-weapons systems, command-and-control, or any training, deployment, or evaluation thereof.
+- Any mass-surveillance, social-credit, or biometric-identification system operated against a general population without specific informed consent.
+
+Full FSL text in [`LICENSE`](LICENSE). AUP details in [`ACCEPTABLE_USE.md`](ACCEPTABLE_USE.md). Third-party dependency attributions in [`NOTICE`](NOTICE). Contributor terms in [`CLA.md`](CLA.md).
+
+### Trademarks
+
+**Claude™** and **Claude Code™** are trademarks of Anthropic, PBC. **Codex™** is a trademark of OpenAI OpCo, LLC. **Gemini™** is a trademark of Google LLC. All other trademarks are the property of their respective owners. **convo-recall is an independent open project** and is NOT affiliated with, endorsed by, sponsored by, or otherwise associated with Anthropic, OpenAI, or Google. References to these CLIs identify the third-party tools whose session files convo-recall reads — they do not imply endorsement.
 
 ---
 
