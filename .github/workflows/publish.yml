@@ -1,9 +1,15 @@
 name: Publish to PyPI
 
+# Manual trigger only. PyPI Trusted Publisher is not yet configured for this
+# project — auto-running on every tag push leaves a red ❌ on the repo's main
+# page for every release. Trigger this workflow from the Actions tab when the
+# trusted-publisher entry has been added on PyPI's side and you want to ship.
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.3.1). Must already exist on origin."
+        required: true
 
 jobs:
   test:
