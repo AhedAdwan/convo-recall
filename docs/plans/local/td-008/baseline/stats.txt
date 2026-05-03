@@ -1,0 +1,12 @@
+Messages   : 64,737
+Embedded   : 64,737  (100%)
+Sessions   : 1,110
+Projects   : 124
+FTS        : porter tokenizer
+By role    :
+  assistant     : 37,892
+  tool_error    : 16,841
+  user          : 10,004
+By agent   :
+  claude        : 64,156
+  codex         : 581

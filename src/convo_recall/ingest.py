@@ -53,6 +53,23 @@ DECAY_HALF_LIFE_DAYS = 90
 # 3.45 on Ubuntu 24.04) shares a DB file with apsw's bundled sqlite (3.53).
 _VEC_ENABLED: "weakref.WeakKeyDictionary[apsw.Connection, bool]" = weakref.WeakKeyDictionary()
 
+# ── Project-identity helpers (extracted to identity.py in v0.4.0; TD-008) ────
+# Re-exported here so legacy `from convo_recall.ingest import _project_id, ...`
+# keeps working through one release. Removed in v0.5.0.
+from .identity import (
+    _ROOT_MARKERS,
+    _project_id,
+    _display_name,
+    _legacy_project_id,
+    _legacy_claude_slug,
+    _legacy_codex_slug,
+    _legacy_gemini_slug,
+    _gemini_hash_project_id,
+    _scan_claude_cwd,
+    _scan_codex_cwd,
+    _scan_gemini_cwd,
+)
+
 
 def _vec_ok(con: apsw.Connection) -> bool:
     return _VEC_ENABLED.get(con, False)
@@ -540,88 +557,9 @@ def _migrate_fts_porter(con: apsw.Connection) -> None:
 
 
 # ── v4: project_slug → project_id + projects table ───────────────────────────
-
-def _legacy_project_id(old_slug: str) -> str:
-    """Synthesize project_id for legacy slugs whose real cwd cannot be recovered."""
-    return hashlib.sha1(("legacy:" + old_slug).encode("utf-8")).hexdigest()[:12]
-
-
-def _gemini_hash_project_id(hash_dir: str) -> str:
-    """Synthesize project_id for Gemini hash-only sessions."""
-    return hashlib.sha1(("gemini-hash:" + hash_dir).encode("utf-8")).hexdigest()[:12]
-
-
-def _scan_claude_cwd(slug: str) -> str | None:
-    """Scan Claude jsonl files for any session matching `slug`, return cwd field.
-
-    Claude stores its session dir as `cwd.replace('/', '-')` — lossy. We can't
-    reverse the encoding without scanning record bodies. Read up to ~200 lines
-    of each candidate file looking for a `cwd` key.
-    """
-    if not PROJECTS_DIR.exists():
-        return None
-    for project_dir in PROJECTS_DIR.iterdir():
-        if not project_dir.is_dir():
-            continue
-        # _legacy_claude_slug collapses hyphens to underscores; reverse-test
-        # by comparing the slug derivation. Cheap because we're not iterating
-        # all files yet — just dirs.
-        try:
-            test_slug = _legacy_claude_slug(project_dir / "x.jsonl")
-        except Exception:
-            continue
-        if test_slug != slug:
-            continue
-        for sess in list(project_dir.glob("*.jsonl"))[:5]:
-            try:
-                with open(sess) as fh:
-                    for i, line in enumerate(fh):
-                        if i > 200:
-                            break
-                        try:
-                            d = json.loads(line)
-                        except (json.JSONDecodeError, ValueError):
-                            continue
-                        if isinstance(d, dict) and d.get("cwd"):
-                            return d["cwd"]
-            except OSError:
-                continue
-    return None
-
-
-def _scan_codex_cwd(slug: str) -> str | None:
-    """Scan Codex rollouts whose session_meta payload.cwd derives `slug`."""
-    if not CODEX_SESSIONS.exists():
-        return None
-    # Cheap: stop at the first matching cwd. Walk newest first to bias to recent.
-    files = sorted(CODEX_SESSIONS.glob("*/*/*/rollout-*.jsonl"), reverse=True)
-    for f in files[:200]:  # cap scan budget
-        try:
-            with open(f) as fh:
-                first = json.loads(fh.readline())
-        except (OSError, json.JSONDecodeError, ValueError):
-            continue
-        cwd = (first.get("payload") or {}).get("cwd")
-        if not cwd:
-            continue
-        if _legacy_codex_slug(cwd) == slug:
-            return cwd
-    return None
-
-
-def _scan_gemini_cwd(slug: str) -> tuple[str | None, str | None]:
-    """For Gemini, attempt to recover real cwd via ~/.gemini/projects.json.
-
-    Returns (cwd, hash_dir_or_None). hash_dir is set when slug looks like a
-    SHA-hash dir name and we can't resolve to a real path.
-    """
-    aliases = _load_gemini_aliases()
-    # aliases is {hash_dir → real_cwd}
-    for hash_dir, cwd in aliases.items():
-        if _legacy_codex_slug(cwd) == slug:
-            return cwd, hash_dir
-    # No alias hit — slug might already be a hash_dir name
-    return None, slug
+# (Project-identity helpers — _legacy_project_id, _gemini_hash_project_id,
+# _scan_claude_cwd, _scan_codex_cwd, _scan_gemini_cwd — moved to identity.py
+# in v0.4.0. Re-exported via the top-of-module `from .identity import ...`.)
 
 
 def _migrate_project_id(con: apsw.Connection) -> None:
@@ -1012,26 +950,7 @@ def _decay(timestamp: str | None, half_life_days: int = DECAY_HALF_LIFE_DAYS) ->
 
 
 # ── Path helpers ──────────────────────────────────────────────────────────────
-
-def _legacy_claude_slug(jsonl_path: Path) -> str:
-    """Lossy slug from Claude's flattened storage dir; legacy fallback only.
-
-    Used by (a) the v4 migration to match an existing legacy slug to its
-    source dir, and (b) the Claude ingest as a last-resort display_name when
-    no cwd field is present in any record. New rows always carry a real
-    project_id derived from cwd via _project_id().
-    """
-    if jsonl_path.parent.name == "subagents":
-        project_dir_name = jsonl_path.parent.parent.parent.name
-    else:
-        project_dir_name = jsonl_path.parent.name
-    parts = project_dir_name.lstrip("-").split("-")
-    try:
-        idx = next(i for i, p in enumerate(parts) if p.lower() == "projects")
-        relevant = parts[idx + 1:]
-    except StopIteration:
-        relevant = parts[-2:] if len(parts) >= 2 else parts
-    return "_".join(relevant) if relevant else project_dir_name
+# (_legacy_claude_slug moved to identity.py in v0.4.0; re-exported above.)
 
 
 def _session_id_from_path(jsonl_path: Path) -> str:
@@ -1067,40 +986,8 @@ def _extract_text(content) -> str:
     return ""
 
 
-_ROOT_MARKERS = (
-    ".git", "package.json", "Cargo.toml", "pyproject.toml",
-    "go.mod", "pom.xml", "build.gradle", "build.gradle.kts",
-    "deno.json", ".projectile",
-)
-
-
-def _project_id(cwd) -> str:
-    """Stable 12-hex id from realpath(cwd). Same dir → same id forever.
-
-    Built from os.path.realpath so symlinked paths that resolve to the same
-    target collapse to one id. Hyphen-vs-slash safe because the input is
-    a real path, not the lossy hyphen-encoded directory name Claude uses.
-    """
-    real = os.path.realpath(str(cwd))
-    return hashlib.sha1(real.encode("utf-8")).hexdigest()[:12]
-
-
-def _display_name(cwd) -> str:
-    """basename of nearest ancestor containing a project-root marker.
-
-    Walks up from realpath(cwd) looking for any of _ROOT_MARKERS (.git,
-    package.json, Cargo.toml, pyproject.toml, go.mod, …). Returns the
-    basename of that ancestor. Falls back to basename of realpath(cwd)
-    when no marker is found upstream.
-    """
-    real = Path(os.path.realpath(str(cwd)))
-    for ancestor in (real, *real.parents):
-        try:
-            if any((ancestor / m).exists() for m in _ROOT_MARKERS):
-                return ancestor.name or "/"
-        except (OSError, PermissionError):
-            continue
-    return real.name or "/"
+# (_ROOT_MARKERS, _project_id, _display_name moved to identity.py in v0.4.0;
+# re-exported above.)
 
 
 # ── Agent detection + per-agent file iteration ───────────────────────────────
@@ -1383,13 +1270,7 @@ def _persist_message(con: apsw.Connection, agent: str, project_id: str,
         return 0
 
 
-def _legacy_gemini_slug(jsonl_path: Path) -> str:
-    """Lossy slug from a Gemini session path; legacy fallback only.
-
-    Used by the v4 migration to match an existing Gemini legacy slug to its
-    source dir. New rows derive project_id from the session header's cwd.
-    """
-    return jsonl_path.parent.parent.name.replace("-", "_")
+# (_legacy_gemini_slug moved to identity.py in v0.4.0; re-exported above.)
 
 
 def ingest_gemini_file(con: apsw.Connection, jsonl_path: Path,
@@ -1531,23 +1412,7 @@ def ingest_gemini_file(con: apsw.Connection, jsonl_path: Path,
     return inserted
 
 
-def _legacy_codex_slug(cwd: str) -> str:
-    """Lossy slug from a cwd; legacy fallback only.
-
-    Used by the v4 migration to match codex/gemini legacy slugs to their
-    source files. New codex rows derive project_id from session_meta.payload.cwd
-    via _project_id().
-    """
-    parts = Path(cwd).parts
-    try:
-        idx = next(i for i, p in enumerate(parts) if p.lower() == "projects")
-        relevant = parts[idx + 1:]
-        slug = "_".join(relevant) if relevant else Path(cwd).name
-    except StopIteration:
-        # No Projects/ in path — use last 2 path components
-        relevant = parts[-2:] if len(parts) >= 2 else parts
-        slug = "_".join(p for p in relevant if p and p != "/")
-    return slug.replace("-", "_")
+# (_legacy_codex_slug moved to identity.py in v0.4.0; re-exported above.)
 
 
 _GEMINI_ALIAS_PATH = Path(os.environ.get(

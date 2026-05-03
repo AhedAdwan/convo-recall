@@ -1,0 +1,13 @@
+
+Embed extra      : installed
+Embed sidecar    : reachable at /Users/ahed_isir/.local/share/convo-recall/embed.sock
+Embedded coverage: 64,737/64,737 (100%)
+
+Projects         : 124 (display_name index)
+
+Ingest hook (response-completion driven):
+  ✅ claude  Stop           wired  (/Users/ahed_isir/.claude/settings.json)
+  ✅ codex   Stop           wired  (/Users/ahed_isir/.codex/hooks.json)
+  ✅ gemini  AfterAgent     wired  (/Users/ahed_isir/.gemini/settings.json)
+
+No other issues found. Pass `--scan-secrets` to scan for credential-shaped tokens.
