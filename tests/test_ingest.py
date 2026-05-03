@@ -1398,8 +1398,16 @@ def test_stats_warns_when_zero_embedded(db, tmp_path, monkeypatch, capsys):
     """When the DB has messages but Embedded:0, stats prints a warning
     line + the actionable command. The agent's feedback session showed
     Embedded: 0 (0%) with 145 messages and no clue why — fix is
-    discoverability, not the install path."""
+    discoverability, not the install path.
+
+    Three branches print "Vector search disabled" (no extra / no sidecar)
+    or the friendlier "Vector search ready but…" / "First-run embedding
+    in progress" — which one fires depends on the dev env. Pin EMBED_SOCK
+    to a non-existent path so we deterministically hit the "embed sidecar
+    not running" branch regardless of whether `[embeddings]` happens to be
+    installed locally."""
     monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    monkeypatch.setattr(ingest, "EMBED_SOCK", tmp_path / "no-such-sock")
     sess = tmp_path / "p" / "s.jsonl"
     _write_session(sess, [
         {"uuid": "u1", "type": "user", "timestamp": "2026-01-01T00:00:00Z",

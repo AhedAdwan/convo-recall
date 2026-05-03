@@ -121,7 +121,7 @@ def test_backfill_clean_no_confirm_does_not_mutate(isolated_db):
     """Same shape: backfill-clean without --confirm must preview only."""
     # Get initial content
     import sqlite3
-    con = sqlite3.connect(f"file:{isolated_db['db']}?mode=ro", uri=True)
+    con = sqlite3.connect(f"file:{isolated_db['db']}?immutable=1", uri=True)
     before = con.execute("SELECT content FROM messages").fetchone()[0]
     con.close()
 
@@ -129,7 +129,7 @@ def test_backfill_clean_no_confirm_does_not_mutate(isolated_db):
     # Exit code can be 0 (DRY-RUN message) or 0 from "nothing to do" — both fine.
     assert r.returncode == 0, f"backfill-clean failed: {r.stderr}"
 
-    con = sqlite3.connect(f"file:{isolated_db['db']}?mode=ro", uri=True)
+    con = sqlite3.connect(f"file:{isolated_db['db']}?immutable=1", uri=True)
     after = con.execute("SELECT content FROM messages").fetchone()[0]
     con.close()
     assert after == before, "row content was mutated in dry-run!"
@@ -137,14 +137,14 @@ def test_backfill_clean_no_confirm_does_not_mutate(isolated_db):
 
 def test_backfill_redact_no_confirm_does_not_mutate(isolated_db):
     import sqlite3
-    con = sqlite3.connect(f"file:{isolated_db['db']}?mode=ro", uri=True)
+    con = sqlite3.connect(f"file:{isolated_db['db']}?immutable=1", uri=True)
     before = con.execute("SELECT content FROM messages").fetchone()[0]
     con.close()
 
     r = _run("backfill-redact", env=isolated_db["env"], input_text="")
     assert r.returncode == 0
 
-    con = sqlite3.connect(f"file:{isolated_db['db']}?mode=ro", uri=True)
+    con = sqlite3.connect(f"file:{isolated_db['db']}?immutable=1", uri=True)
     after = con.execute("SELECT content FROM messages").fetchone()[0]
     con.close()
     assert after == before
