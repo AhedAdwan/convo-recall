@@ -180,7 +180,33 @@ Scheduler-tier watchers (launchd / systemd `.path` units / cron) are no longer i
 
 ## Privacy
 
-convo-recall ingests your conversation history verbatim into a local SQLite DB. To reduce the chance that secrets pasted into chats end up indexed, ingestion runs a **secret redaction** pass that replaces well-known credential token shapes with stable placeholders before they reach the FTS / vector index.
+### What gets stored — and where
+
+convo-recall reads your existing agent conversation logs and indexes them **verbatim** (full text, not LLM summaries) into a single local SQLite database. **Nothing leaves your machine** — no telemetry, no central server, no third-party API calls beyond the embedding model running locally on your CPU/MPS/GPU. Source files in `~/.claude/projects/`, `~/.codex/sessions/`, and `~/.gemini/tmp/` are read-only; convo-recall does not modify them.
+
+| Path | Holds | Mode |
+|---|---|---|
+| `~/.local/share/convo-recall/conversations.db` | Full message corpus + FTS index + 1024-d embeddings (one vector per message) | `0600` |
+| `~/.local/share/convo-recall/conversations.db-{wal,shm}` | SQLite WAL sidecars | `0600` |
+| `~/.local/share/convo-recall/embed.sock` | Unix-domain socket for the embed sidecar (local-only IPC) | `0600` |
+| `~/.local/share/convo-recall/` (parent dir) | All of the above | `0700` |
+| `~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.gemini/settings.json` | Hook entries written by `recall install`; removed by `recall uninstall` | unchanged |
+
+### Inspecting + wiping
+
+```bash
+recall stats                       # row count, agent breakdown, embed coverage
+recall doctor --scan-secrets       # count residual secret-shaped tokens in indexed text
+recall forget --session <id>       # delete one session
+recall forget --project <name>     # delete every row from a project (exact display_name)
+recall forget --pattern '<regex>'  # delete rows whose content matches a Python regex
+recall uninstall                   # remove hooks + sidecar (DB preserved)
+rm -rf ~/.local/share/convo-recall # full data wipe after uninstall
+```
+
+### Secret redaction
+
+To reduce the chance that secrets pasted into chats end up indexed, ingestion runs a **secret redaction** pass that replaces well-known credential token shapes with stable placeholders before they reach the FTS / vector index.
 
 | Shape | Placeholder |
 |---|---|
