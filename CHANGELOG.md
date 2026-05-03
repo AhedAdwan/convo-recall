@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Install wizard no longer asks about scheduler-tier watchers.** The watcher question (Step 1/5 — `Install <scheduler> watchers so new sessions index automatically?`) and its systemd linger sub-prompt are suppressed; `do_watchers` is hardcoded to `False`. The response-completion ingest hook (now Step 1/4 — Claude `Stop`, Codex `Stop`, Gemini `AfterAgent`) covers the same job: it fires `recall ingest` on every agent turn. The watcher install code (`PollingScheduler` / `LaunchdScheduler` / `SystemdUserScheduler` / `CronScheduler`) and the `if do_watchers:` apply branch remain in place — re-enable by restoring the `_ask` block in `_wizard.py`. Mitigates **TD-004** (the WAL-init `apsw.BusyError` race on first install was caused by the wizard spawning a second detached subprocess for the watcher; with watchers off, only the `_backfill-chain` child runs and there's no race). Step headers renumbered: 5 steps → 4 steps.
+
+### Added
+- `tests/test_hook_silent_stdout.py` — 14 pytest cases locking the empty-stdout-exit-0 contract on `conversation-ingest.sh`. Closes **TD-005**.
+
 ## [0.3.4] — 2026-05-03
 
 ### Added

@@ -437,10 +437,13 @@ def test_search_agent_filter(db, tmp_path, monkeypatch, capsys):
 
 # ── Phase 5: per-agent plists + watch loop ─────────────────────────────────────
 
-def test_install_emits_one_plist_per_enabled_agent(tmp_path, monkeypatch):
-    """install.run() generates one plist per enabled agent and writes the
-    config. The launchctl bootstrap is monkeypatched to a no-op so no real
-    macOS launchd interaction happens during the test."""
+def test_install_skips_watcher_plists_by_default(tmp_path, monkeypatch):
+    """v0.3.5 — install.run() does NOT emit per-agent ingest watcher plists
+    by default (TD-004 mitigation: the watcher question is suppressed in
+    the wizard). The config is still written with the detected agent set,
+    and the embed sidecar plist may still appear when [embeddings] extra
+    is present. The launchctl bootstrap is monkeypatched to a no-op so no
+    real macOS launchd interaction happens during the test."""
     from convo_recall import install as _install
     from convo_recall.install.schedulers.launchd import LaunchdScheduler
     monkeypatch.setattr(LaunchdScheduler, "_launchctl_load", lambda self, p: True)
@@ -480,15 +483,15 @@ def test_install_emits_one_plist_per_enabled_agent(tmp_path, monkeypatch):
 
     _install.run(dry_run=False, non_interactive=True, scheduler="launchd")
 
-    plists = {p.name for p in (tmp_path / "LaunchAgents").iterdir()}
-    # Wizard's non-interactive mode accepts all defaults, so we expect:
-    # - one ingest plist per detected agent
-    # - the embed sidecar plist (default-on when [embeddings] extra is present)
-    assert {
-        "com.convo-recall.ingest.claude.plist",
-        "com.convo-recall.ingest.codex.plist",
-        "com.convo-recall.ingest.gemini.plist",
-    }.issubset(plists), f"missing ingest plists: {plists}"
+    plists = {p.name for p in (tmp_path / "LaunchAgents").iterdir()} \
+        if (tmp_path / "LaunchAgents").exists() else set()
+    # Wizard's non-interactive mode accepts the watcher default, which is
+    # now False (suppressed). No per-agent ingest plists should appear.
+    assert "com.convo-recall.ingest.claude.plist" not in plists, plists
+    assert "com.convo-recall.ingest.codex.plist" not in plists, plists
+    assert "com.convo-recall.ingest.gemini.plist" not in plists, plists
+    # Config is still written with the detected agent set so `recall ingest`
+    # (driven by the response-completion hook) knows which agents to scan.
     cfg = json.loads((tmp_path / "config.json").read_text())
     assert sorted(cfg["agents"]) == ["claude", "codex", "gemini"]
 

@@ -42,8 +42,9 @@ def test_wizard_full_yes_flow_dry_run():
     try:
         wizard.expect("Selected scheduler:")
         wizard.expect("polling \\(Popen fallback\\)")
-        # Polling's consequence_yes() is the watchers-Step-1 if-YES line.
-        wizard.expect("Backgrounded via Popen")
+        # Stream `y` to every [Y/n] until EOF. Since v0.3.5 the watcher
+        # question (which used the scheduler's consequence_yes/no text) is
+        # suppressed; the first prompt is now Step 1/4 — ingest hooks.
         # Now stream `y` to every [Y/n] until EOF.
         while True:
             idx = wizard.expect([r"\[Y/n\]", pexpect.EOF], timeout=15)
@@ -56,28 +57,6 @@ def test_wizard_full_yes_flow_dry_run():
     assert wizard.exitstatus == 0, (
         f"wizard exited {wizard.exitstatus}; transcript:\n{wizard.before}"
     )
-
-
-def test_wizard_decline_watchers_consequence_appears():
-    """Decline the watchers question — assert polling's consequence_no()
-    text appeared in the prompt before we answered."""
-    wizard = _spawn(["install", "--scheduler", "polling", "--dry-run"])
-    try:
-        wizard.expect("Install polling \\(Popen fallback\\) watchers")
-        # Polling's consequence_no() is "Run `recall ingest` manually after each session."
-        wizard.expect_exact("Run `recall ingest` manually after each session.")
-        wizard.expect(r"\[Y/n\]")
-        wizard.sendline("n")
-        # Drain the rest of the wizard with `y` to reach EOF cleanly.
-        while True:
-            idx = wizard.expect([r"\[Y/n\]", pexpect.EOF], timeout=15)
-            if idx == 0:
-                wizard.sendline("y")
-            else:
-                break
-    finally:
-        wizard.close()
-    assert wizard.exitstatus == 0
 
 
 def test_wizard_decline_hooks_consequence_appears():
@@ -159,18 +138,17 @@ def test_wizard_abort_at_final_confirm():
     assert wizard.exitstatus == 0
 
 
-# ── H04 — wizard prompts for ingest hooks (Step 2/5) ────────────────────────
+# ── H04 — wizard prompts for ingest hooks (Step 1/4 since v0.3.5) ───────────
 
 
 def test_wizard_prompts_for_ingest_hooks():
-    """Step 2/5 surfaces the response-completion ingest hook prompt with
-    its consequence_yes/no callouts before the embed sidecar step."""
+    """Step 1/4 surfaces the response-completion ingest hook prompt with
+    its consequence_yes/no callouts before the embed sidecar step. Since
+    v0.3.5 the watcher-install question is suppressed (TD-004 mitigation),
+    so the ingest-hooks step is now the FIRST prompt the user sees."""
     wizard = _spawn(["install", "--scheduler", "polling", "--dry-run"])
     try:
-        # Drain Step 1's [Y/n] first so Step 2's banner prints.
-        wizard.expect(r"\[Y/n\]")
-        wizard.sendline("y")
-        wizard.expect("Step 2/5: response-completion ingest hooks")
+        wizard.expect("Step 1/4: response-completion ingest hooks")
         wizard.expect_exact("Wire response-completion ingest hooks now?")
         # Consequence-yes line mentions "Stop / AfterAgent".
         wizard.expect("Stop / AfterAgent")
@@ -185,19 +163,19 @@ def test_wizard_prompts_for_ingest_hooks():
     assert wizard.exitstatus == 0
 
 
-def test_wizard_renumbered_steps_show_5_total():
-    """All five step headers appear in order so the renumber is visible
-    and old `Step N/4` strings don't leak through. Step 3 (embed sidecar)
-    auto-skips without a [Y/n] when [embeddings] extra isn't installed
-    (CI default), so we expect either [Y/n] OR the next label."""
+def test_wizard_renumbered_steps_show_4_total():
+    """All four step headers appear in order so the v0.3.5 renumber (5→4
+    after dropping the watcher question) is visible and old `Step N/5`
+    strings don't leak through. Step 2 (embed sidecar) auto-skips without
+    a [Y/n] when [embeddings] extra isn't installed (CI default), so we
+    expect either [Y/n] OR the next label."""
     wizard = _spawn(["install", "--scheduler", "polling", "--dry-run"])
     try:
-        wizard.expect("Step 1/5: indexing watchers")
+        wizard.expect("Step 1/4: response-completion ingest hooks")
         for label in (
-            "Step 2/5: response-completion ingest hooks",
-            "Step 3/5: hybrid vector",
-            "Step 4/5: pre-prompt search hooks",
-            "Step 5/5: initial ingest",
+            "Step 2/4: hybrid vector",
+            "Step 3/4: pre-prompt search hooks",
+            "Step 4/4: initial ingest",
         ):
             while True:
                 idx = wizard.expect([r"\[Y/n\]", label, pexpect.EOF], timeout=15)
@@ -215,4 +193,33 @@ def test_wizard_renumbered_steps_show_5_total():
                 break
     finally:
         wizard.close()
+    assert wizard.exitstatus == 0
+
+
+def test_wizard_does_not_ask_about_watchers_or_linger():
+    """v0.3.5 — the watcher-install question (and its systemd linger
+    sub-prompt) are suppressed. The wizard must NOT print 'Install
+    polling watchers?' or 'Keep watchers running when logged out?' under
+    any scheduler. Mitigates TD-004 by never spawning the second
+    detached subprocess that races the backfill child for the WAL lock."""
+    wizard = _spawn(["install", "--scheduler", "polling", "--dry-run"])
+    transcript_parts: list[str] = []
+    try:
+        while True:
+            idx = wizard.expect([r"\[Y/n\]", pexpect.EOF], timeout=15)
+            transcript_parts.append(wizard.before or "")
+            if idx == 0:
+                transcript_parts.append(wizard.after or "")
+                wizard.sendline("y")
+            else:
+                break
+    finally:
+        wizard.close()
+    transcript = "".join(transcript_parts)
+    assert "Install polling" not in transcript, (
+        f"watcher question leaked into transcript:\n{transcript}"
+    )
+    assert "Keep watchers running" not in transcript, (
+        f"linger question leaked into transcript:\n{transcript}"
+    )
     assert wizard.exitstatus == 0

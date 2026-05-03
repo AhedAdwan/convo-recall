@@ -123,7 +123,7 @@ def run(
         print("⚠️  ⚠️  ⚠️   NON-INTERACTIVE MODE — AUTO-ACCEPTING EVERY PROMPT   ⚠️  ⚠️  ⚠️")
         print()
         print("This will run `recall install` WITHOUT asking for confirmation on:")
-        print("  • Installing watchers (launchd/systemd/cron) for detected agents")
+        print("  • Wiring response-completion ingest hooks (Stop / AfterAgent)")
         print("  • Wiring pre-prompt hooks into claude/codex/gemini settings files")
         print("  • Starting the embed sidecar (~1.3 GB model download if --with-embeddings)")
         print("  • Persisting config to ~/.local/share/convo-recall/")
@@ -189,33 +189,26 @@ def run(
     embeddings_extra_present = _check_embeddings_installed()
     print(f"\n[embeddings] extra installed: {'yes' if embeddings_extra_present else 'no'}")
 
-    # ── Q1. Indexing watchers ────────────────────────────────────────────────
-    print("\n" + "─" * 70)
-    print(f"Step 1/5: indexing watchers via {sched.describe()} for {', '.join(enabled)}")
-    do_watchers = _ask(
-        f"Install {sched.describe()} watchers so new sessions index automatically?",
-        default=True,
-        if_yes=sched.consequence_yes(),
-        if_no=sched.consequence_no(),
-        non_interactive=non_interactive,
-    )
-
-    # Linger opt-in — only meaningful for SystemdUserScheduler.
+    # ── Watchers disabled by default (v0.3.5) ────────────────────────────────
+    # Scheduler-tier watchers (launchd / systemd / cron / polling Popen) are
+    # disabled in the wizard because the response-completion ingest hook
+    # (Step 1 below — Claude `Stop`, Codex `Stop`, Gemini `AfterAgent`) fires
+    # `recall ingest` on every agent turn, which is the same job the watcher
+    # did. Keeping both ran two detached subprocesses through the WAL-init
+    # path on first install and reproduced TD-004 (`apsw.BusyError`) ~1/3 of
+    # the time.
+    #
+    # The watcher install code at `if do_watchers:` below is intentionally
+    # kept reachable — re-enable by replacing this block with the original
+    # `_ask` prompt + linger sub-prompt. The schedulers in
+    # `convo_recall.install.schedulers/` remain fully supported for users
+    # who wire watchers via the underlying API or a future CLI flag.
+    do_watchers = False
     do_linger = False
-    if do_watchers and isinstance(sched, SystemdUserScheduler):
-        do_linger = _ask(
-            "Keep watchers running when logged out? (enables `loginctl enable-linger`)",
-            default=True,
-            if_yes=("Lingering keeps your user systemd instance running across "
-                    "logout/SSH-disconnect — watchers survive."),
-            if_no=("Watchers will die at logout — re-enable later with "
-                   "`sudo loginctl enable-linger $USER`."),
-            non_interactive=non_interactive,
-        )
 
-    # ── Q1.5 / Step 2. Response-completion ingest hooks ──────────────────────
+    # ── Step 1. Response-completion ingest hooks ─────────────────────────────
     print("\n" + "─" * 70)
-    print(f"Step 2/5: response-completion ingest hooks for {', '.join(enabled)}")
+    print(f"Step 1/4: response-completion ingest hooks for {', '.join(enabled)}")
     print("  Each agent CLI fires a hook when its turn ends. We use that to")
     print("  trigger `recall ingest` immediately — bypassing the OS scheduler's")
     print("  recursive-watch limitations on Linux. Recommended on every platform.")
@@ -232,9 +225,9 @@ def run(
         non_interactive=non_interactive,
     )
 
-    # ── Q2 / Step 3. Embed sidecar ───────────────────────────────────────────
+    # ── Step 2. Embed sidecar ────────────────────────────────────────────────
     print("\n" + "─" * 70)
-    print("Step 3/5: hybrid vector + FTS search")
+    print("Step 2/4: hybrid vector + FTS search")
     if not embeddings_extra_present:
         print("  · Skipping: [embeddings] extra not installed.")
         print("    To enable later: `pipx install 'convo-recall[embeddings]' && recall install`")
@@ -254,9 +247,9 @@ def run(
             non_interactive=non_interactive,
         )
 
-    # ── Q3 / Step 4. Pre-prompt hooks ────────────────────────────────────────
+    # ── Step 3. Pre-prompt hooks ─────────────────────────────────────────────
     print("\n" + "─" * 70)
-    print(f"Step 4/5: pre-prompt search hooks for {', '.join(enabled)}")
+    print(f"Step 3/4: pre-prompt search hooks for {', '.join(enabled)}")
     print("  Without these, your AI agents (Claude/Codex/Gemini) won't know")
     print("  convo-recall exists and will keep guessing/web-searching despite")
     print("  the indexed history sitting right there.")
@@ -272,9 +265,9 @@ def run(
         non_interactive=non_interactive,
     )
 
-    # ── Q4 / Step 5. Initial ingest + backfill ───────────────────────────────
+    # ── Step 4. Initial ingest + backfill ────────────────────────────────────
     print("\n" + "─" * 70)
-    print("Step 5/5: initial ingest")
+    print("Step 4/4: initial ingest")
     do_initial_ingest = _ask(
         "Run initial ingest now? (synchronous; may take 10-30 min on a large corpus)",
         default=True,
@@ -435,9 +428,13 @@ def run(
         print("\nWatchers fire automatically when files change in:")
         for agent in enabled:
             print(f"  [{agent}]  {_AGENT_WATCH_DIRS[agent]()}")
+    elif do_ingest_hooks:
+        print("\nIngestion fires automatically on every agent turn via the "
+              "response-completion hook (Stop / AfterAgent).")
     else:
-        print("\nWatchers were skipped. Run `recall ingest` manually after each session, "
-              "or set up cron/systemd yourself.")
+        print("\nNo automatic ingestion path is wired. Run `recall ingest` "
+              "manually after each session, or wire the hook later with "
+              "`recall install-hooks --kind ingest`.")
     if not do_hooks and not do_ingest_hooks:
         print("\nAll hooks were skipped. Wire them later with:")
         print(f"  recall install-hooks                       # both kinds, all CLIs")

@@ -67,59 +67,34 @@ def test_wizard_unknown_scheduler_raises_value_error(monkeypatch):
         _wizard.run(non_interactive=True, dry_run=True, scheduler="bogus")
 
 
-def test_wizard_uses_scheduler_consequences_in_step1_prompt(monkeypatch):
-    _stub_scheduler_install_methods(monkeypatch)
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        _wizard.run(non_interactive=True, dry_run=True, scheduler="cron")
-    output = buf.getvalue()
-    assert "@reboot" in output
-    # Launchd's consequence text MUST NOT appear when cron was selected.
-    assert "indexed within ~10s" not in output
-
-
-def test_wizard_systemd_path_asks_about_linger(monkeypatch):
-    """Force-pick systemd via explicit name; capture every _ask question."""
+def test_wizard_does_not_ask_about_watchers_under_any_scheduler(monkeypatch):
+    """v0.3.5 — the watcher-install question and its systemd linger
+    sub-prompt are suppressed unconditionally (TD-004 mitigation). No
+    scheduler choice should surface either prompt."""
     _stub_scheduler_install_methods(monkeypatch)
 
-    asked: list[str] = []
+    for scheduler in ("polling", "cron", "systemd", "launchd"):
+        asked: list[str] = []
 
-    def recording_ask(question, *, default=True, if_yes=None, if_no=None,
-                      non_interactive=False):
-        asked.append(question)
-        return True
+        def recording_ask(question, *, default=True, if_yes=None, if_no=None,
+                          non_interactive=False):
+            asked.append(question)
+            return True
 
-    monkeypatch.setattr(_wizard, "_ask", recording_ask)
-    monkeypatch.setattr(SystemdUserScheduler, "available", lambda self: True)
+        monkeypatch.setattr(_wizard, "_ask", recording_ask)
+        monkeypatch.setattr(LaunchdScheduler, "available", lambda self: True)
+        monkeypatch.setattr(SystemdUserScheduler, "available", lambda self: True)
 
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        _wizard.run(non_interactive=False, dry_run=True, scheduler="systemd")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _wizard.run(non_interactive=False, dry_run=True, scheduler=scheduler)
 
-    assert any(q.startswith("Keep watchers running when logged out") for q in asked), (
-        f"linger question missing from {asked}"
-    )
-
-
-def test_wizard_macos_path_does_not_ask_about_linger(monkeypatch):
-    _stub_scheduler_install_methods(monkeypatch)
-    asked: list[str] = []
-
-    def recording_ask(question, *, default=True, if_yes=None, if_no=None,
-                      non_interactive=False):
-        asked.append(question)
-        return True
-
-    monkeypatch.setattr(_wizard, "_ask", recording_ask)
-    monkeypatch.setattr(LaunchdScheduler, "available", lambda self: True)
-
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        _wizard.run(non_interactive=False, dry_run=True, scheduler="launchd")
-
-    assert not any("linger" in q for q in asked), (
-        f"linger question should not fire for launchd; got {asked}"
-    )
+        assert not any("watchers" in q.lower() and "Install" in q for q in asked), (
+            f"watcher-install question leaked under scheduler={scheduler}; got {asked}"
+        )
+        assert not any("linger" in q.lower() for q in asked), (
+            f"linger question leaked under scheduler={scheduler}; got {asked}"
+        )
 
 
 # ── F-13: apply-phase order — sidecar → ingest → backfill → watchers ─────────
@@ -190,7 +165,6 @@ def test_wizard_apply_order_sidecar_before_backfill_chain(monkeypatch, tmp_path)
 
     assert sidecar_at >= 0, f"install_sidecar never called; events={events}"
     assert chain_at >= 0, f"_backfill-chain Popen never spawned; events={events}"
-    assert watcher_at >= 0, f"install_watcher never called; events={events}"
 
     # F-13: sidecar BEFORE the backfill chain
     assert sidecar_at < chain_at, (
@@ -199,12 +173,13 @@ def test_wizard_apply_order_sidecar_before_backfill_chain(monkeypatch, tmp_path)
         f"events: {events}"
     )
 
-    # F-3: watchers AFTER the chain spawn (chain triggers ingest into DB,
-    # watcher install must wait until DB is reachable / not racing).
-    assert chain_at < watcher_at, (
-        f"F-3 regression: _backfill-chain spawn at {chain_at}, "
-        f"install_watcher at {watcher_at}; watcher must come last.\n"
-        f"events: {events}"
+    # v0.3.5 (TD-004 mitigation): watchers are suppressed by default, so
+    # install_watcher should NOT be called from the wizard's apply phase.
+    # The F-3 ordering invariant (watcher AFTER chain) is moot until/unless
+    # watchers are re-enabled via a future flag.
+    assert watcher_at < 0, (
+        f"v0.3.5 regression: install_watcher should not fire when the "
+        f"wizard has watchers disabled; events={events}"
     )
 
 
