@@ -1221,6 +1221,144 @@ def test_ingest_file_captures_tool_error_alongside_text(db, tmp_path, monkeypatc
         f"expected user + tool_error rows, got {roles}"
 
 
+def test_ingest_codex_captures_exec_command_end_errors(db, tmp_path, monkeypatch):
+    """Multi-agent tool_error: codex emits shell failures as event_msg
+    payloads with type='exec_command_end' and non-zero exit_code, NOT as
+    Anthropic-style tool_result blocks. The hot-path must harvest these."""
+    cdir = tmp_path / "codex" / "sessions" / "2026" / "05" / "03"
+    cdir.mkdir(parents=True)
+    sess = cdir / "rollout-2026-05-03T00-00-00-tderr.jsonl"
+    sess.write_text(
+        json.dumps({"type": "session_meta", "timestamp": "2026-05-03T00:00:00Z",
+                    "payload": {"id": "c-tderr",
+                                "cwd": "/Users/x/Projects/mcp/Foo",
+                                "timestamp": "2026-05-03T00:00:00Z"}}) + "\n"
+        + json.dumps({"type": "response_item", "timestamp": "2026-05-03T00:00:01Z",
+                      "payload": {"type": "message", "role": "user",
+                                  "content": [{"type": "input_text", "text": "run a thing"}]}}) + "\n"
+        + json.dumps({"type": "event_msg", "timestamp": "2026-05-03T00:00:02Z",
+                      "payload": {"type": "exec_command_end",
+                                  "call_id": "call_xyz",
+                                  "exit_code": 1,
+                                  "aggregated_output": "bash: bad-cmd: command not found",
+                                  "stdout": "", "stderr": ""}}) + "\n"
+    )
+    monkeypatch.setattr(ingest, "CODEX_SESSIONS", tmp_path / "codex" / "sessions")
+    n = ingest.ingest_codex_file(db, sess, do_embed=False)
+    assert n == 2, f"expected 2 inserted (user + tool_error), got {n}"
+    rows = db.execute(
+        "SELECT role, agent, content FROM messages ORDER BY rowid"
+    ).fetchall()
+    te = [r for r in rows if r["role"] == "tool_error"]
+    assert len(te) == 1, f"expected 1 tool_error, got {len(te)}"
+    assert te[0]["agent"] == "codex"
+    # snake_case→snake case via _expand_code_tokens for FTS
+    assert "exit=1" in te[0]["content"]
+    assert "command not found" in te[0]["content"]
+    assert "exec command end" in te[0]["content"]
+
+
+def test_ingest_codex_captures_event_msg_errors(db, tmp_path, monkeypatch):
+    """Codex stream/rate-limit errors arrive as event_msg with payload.type='error'."""
+    cdir = tmp_path / "codex" / "sessions" / "2026" / "05" / "03"
+    cdir.mkdir(parents=True)
+    sess = cdir / "rollout-2026-05-03T01-00-00-rerr.jsonl"
+    sess.write_text(
+        json.dumps({"type": "session_meta", "timestamp": "2026-05-03T01:00:00Z",
+                    "payload": {"id": "c-rerr",
+                                "cwd": "/Users/x/Projects/mcp/Foo",
+                                "timestamp": "2026-05-03T01:00:00Z"}}) + "\n"
+        + json.dumps({"type": "event_msg", "timestamp": "2026-05-03T01:00:01Z",
+                      "payload": {"type": "error",
+                                  "message": "Rate limit reached for gpt-5.4-mini in organization org-foo",
+                                  "codex_error_info": "other"}}) + "\n"
+    )
+    monkeypatch.setattr(ingest, "CODEX_SESSIONS", tmp_path / "codex" / "sessions")
+    n = ingest.ingest_codex_file(db, sess, do_embed=False)
+    assert n == 1, f"expected 1 tool_error inserted, got {n}"
+    rows = db.execute(
+        "SELECT role, agent, content FROM messages WHERE role='tool_error'"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["agent"] == "codex"
+    assert "Rate limit" in rows[0]["content"]
+    # snake_case→snake case via _expand_code_tokens for FTS
+    assert "codex error" in rows[0]["content"]
+
+
+def test_ingest_gemini_captures_top_level_error_messages(db, tmp_path, monkeypatch):
+    """Gemini emits CLI-level errors as top-level records with type='error'.
+    These are NOT tool errors per se (slash command failures, auth issues),
+    but useful diagnostic signal."""
+    gtmp = tmp_path / "gemini" / "tmp" / "myproj" / "chats"
+    gtmp.mkdir(parents=True)
+    sess = gtmp / "session-tderr.jsonl"
+    sess.write_text(
+        json.dumps({"sessionId": "g-tderr", "projectHash": "h",
+                    "startTime": "2026-05-03T00:00:00Z",
+                    "lastUpdated": "2026-05-03T00:00:00Z", "kind": "main"}) + "\n"
+        + json.dumps({"id": "m1", "timestamp": "2026-05-03T00:00:01Z",
+                      "type": "user", "content": [{"text": "do a thing"}]}) + "\n"
+        + json.dumps({"id": "m2", "timestamp": "2026-05-03T00:00:02Z",
+                      "type": "error",
+                      "content": "Please provide a subcommand for /permissions"}) + "\n"
+    )
+    monkeypatch.setattr(ingest, "GEMINI_TMP", tmp_path / "gemini" / "tmp")
+    n = ingest.ingest_gemini_file(db, sess, do_embed=False)
+    assert n == 2, f"expected 2 inserted (user + tool_error), got {n}"
+    rows = db.execute(
+        "SELECT role, agent, content FROM messages ORDER BY rowid"
+    ).fetchall()
+    te = [r for r in rows if r["role"] == "tool_error"]
+    assert len(te) == 1, f"expected 1 tool_error, got {len(te)}"
+    assert te[0]["agent"] == "gemini"
+    assert "subcommand" in te[0]["content"]
+    assert "/permissions" in te[0]["content"]
+
+
+def test_ingest_gemini_captures_tool_call_status_error(db, tmp_path, monkeypatch):
+    """Gemini tool failures live INSIDE 'gemini' messages, in the
+    toolCalls[] array, with status='error'. Error text is at
+    tc.result[].functionResponse.response.error."""
+    gtmp = tmp_path / "gemini" / "tmp" / "myproj" / "chats"
+    gtmp.mkdir(parents=True)
+    sess = gtmp / "session-tcerr.jsonl"
+    sess.write_text(
+        json.dumps({"sessionId": "g-tcerr", "projectHash": "h",
+                    "startTime": "2026-05-03T01:00:00Z",
+                    "lastUpdated": "2026-05-03T01:00:00Z", "kind": "main"}) + "\n"
+        + json.dumps({
+            "id": "m1", "timestamp": "2026-05-03T01:00:01Z", "type": "gemini",
+            "content": [{"text": "I'll list that directory"}],
+            "toolCalls": [{
+                "id": "list_directory_111_0",
+                "name": "list_directory",
+                "args": {"dir_path": "/forbidden"},
+                "status": "error",
+                "result": [{"functionResponse": {
+                    "id": "list_directory_111_0",
+                    "name": "list_directory",
+                    "response": {"error": "Path not in workspace: /forbidden"},
+                }}],
+            }],
+        }) + "\n"
+    )
+    monkeypatch.setattr(ingest, "GEMINI_TMP", tmp_path / "gemini" / "tmp")
+    n = ingest.ingest_gemini_file(db, sess, do_embed=False)
+    assert n == 2, f"expected 2 inserted (assistant + tool_error), got {n}"
+    rows = db.execute(
+        "SELECT role, agent, content FROM messages ORDER BY rowid"
+    ).fetchall()
+    roles = [r["role"] for r in rows]
+    assert "assistant" in roles and "tool_error" in roles, \
+        f"expected assistant + tool_error rows, got {roles}"
+    te = [r for r in rows if r["role"] == "tool_error"][0]
+    assert te["agent"] == "gemini"
+    assert "Path not in workspace" in te["content"]
+    # snake_case→snake case via _expand_code_tokens
+    assert "list directory" in te["content"]
+
+
 def test_tool_error_backfill_uses_correct_agent(db, tmp_path, monkeypatch):
     """P1 #6: tool_error_backfill INSERT statement is missing the `agent`
     column. Today it relies on DEFAULT 'claude' — works for claude sessions
@@ -1230,6 +1368,9 @@ def test_tool_error_backfill_uses_correct_agent(db, tmp_path, monkeypatch):
     session, OR tool_error_backfill should only iterate claude sources.
     """
     monkeypatch.setattr(ingest, "PROJECTS_DIR", tmp_path)
+    # Isolate codex/gemini sources so the dev's real sessions don't leak in.
+    monkeypatch.setattr(ingest, "CODEX_SESSIONS", tmp_path / "no-codex")
+    monkeypatch.setattr(ingest, "GEMINI_TMP", tmp_path / "no-gemini")
     # Plant a fake claude session with a tool_error block
     sess = tmp_path / "p" / "session.jsonl"
     sess.parent.mkdir(parents=True)
@@ -1249,18 +1390,20 @@ def test_tool_error_backfill_uses_correct_agent(db, tmp_path, monkeypatch):
         assert r["agent"] == "claude", \
             f"tool_error row has agent={r['agent']!r}, expected explicit 'claude'"
 
-    # Read the source: the INSERT must list agent in the column list
+    # The INSERT now lives in the shared helper _backfill_insert_tool_error.
+    # Verify it explicitly lists the `agent` column so non-claude rows can't
+    # silently pick up the schema's DEFAULT 'claude'.
     src = Path(ingest.__file__).read_text()
-    # Find the INSERT in tool_error_backfill specifically
     import re as _re
-    teb_block = _re.search(
-        r"def tool_error_backfill.*?(?=\ndef |\Z)", src, _re.DOTALL
+    helper_block = _re.search(
+        r"def _backfill_insert_tool_error.*?(?=\ndef |\Z)", src, _re.DOTALL
     ).group(0)
-    inserts = _re.findall(r"INSERT OR IGNORE INTO messages.*?VALUES\s*\([?,\s]+\)", teb_block, _re.DOTALL)
-    assert inserts, "no INSERT statement found in tool_error_backfill"
+    inserts = _re.findall(r"INSERT OR IGNORE INTO messages.*?VALUES\s*\([?,\s]+\)",
+                           helper_block, _re.DOTALL)
+    assert inserts, "no INSERT statement found in _backfill_insert_tool_error"
     for ins in inserts:
         assert "agent" in ins, (
-            "tool_error_backfill INSERT does NOT list the `agent` column — "
+            "_backfill_insert_tool_error INSERT does NOT list `agent` — "
             "relies on DEFAULT 'claude' which mis-tags non-claude sessions:\n" + ins
         )
 

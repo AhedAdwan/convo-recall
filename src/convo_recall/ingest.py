@@ -872,6 +872,132 @@ def _extract_tool_result_text(block: dict) -> str:
     return ""
 
 
+# ── Codex / Gemini tool_error extractors ──────────────────────────────────────
+#
+# The agent CLIs emit failures in agent-specific shapes, not Anthropic's
+# `tool_result.is_error` schema. Each helper below is a pure function that
+# decides whether one record represents a harvestable failure and returns
+# the error text (truncated) if so. Used by the in-place ingesters and the
+# tool_error_backfill walker.
+
+def _codex_event_msg_error(rec: dict) -> tuple[str, str] | None:
+    """Extract (kind, text) from a Codex event_msg record if it represents
+    a harvestable failure, else None. Recognized shapes (sandbox-confirmed):
+      - exec_command_end with non-zero exit_code (shell failures)
+      - patch_apply_end with success=False (failed file edits)
+      - error (stream/rate-limit/CLI errors)
+      - turn_aborted (user interrupt)
+    Returned text is prefixed with a bracketed source tag for FTS targeting.
+    """
+    if rec.get("type") != "event_msg":
+        return None
+    pl = rec.get("payload", {})
+    if not isinstance(pl, dict):
+        return None
+    pt = pl.get("type")
+    if pt == "exec_command_end":
+        ec = pl.get("exit_code")
+        if ec is None or ec == 0:
+            return None
+        body = pl.get("aggregated_output") or ""
+        if not body:
+            body = (pl.get("stdout") or "") + "\n" + (pl.get("stderr") or "")
+        return ("exec", f"[exec_command_end exit={ec}]\n{body[:500]}")
+    if pt == "patch_apply_end":
+        if pl.get("success", True):
+            return None
+        body = pl.get("stderr") or pl.get("stdout") or ""
+        return ("patch", f"[patch_apply_end]\n{body[:500]}")
+    if pt == "error":
+        msg = pl.get("message") or ""
+        info = pl.get("codex_error_info") or ""
+        text = msg if not info else f"{msg} ({info})"
+        return ("error", f"[codex_error]\n{text[:500]}")
+    if pt == "turn_aborted":
+        reason = pl.get("reason", "unknown")
+        dur = pl.get("duration_ms")
+        suffix = f" (after {dur}ms)" if dur is not None else ""
+        return ("abort", f"[turn_aborted]\nTurn aborted: {reason}{suffix}")
+    return None
+
+
+def _codex_fco_error(rec: dict) -> str | None:
+    """Fallback extractor for Codex response_item.function_call_output records.
+    Handles two output shapes:
+      1. Older schema (~Sep 2025): output is JSON-string with metadata.exit_code.
+      2. Newer schema (~2026): output is plain string; uses _is_error_result
+         (catches "Process exited with code N").
+    Returns truncated error text, else None.
+    """
+    if rec.get("type") != "response_item":
+        return None
+    pl = rec.get("payload", {})
+    if not isinstance(pl, dict) or pl.get("type") != "function_call_output":
+        return None
+    out = pl.get("output", "")
+    if not isinstance(out, str) or not out:
+        return None
+    try:
+        obj = json.loads(out)
+        if isinstance(obj, dict):
+            ec = obj.get("metadata", {}).get("exit_code")
+            if ec is not None and ec != 0:
+                inner = obj.get("output", "")
+                inner_s = inner if isinstance(inner, str) else str(inner)
+                return f"[function_call_output exit={ec}]\n{inner_s[:500]}"
+            return None  # Parsed cleanly, no error signal
+    except (json.JSONDecodeError, ValueError):
+        pass
+    if _is_error_result(out):
+        return f"[function_call_output]\n{out[:500]}"
+    return None
+
+
+def _gemini_record_error(rec: dict) -> tuple[str, str] | None:
+    """Extract (kind, text) from a top-level Gemini message record if its
+    type is 'error' or 'warning'. Content is always a plain string per the
+    ConversationRecord schema.
+    """
+    rtype = rec.get("type")
+    if rtype not in ("error", "warning"):
+        return None
+    content = rec.get("content", "")
+    if not isinstance(content, str) or not content:
+        return None
+    kind = "cli_error" if rtype == "error" else "cli_warning"
+    return (kind, f"[gemini_{rtype}]\n{content[:500]}")
+
+
+def _gemini_tool_call_error(tc: dict) -> str | None:
+    """Extract error text from a Gemini ToolCallRecord if its status indicates
+    failure ('error' or 'cancelled'). The error string typically lives at
+    tc.result[].functionResponse.response.error.
+    """
+    if not isinstance(tc, dict):
+        return None
+    status = tc.get("status")
+    if status not in ("error", "cancelled"):
+        return None
+    name = tc.get("name", "<?>")
+    err_text = ""
+    result = tc.get("result")
+    if isinstance(result, list):
+        for r in result:
+            if not isinstance(r, dict):
+                continue
+            fr = r.get("functionResponse", {})
+            if isinstance(fr, dict):
+                resp = fr.get("response", {})
+                if isinstance(resp, dict):
+                    err = resp.get("error")
+                    if isinstance(err, str) and err:
+                        err_text = err
+                        break
+    if not err_text:
+        err_text = json.dumps(result)[:500] if result is not None else f"toolCall {status}"
+    return f"[gemini_tool {name} status={status}]\n{err_text[:500]}"
+
+
 # ── Temporal decay ────────────────────────────────────────────────────────────
 
 def _decay(timestamp: str | None, half_life_days: int = DECAY_HALF_LIFE_DAYS) -> float:
@@ -1336,21 +1462,56 @@ def ingest_gemini_file(con: apsw.Connection, jsonl_path: Path,
                     cwd_real = os.path.realpath(cwd)
                 continue
             rtype = rec.get("type")
-            if rtype not in ("user", "gemini"):
+            if rtype not in ("user", "gemini", "error", "warning"):
                 continue
             # Defer message inserts until we've decided project_id (after header).
             if project_id is None:
                 project_id = _gemini_hash_project_id(hash_dir)
                 display_name = hash_dir
                 cwd_real = None
+            timestamp = rec.get("timestamp")
+
+            # Top-level CLI error/warning records → tool_error.
+            if rtype in ("error", "warning"):
+                hit = _gemini_record_error(rec)
+                if hit is not None:
+                    kind, tr_text = hit
+                    rec_id = rec.get("id") or str(lineno)
+                    tr_uuid = f"{session_id}:tr:gemini:{kind}:{rec_id}"
+                    cleaned = _clean_content(tr_text)
+                    if cleaned:
+                        inserted += _persist_message(
+                            con, "gemini", project_id, session_id, tr_uuid,
+                            "tool_error", cleaned, timestamp, do_embed,
+                        )
+                continue
+
             role = "user" if rtype == "user" else "assistant"
             text = _clean_content(_extract_text(rec.get("content", "")))
-            if not text:
-                continue
             uuid = rec.get("id") or f"{session_id}:{lineno}"
-            timestamp = rec.get("timestamp")
-            inserted += _persist_message(con, "gemini", project_id, session_id,
-                                          uuid, role, text, timestamp, do_embed)
+
+            if text:
+                inserted += _persist_message(con, "gemini", project_id, session_id,
+                                              uuid, role, text, timestamp, do_embed)
+
+            # toolCalls[] error/cancelled harvest. Runs independently of
+            # `text` so messages that are pure tool wrappers don't drop the
+            # error signal (TD-006-style invariant).
+            if rtype == "gemini":
+                tool_calls = rec.get("toolCalls") or []
+                if isinstance(tool_calls, list):
+                    for tc in tool_calls:
+                        tr_text = _gemini_tool_call_error(tc)
+                        if tr_text is None:
+                            continue
+                        tc_id = tc.get("id") or f"{lineno}-{id(tc)}"
+                        tr_uuid = f"{session_id}:tr:gemini:tool:{tc_id}"
+                        cleaned = _clean_content(tr_text)
+                        if cleaned:
+                            inserted += _persist_message(
+                                con, "gemini", project_id, session_id, tr_uuid,
+                                "tool_error", cleaned, timestamp, do_embed,
+                            )
 
     # If no records produced project_id (empty file or skipped-only), fall back.
     if project_id is None:
@@ -1482,6 +1643,7 @@ def ingest_codex_file(con: apsw.Connection, jsonl_path: Path,
                 malformed += 1
                 continue
             ttype = rec.get("type")
+            timestamp = rec.get("timestamp")
             if ttype == "session_meta":
                 payload = rec.get("payload", {})
                 session_id = payload.get("id", session_id)
@@ -1490,10 +1652,49 @@ def ingest_codex_file(con: apsw.Connection, jsonl_path: Path,
                     _set_project_from_cwd(cwd)
                 first_seen = payload.get("timestamp") or rec.get("timestamp")
                 continue
+
+            # Tool-error harvesting (event_msg branch). Independent of the
+            # message branch — codex emits failures as event_msg payloads,
+            # not as `tool_result` blocks inside user messages.
+            if ttype == "event_msg":
+                hit = _codex_event_msg_error(rec)
+                if hit is not None:
+                    kind, tr_text = hit
+                    payload_evt = rec.get("payload", {})
+                    key = (payload_evt.get("call_id")
+                           or payload_evt.get("turn_id")
+                           or str(lineno))
+                    tr_uuid = f"{session_id}:tr:codex:{kind}:{key}"
+                    cleaned = _clean_content(tr_text)
+                    if cleaned:
+                        inserted += _persist_message(
+                            con, "codex", project_id, session_id, tr_uuid,
+                            "tool_error", cleaned, timestamp, do_embed,
+                        )
+                continue
+
             if ttype != "response_item":
                 continue
             payload = rec.get("payload", {})
-            if payload.get("type") != "message":
+            payload_type = payload.get("type")
+
+            # Tool-error fallback (function_call_output branch). Catches the
+            # older Sep-2025 schema where exit_code lives inside output JSON,
+            # plus modern plain-string outputs that match the error regex.
+            if payload_type == "function_call_output":
+                fco_text = _codex_fco_error(rec)
+                if fco_text is not None:
+                    call_id = payload.get("call_id") or str(lineno)
+                    tr_uuid = f"{session_id}:tr:codex:fco:{call_id}"
+                    cleaned = _clean_content(fco_text)
+                    if cleaned:
+                        inserted += _persist_message(
+                            con, "codex", project_id, session_id, tr_uuid,
+                            "tool_error", cleaned, timestamp, do_embed,
+                        )
+                continue
+
+            if payload_type != "message":
                 continue
             role_in = payload.get("role")
             if role_in == "user":
@@ -1505,7 +1706,6 @@ def ingest_codex_file(con: apsw.Connection, jsonl_path: Path,
             text = _clean_content(_extract_text(payload.get("content", "")))
             if not text:
                 continue
-            timestamp = rec.get("timestamp")
             uuid = payload.get("id") or f"{session_id}:{lineno}"
             inserted += _persist_message(con, "codex", project_id, session_id,
                                           uuid, role, text, timestamp, do_embed)
@@ -2881,7 +3081,41 @@ def chunk_backfill(con: apsw.Connection, confirm: bool = False) -> None:
     print(f"Done. {done:,} re-embedded.")
 
 
-def tool_error_backfill(con: apsw.Connection) -> None:
+def _backfill_insert_tool_error(con: apsw.Connection, agent: str,
+                                 project_id: str, session_id: str,
+                                 uuid: str, text: str,
+                                 timestamp: str | None) -> int:
+    """Insert one tool_error row + embed. Returns 1 if inserted, 0 otherwise.
+    Catches apsw.Error and surfaces a [warn] line so backfill keeps walking."""
+    try:
+        ret = con.execute(
+            """INSERT OR IGNORE INTO messages
+               (uuid, session_id, project_id, role, content, timestamp, model, agent)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING rowid""",
+            (uuid, session_id, project_id, "tool_error", text, timestamp,
+             None, agent),
+        ).fetchall()
+    except apsw.Error as _e:
+        print(f"[warn] tool_error_backfill insert failed: "
+              f"{type(_e).__name__}: {_e}", file=sys.stderr)
+        return 0
+    if not ret:
+        return 0
+    if _vec_ok(con):
+        vec = embed(text)
+        if vec:
+            try:
+                _vec_insert(con, ret[0][0], vec)
+            except apsw.Error as _e:
+                print(f"[warn] tool_error_backfill vec insert failed: "
+                      f"{type(_e).__name__}: {_e}", file=sys.stderr)
+    return 1
+
+
+def _backfill_claude_tool_errors(con: apsw.Connection) -> int:
+    """Walk Claude project JSONLs and harvest tool_result.is_error blocks.
+    Mirrors the in-place ingest loop's logic at ingest_file but full-scans
+    every file (no lines_already guard)."""
     indexed = 0
     for project_dir in PROJECTS_DIR.iterdir():
         if not project_dir.is_dir():
@@ -2889,8 +3123,6 @@ def tool_error_backfill(con: apsw.Connection) -> None:
         for pattern in ("*.jsonl", "*/subagents/*.jsonl"):
             for jsonl_path in project_dir.glob(pattern):
                 session_id = _session_id_from_path(jsonl_path)
-                # Recover project_id by scanning the file for cwd; fall back to
-                # legacy slug if no cwd field is present.
                 recovered_cwd: str | None = None
                 try:
                     with open(jsonl_path, "r", errors="replace") as fh:
@@ -2905,7 +3137,7 @@ def tool_error_backfill(con: apsw.Connection) -> None:
                                 recovered_cwd = d["cwd"]
                                 break
                 except OSError:
-                    pass
+                    continue
                 if recovered_cwd:
                     project_id = _project_id(recovered_cwd)
                 else:
@@ -2932,40 +3164,183 @@ def tool_error_backfill(con: apsw.Connection) -> None:
                                 raw_tr = _extract_tool_result_text(block)
                                 if not raw_tr:
                                     continue
-                                if not (block.get("is_error", False) or _is_error_result(raw_tr)):
+                                if not (block.get("is_error", False)
+                                        or _is_error_result(raw_tr)):
                                     continue
                                 tool_use_id = block.get("tool_use_id", f"tr{lineno}")
                                 tr_uuid = f"{session_id}:tr:{tool_use_id}"
                                 tr_text = _clean_content(raw_tr[:500])
                                 if not tr_text:
                                     continue
-                                # tool_error_backfill currently only walks
-                                # claude session files (PROJECTS_DIR is the
-                                # claude root). When Phase 4b/c parsers add
-                                # tool_error detection, the agent argument
-                                # below should be set per source agent.
-                                try:
-                                    ret = con.execute(
-                                        """INSERT OR IGNORE INTO messages
-                                           (uuid, session_id, project_id, role,
-                                            content, timestamp, model, agent)
-                                           VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING rowid""",
-                                        (tr_uuid, session_id, project_id, "tool_error",
-                                         tr_text, timestamp, None, "claude"),
-                                    ).fetchall()
-                                    if ret:
-                                        tr_rowid = ret[0][0]
-                                        if _vec_ok(con):
-                                            tr_vec = embed(tr_text)
-                                            if tr_vec:
-                                                _vec_insert(con, tr_rowid, tr_vec)
-                                        indexed += 1
-                                except apsw.Error as _e:
-                                    print(f"[warn] tool_error_backfill insert failed: "
-                                          f"{type(_e).__name__}: {_e}", file=sys.stderr)
+                                indexed += _backfill_insert_tool_error(
+                                    con, "claude", project_id, session_id,
+                                    tr_uuid, tr_text, timestamp,
+                                )
                 except OSError:
                     pass
-    print(f"Indexed {indexed:,} tool_result error(s).")
+    return indexed
+
+
+def _backfill_codex_tool_errors(con: apsw.Connection) -> int:
+    """Walk Codex rollout JSONLs and harvest event_msg failures + FCO
+    fallback. Project_id derived from session_meta.payload.cwd."""
+    indexed = 0
+    for jsonl_path in _iter_codex_files():
+        session_id = jsonl_path.stem
+        project_id = _legacy_project_id("codex_unknown")
+        try:
+            with open(jsonl_path, "r", errors="replace") as fh:
+                for i, line in enumerate(fh):
+                    if i > 50:  # session_meta is always first
+                        break
+                    try:
+                        d = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if d.get("type") != "session_meta":
+                        continue
+                    payload = d.get("payload", {})
+                    session_id = payload.get("id", session_id)
+                    cwd = payload.get("cwd")
+                    if cwd:
+                        project_id = _project_id(cwd)
+                    break
+        except OSError:
+            continue
+        try:
+            with open(jsonl_path, "r", errors="replace") as f:
+                for lineno, raw in enumerate(f):
+                    try:
+                        rec = json.loads(raw)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    ttype = rec.get("type")
+                    timestamp = rec.get("timestamp")
+                    if ttype == "event_msg":
+                        hit = _codex_event_msg_error(rec)
+                        if hit is None:
+                            continue
+                        kind, tr_text = hit
+                        pl = rec.get("payload", {})
+                        key = (pl.get("call_id") or pl.get("turn_id")
+                               or str(lineno))
+                        tr_uuid = f"{session_id}:tr:codex:{kind}:{key}"
+                        cleaned = _clean_content(tr_text)
+                        if not cleaned:
+                            continue
+                        indexed += _backfill_insert_tool_error(
+                            con, "codex", project_id, session_id,
+                            tr_uuid, cleaned, timestamp,
+                        )
+                    elif ttype == "response_item":
+                        pl = rec.get("payload", {})
+                        if pl.get("type") != "function_call_output":
+                            continue
+                        fco_text = _codex_fco_error(rec)
+                        if fco_text is None:
+                            continue
+                        call_id = pl.get("call_id") or str(lineno)
+                        tr_uuid = f"{session_id}:tr:codex:fco:{call_id}"
+                        cleaned = _clean_content(fco_text)
+                        if not cleaned:
+                            continue
+                        indexed += _backfill_insert_tool_error(
+                            con, "codex", project_id, session_id,
+                            tr_uuid, cleaned, timestamp,
+                        )
+        except OSError:
+            pass
+    return indexed
+
+
+def _backfill_gemini_tool_errors(con: apsw.Connection) -> int:
+    """Walk Gemini session JSONLs and harvest top-level error/warning
+    records + toolCalls[] with status in (error, cancelled). Project_id
+    derived from header cwd → alias map → hash-dir fallback."""
+    indexed = 0
+    aliases = _load_gemini_aliases()
+    for jsonl_path in _iter_gemini_files():
+        session_id = jsonl_path.stem
+        hash_dir = jsonl_path.parent.parent.name
+        project_id: str | None = None
+        aliased_cwd = aliases.get(hash_dir)
+        if aliased_cwd:
+            project_id = _project_id(aliased_cwd)
+        # Read header for cwd / sessionId override
+        try:
+            with open(jsonl_path, "r", errors="replace") as fh:
+                first = fh.readline()
+                try:
+                    head = json.loads(first)
+                    if isinstance(head, dict):
+                        if "sessionId" in head and "type" not in head:
+                            session_id = head.get("sessionId", session_id)
+                            cwd = head.get("cwd") or head.get("projectDir")
+                            if cwd and project_id is None:
+                                project_id = _project_id(cwd)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+        except OSError:
+            continue
+        if project_id is None:
+            project_id = _gemini_hash_project_id(hash_dir)
+        try:
+            with open(jsonl_path, "r", errors="replace") as f:
+                for lineno, raw in enumerate(f):
+                    try:
+                        rec = json.loads(raw)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    if "$set" in rec or ("sessionId" in rec and "type" not in rec):
+                        continue
+                    timestamp = rec.get("timestamp")
+                    rtype = rec.get("type")
+                    if rtype in ("error", "warning"):
+                        hit = _gemini_record_error(rec)
+                        if hit is None:
+                            continue
+                        kind, tr_text = hit
+                        rec_id = rec.get("id") or str(lineno)
+                        tr_uuid = f"{session_id}:tr:gemini:{kind}:{rec_id}"
+                        cleaned = _clean_content(tr_text)
+                        if not cleaned:
+                            continue
+                        indexed += _backfill_insert_tool_error(
+                            con, "gemini", project_id, session_id,
+                            tr_uuid, cleaned, timestamp,
+                        )
+                    elif rtype == "gemini":
+                        for tc in rec.get("toolCalls") or []:
+                            tr_text = _gemini_tool_call_error(tc)
+                            if tr_text is None:
+                                continue
+                            tc_id = tc.get("id") or f"{lineno}-{id(tc)}"
+                            tr_uuid = f"{session_id}:tr:gemini:tool:{tc_id}"
+                            cleaned = _clean_content(tr_text)
+                            if not cleaned:
+                                continue
+                            indexed += _backfill_insert_tool_error(
+                                con, "gemini", project_id, session_id,
+                                tr_uuid, cleaned, timestamp,
+                            )
+        except OSError:
+            pass
+    return indexed
+
+
+def tool_error_backfill(con: apsw.Connection) -> None:
+    """Walk every agent's session files and insert any tool_error rows
+    that the in-place ingest missed (e.g. pre-fix sessions, foreign DBs).
+    Always full-scans (no lines_already / mtime guard). Idempotent via
+    INSERT OR IGNORE on the uuid PK."""
+    n_claude = _backfill_claude_tool_errors(con)
+    n_codex = _backfill_codex_tool_errors(con)
+    n_gemini = _backfill_gemini_tool_errors(con)
+    total = n_claude + n_codex + n_gemini
+    print(f"Indexed {total:,} tool_result error(s) "
+          f"(claude={n_claude:,}, codex={n_codex:,}, gemini={n_gemini:,}).")
 
 
 def forget(con: apsw.Connection, *,
