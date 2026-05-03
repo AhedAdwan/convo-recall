@@ -3,9 +3,9 @@ Core ingestion, search, and backfill logic for convo-recall.
 
 Paths default to standard Claude Code locations but are configurable
 via environment variables:
-  CONVO_RECALL_DB       — path to SQLite DB (default ~/.claude/index/conversations.db)
+  CONVO_RECALL_DB       — path to SQLite DB (default ~/.local/share/convo-recall/conversations.db)
   CONVO_RECALL_PROJECTS — path to Claude projects dir (default ~/.claude/projects)
-  CONVO_RECALL_SOCK     — path to embed UDS socket (default ~/.midcortex/engram/embed.sock)
+  CONVO_RECALL_SOCK     — path to embed UDS socket (default ~/.local/share/convo-recall/embed.sock)
 """
 
 import hashlib
