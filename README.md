@@ -102,63 +102,29 @@ Tool calls and reasoning blocks are NOT indexed — only human-readable user/ass
 
 ## Install
 
-### FTS-only (fast, no GPU, no large download)
+Pick one path. Both install with hybrid FTS + vector search (the `[embeddings]` extra) and both end with `recall install` running the full interactive wizard.
+
+**A — From the public Git repo (no clone):**
 
 ```bash
-pipx install convo-recall
-recall install                    # interactive wizard — prompts for each decision
+pipx install 'convo-recall[embeddings] @ git+https://github.com/AhedAdwan/convo-recall.git'
+recall install
 ```
 
-### Hybrid FTS + vector search
+**B — From a local clone (use this if you want to edit the source):**
 
 ```bash
-pipx install 'convo-recall[embeddings]'
-recall install --with-embeddings  # interactive wizard
+git clone https://github.com/AhedAdwan/convo-recall.git
+cd convo-recall
+pipx install -e '.[embeddings]'
+recall install
 ```
 
-`--with-embeddings` keeps the embedding model warm in the background (launchd job on macOS, systemd-user `.service` on Linux, fallback to a Popen child elsewhere). The model (BAAI/bge-large-en-v1.5, ~1.3 GB) downloads on first use.
+`recall install` runs an interactive wizard that walks through every decision (response-completion ingest hooks, embed sidecar, pre-prompt search hooks, initial ingest) — each prompt prints what happens if you answer yes vs. no. Run it as-is on first install so the full wizard surface is visible.
 
-Long texts are chunked with a 450-token sliding window (50-token overlap) and mean-pooled — no silent truncation at 512 tokens.
+The wizard kicks off the initial ingest + embed-backfill in a **detached background process** so it returns control immediately. Watch progress with `recall stats` (shows a one-shot tqdm bar at the top while the job is active) or `tail -f ~/Library/Logs/convo-recall-wizard-backfill.log`.
 
-#### Interactive wizard vs. `-y`
-
-By default `recall install` runs an **interactive wizard** that walks through 4 decisions (watchers, embed sidecar, hooks, initial ingest) — each prompts you and prints what happens if you say yes vs. no. Pass `-y` only for scripted/CI installs where you want defaults applied without prompts:
-
-```bash
-recall install --with-embeddings        # interactive — RECOMMENDED for first install
-recall install --with-embeddings -y     # non-interactive — auto-yes to every default
-```
-
-The wizard kicks off the initial ingest + embed-backfill in a **detached background process** so it returns control immediately. Watch progress any time with `recall stats` (shows a one-shot tqdm bar at the top while the job is active) or `tail -f ~/Library/Logs/convo-recall-wizard-backfill.log`.
-
-### Verbose / audit install
-
-The plain install is terse. For first-time installs or security audits where you want to see every wheel + URL + hash:
-
-```bash
-pipx install 'convo-recall[embeddings]' --verbose                  # show pipx's own steps
-pipx install 'convo-recall[embeddings]' --verbose --pip-args="-v"  # also pass -v to pip
-recall install --with-embeddings                                   # interactive (no -y)
-```
-
-⚠ pipx pipes pip's stdout through `subprocess.PIPE`, which strips pip's TTY-aware progress bars. Even with `--pip-args="-v"` the heaviest step (`torch` ~750 MB download) prints once at the start and then appears to "hang" until done. **For real progress bars**, install the core first and then add deps directly:
-
-```bash
-pipx install convo-recall                                          # fast core, no embeddings
-pipx runpip convo-recall install \
-    sentence-transformers 'torch>=2.2,<3' 'aiohttp>=3.10.11'       # tqdm progress bars
-recall install --with-embeddings                                   # interactive wizard
-```
-
-`pipx runpip` execs pip with stdout attached to your real terminal — same end-state as `pipx install '.[embeddings]'`, but you get live download bars per wheel.
-
-To audit what landed afterward:
-
-```bash
-pipx runpip convo-recall list             # all packages + versions
-pipx environment                          # pipx's directory layout
-pipx runpip convo-recall show torch       # provenance of any one package
-```
+The embedding model (BAAI/bge-large-en-v1.5, ~1.3 GB) downloads on first use. Long texts are chunked with a 450-token sliding window (50-token overlap) and mean-pooled — no silent truncation at 512 tokens.
 
 ### Uninstall
 
@@ -187,24 +153,16 @@ pipx uninstall convo-recall
 
 ## Schedulers
 
-`recall install` picks one of four schedulers automatically. Override with `--scheduler X`:
+`recall install` picks one of four schedulers automatically — used to supervise the embed sidecar. Since v0.3.5, the response-completion ingest hook handles ingestion (no separate watcher daemons), so the scheduler tier matters mainly for keeping the embedding service warm.
 
 | Scheduler | Detected when | Survives reboot | Notes |
 |---|---|---|---|
 | `launchd` | macOS | yes | Uses `~/Library/LaunchAgents` plists. Default on Darwin. |
-| `systemd` | Linux + `systemctl --user is-system-running` succeeds | yes (with linger) | `.service` + `.path` units, file-event driven. Run `loginctl enable-linger $USER` if you want watchers to survive logout — the wizard offers to do this for you. |
+| `systemd` | Linux + `systemctl --user is-system-running` succeeds | yes (with linger) | User-mode `.service` units. Run `loginctl enable-linger $USER` if you want the sidecar to survive logout. |
 | `cron` | Linux + `crontab` available, no usable systemd-user | yes | `@reboot` lines tagged `# convo-recall:*`. Tagged-line filtering on uninstall preserves your other crontab entries. |
-| `polling` | always | NO | Last-resort fallback: `recall watch` runs as a `Popen` child. Dies at logout/reboot — re-run `recall install` after restart. |
+| `polling` | always | NO | Last-resort fallback: spawns the sidecar as a `Popen` child. Dies at logout/reboot. |
 
-The wizard prints `Selected scheduler: <X>` so you always know which tier you're on. To force a specific tier (e.g. for CI containers where systemd-user reports `running` but doesn't actually work):
-
-```bash
-recall install --scheduler polling -y     # universal Popen fallback
-recall install --scheduler systemd -y     # explicit systemd-user, Linux
-recall install --scheduler launchd -y     # explicit launchd, macOS
-```
-
-`recall uninstall` walks every scheduler so a host that switched OS gets clean teardown.
+The wizard prints `Selected scheduler: <X>` so you always know which tier you're on. `recall uninstall` walks every scheduler so a host that switched OS gets clean teardown.
 
 ---
 
@@ -356,9 +314,7 @@ Notes:
 
 ### Continuous ingest (response-completion hooks)
 
-The schedulers (launchd / systemd / cron / polling) handle ingest by watching session directories for new files. On macOS launchd's `WatchPaths` is genuinely recursive, so file appends inside existing project subdirs trigger ingest cleanly. **On Linux** systemd `.path` units (`PathChanged=` / `PathModified=`) are non-recursive by design — a write to `~/.claude/projects/<flat-cwd>/<sid>.jsonl` does NOT fire the parent-dir watcher, so live appends in long-running sessions are silently missed until a new project dir appears.
-
-To close that gap, convo-recall installs a **second hook** alongside the search hook: `conversation-ingest.sh` fires on each CLI's response-completion event and spawns `recall ingest` detached + backgrounded.
+Since v0.3.5 ingestion runs entirely off agent response-completion hooks. `conversation-ingest.sh` fires on each CLI's end-of-turn event and spawns `recall ingest` detached + backgrounded — within ~50 ms of every agent turn ending.
 
 | CLI | Event | Per-turn? |
 |---|---|---|
@@ -379,7 +335,7 @@ recall doctor                               # shows per-agent wired/NOT-wired st
 
 **Opt out** without uninstalling: `CONVO_RECALL_INGEST_HOOK=off`.
 
-The hook is **additive** to existing schedulers — they all stay installed. Ingest now fires from the soonest of {scheduler tick, response completion}.
+Scheduler-tier watchers (launchd / systemd `.path` units / cron) are no longer installed by default — the response-completion hook makes them redundant. The watcher install code is still in the codebase (re-enable by uncommenting the `_ask` block in `_wizard.py`) for users with bespoke flows where the hook can't fire.
 
 ---
 
