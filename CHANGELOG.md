@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] — 2026-05-03
+
+### Added
+- **Multi-agent `tool_error` capture for Codex and Gemini.** `ingest_codex_file` now harvests failures from `event_msg.payload` records (`exec_command_end` with non-zero exit, `patch_apply_end` with `success:false`, `error`, `turn_aborted`) plus `function_call_output` fallback for both the older Sep-2025 metadata schema and the newer plain-string `"Process exited with code N"` format. `ingest_gemini_file` now harvests top-level `type:'error'` / `type:'warning'` records and `gemini.toolCalls[]` entries with `status:'error'` or `status:'cancelled'`, reading the error string from `tc.result[].functionResponse.response.error`. Closes the long-deferred "Phase 4b/c" gap documented in `tool_error_backfill`'s comment block.
+
+### Changed
+- `tool_error_backfill` refactored into three per-agent walkers (`_backfill_claude_tool_errors`, `_backfill_codex_tool_errors`, `_backfill_gemini_tool_errors`) with a shared insert helper. The public function now reports per-agent counts on completion, e.g. `Indexed 171 tool_result error(s) (claude=4, codex=167, gemini=0).`
+- `ingest_gemini_file` restructured TD-006-style: persistence and toolCalls iteration are now independent, so a `gemini` message that's pure `toolCalls` wrapper no longer drops error signal when the assistant text is empty.
+
+### Notes for upgraders
+- Run `recall tool-error-backfill` after upgrading to retroactively index codex/gemini errors that were dropped by older versions. Idempotent (`INSERT OR IGNORE`).
+- Format detection helpers live in `_codex_event_msg_error`, `_codex_fco_error`, `_gemini_record_error`, `_gemini_tool_call_error` near `ingest.py:880`.
+
 ## [0.3.3] — 2026-05-03
 
 ### Fixed
