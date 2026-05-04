@@ -2057,7 +2057,11 @@ def test_wait_for_embed_socket_returns_true_when_socket_appears(tmp_path, monkey
     start = time.time()
     assert ingest._wait_for_embed_socket(timeout_s=2.0, poll_interval_s=0.05) is True
     elapsed = time.time() - start
-    assert 0.25 < elapsed < 0.6, f'should wait for socket; elapsed={elapsed:.2f}s'
+    # Lower bound: confirms we actually waited (didn't return immediately).
+    # Upper bound: well under timeout_s=2.0 — generous margin for slow CI
+    # runners (macos-latest + Python 3.14 occasionally hits 0.6-0.7s on a
+    # 0.3s sock-create thread + 0.05s poll interval).
+    assert 0.25 < elapsed < 1.5, f'should wait for socket; elapsed={elapsed:.2f}s'
 
 
 def test_wait_for_embed_socket_returns_false_on_timeout(tmp_path, monkeypatch):
@@ -2067,7 +2071,10 @@ def test_wait_for_embed_socket_returns_false_on_timeout(tmp_path, monkeypatch):
     start = time.time()
     assert ingest._wait_for_embed_socket(timeout_s=0.3, poll_interval_s=0.05) is False
     elapsed = time.time() - start
-    assert 0.25 < elapsed < 0.5, f'should respect timeout; elapsed={elapsed:.2f}s'
+    # Lower bound: confirms we honored the 0.3s timeout. Upper bound: returns
+    # promptly after timeout — same widened slack as the 'socket appears' case
+    # to absorb CI runner variance without losing the "didn't hang" signal.
+    assert 0.25 < elapsed < 1.0, f'should respect timeout; elapsed={elapsed:.2f}s'
 
 
 def test_wait_for_embed_socket_verbose_logs_to_stderr(tmp_path, monkeypatch, capsys):
