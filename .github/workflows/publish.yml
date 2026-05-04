@@ -1,14 +1,16 @@
 name: Publish to PyPI
 
-# Manual trigger only. PyPI Trusted Publisher is not yet configured for this
-# project — auto-running on every tag push leaves a red ❌ on the repo's main
-# page for every release. Trigger this workflow from the Actions tab when the
-# trusted-publisher entry has been added on PyPI's side and you want to ship.
+# Manual trigger only. Triggered from the Actions tab once PyPI Trusted
+# Publisher is configured (https://docs.pypi.org/trusted-publishers/).
+# The `tag` input pins both the test job and the build job to the exact
+# tagged tree so the published artifact matches what's at that tag —
+# without it, both jobs default to whatever's at HEAD on the default
+# branch, which can drift past the tag with doc/CI commits.
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to publish (e.g. v0.3.1). Must already exist on origin."
+        description: "Tag to publish (e.g. v0.4.0). Must already exist on origin."
         required: true
 
 jobs:
@@ -19,6 +21,8 @@ jobs:
         python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ inputs.tag }}
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: ${{ matrix.python-version }}
@@ -38,6 +42,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
