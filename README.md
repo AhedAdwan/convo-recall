@@ -31,12 +31,12 @@ Runs on macOS or Linux. Python 3.11–3.14. Works with any subset of Claude Code
 
 ## Install
 
-Pick one path. Both install with hybrid FTS + vector search (the `[embeddings]` extra) and both end with `recall install` running the full interactive wizard.
+Pick one path. All three install with hybrid FTS + vector search (the `[embeddings]` extra) and all end with `recall install` running the full interactive wizard.
 
-**A — From the public Git repo (no clone):**
+**A — From PyPI (recommended for everyone):**
 
 ```bash
-pipx install 'convo-recall[embeddings] @ git+https://github.com/AhedAdwan/convo-recall.git'
+pipx install "convo-recall[embeddings]"
 recall install
 ```
 
@@ -46,6 +46,13 @@ recall install
 git clone https://github.com/AhedAdwan/convo-recall.git
 cd convo-recall
 pipx install -e '.[embeddings]'
+recall install
+```
+
+**C — From an unreleased main commit** (for trying a fix that hasn't been cut to a release yet):
+
+```bash
+pipx install 'convo-recall[embeddings] @ git+https://github.com/AhedAdwan/convo-recall.git'
 recall install
 ```
 
