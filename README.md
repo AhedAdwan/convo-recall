@@ -284,7 +284,7 @@ In addition, all use is subject to the [convo-recall Acceptable Use Policy](ACCE
 
 - A **Competing Use**: making convo-recall available to others as a commercial product or service that substitutes for, or offers substantially similar functionality to, convo-recall itself. Hosting convo-recall as a SaaS, reselling it as the product, or offering managed convo-recall is a Competing Use.
 
-If your use case falls outside the FSL — e.g., you want to bundle convo-recall in a commercial product, host it as a managed service, or remove the AUP rider — **email the author** to discuss commercial licensing terms.
+**Email the author** to discuss collaboration opportunities.
 
 ### What the AUP forbids — under all licenses, perpetually
 
