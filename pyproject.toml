@@ -19,7 +19,7 @@ requires-python = ">=3.11"
 license = "LicenseRef-FSL-1.1-Apache-2.0"
 license-files = ["LICENSE", "ACCEPTABLE_USE.md", "NOTICE"]
 authors = [
-    {name = "Ahed Isir"},
+    {name = "Ahed Aladwan", email = "adwansubs@icloud.com"},
 ]
 keywords = ["claude", "claude-code", "gemini", "codex", "search", "memory", "rag", "sqlite", "fts5"]
 classifiers = [
