@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use convo-recall in research, please cite it as below."
+title: "convo-recall: searchable conversation memory for AI coding agents"
+abstract: >-
+  A local-first SQLite + FTS5 + sqlite-vec hybrid search tool that indexes
+  Claude Code, Codex, and Gemini session transcripts. Provides time-decay
+  reranking, secret redaction at ingest, and a UNIX-socket embedding sidecar
+  (BAAI/bge-large-en-v1.5).
+authors:
+  - family-names: Aladwan
+    given-names: Ahed
+    email: adwansubs@icloud.com
+repository-code: "https://github.com/AhedAdwan/convo-recall"
+url: "https://github.com/AhedAdwan/convo-recall"
+license: LicenseRef-FSL-1.1-Apache-2.0
+keywords:
+  - conversation-memory
+  - retrieval-augmented-generation
+  - sqlite
+  - fts5
+  - sqlite-vec
+  - claude-code
+  - codex
+  - gemini
+  - hybrid-search

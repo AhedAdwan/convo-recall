@@ -69,6 +69,11 @@ License: MIT (per model card; permitted for commercial use)
 Trademarks
 ================================================================================
 
+"convo-recall" is an unregistered trademark of Ahed Aladwan. Forks that
+materially diverge from upstream must not redistribute under the name
+"convo-recall" without permission. Preserving the LICENSE and NOTICE files
+in derivative works is required by Apache 2.0 Section 4.
+
 Claude(TM) and Claude Code(TM) are trademarks of Anthropic, PBC.
 Codex(TM) is a trademark of OpenAI OpCo, LLC.
 Gemini(TM) is a trademark of Google LLC.

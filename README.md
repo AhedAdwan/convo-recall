@@ -296,6 +296,16 @@ Notwithstanding any license grant (including the post-conversion Apache 2.0), co
 
 Full FSL text in [`LICENSE`](LICENSE). AUP details in [`ACCEPTABLE_USE.md`](ACCEPTABLE_USE.md). Third-party dependency attributions in [`NOTICE`](NOTICE). Contributor terms in [`CLA.md`](CLA.md).
 
+### Attribution & forks
+
+If you fork convo-recall, modify it, or redistribute it in any form:
+
+- **Legally required** (Apache 2.0 §4, inherited by FSL): keep the `LICENSE` and `NOTICE` files unmodified in your distribution, preserve the copyright notice, and mark any files you change as modified.
+- **Socially expected**: link back to this repository (`https://github.com/AhedAdwan/convo-recall`) from your fork's README, and if your fork materially diverges in scope or behavior, **rename it** so users don't confuse it with upstream convo-recall.
+- **For research / publications**: please cite via the [`CITATION.cff`](CITATION.cff) file (GitHub's "Cite this repository" button on the sidebar renders it automatically).
+
+The name **convo-recall** is an unregistered trademark of Ahed Aladwan; using it for a substantially different fork is not permitted without permission.
+
 ### Trademarks
 
 **Claude™** and **Claude Code™** are trademarks of Anthropic, PBC. **Codex™** is a trademark of OpenAI OpCo, LLC. **Gemini™** is a trademark of Google LLC. All other trademarks are the property of their respective owners. **convo-recall is an independent open project** and is NOT affiliated with, endorsed by, sponsored by, or otherwise associated with Anthropic, OpenAI, or Google. References to these CLIs identify the third-party tools whose session files convo-recall reads — they do not imply endorsement.
